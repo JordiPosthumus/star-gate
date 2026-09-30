@@ -164,3 +164,57 @@ test('server restart invalidates a baseline even when replacement counters are a
  const b=vllmSnapshot(phaseMetrics({running:1,done:1,first:1,g:100,computed:10000,prefillSeconds:10})+'\nvllm:generation_tokens_created 200',3000,a);
  assert.equal(b.completed_prefill,null);assert.equal(b.live_decode_tps,null);assert.equal(b.phase,'working');
 });
+
+// One dropped poll used to blackout the phase for the rest of a busy period:
+// the carry-forward needs its own previous value, and an unusable sample left
+// it null with no way to re-seed until the engine drained.
+test('a dropped poll no longer leaves a busy engine unresolved for the rest of its work',()=>{
+ const idle=vllmSnapshot(phaseMetrics(),1000);
+ const first=vllmSnapshot(phaseMetrics({running:2,first:1,g:10}),3000,idle);
+ assert.equal(first.phase,'mixed');
+ const dropped=vllmSnapshot(phaseMetrics({running:2,first:2,g:20}),40000,first);
+ assert.equal(dropped.interval_generated,null);
+ assert.equal(dropped.phase,'decode');assert.equal(dropped.decoding_requests,2);
+ const after=vllmSnapshot(phaseMetrics({running:2,first:2,done:1,g:30}),42000,dropped);
+ assert.equal(after.phase,'mixed');assert.equal(after.decoding_requests,1);
+});
+test('counter regressions do not latch: the next comparable sample resolves again',()=>{
+ const idle=vllmSnapshot(phaseMetrics(),1000);
+ const a=vllmSnapshot(phaseMetrics({running:2,first:1,g:10}),3000,idle);
+ const regressed=vllmSnapshot(phaseMetrics({running:2,first:0,g:12}),5000,a);
+ assert.equal(regressed.phase,'working');assert.equal(regressed.decoding_requests,null);
+ const next=vllmSnapshot(phaseMetrics({running:2,first:2,g:14}),7000,regressed);
+ assert.equal(next.phase,'decode');assert.equal(next.decoding_requests,2);
+});
+test('the counter identity is measured since idle, so an abandoned request cannot poison it forever',()=>{
+ const idle=vllmSnapshot(phaseMetrics({first:6,done:4}),1000);
+ assert.deepEqual(idle.decoding_baseline,{first_tokens:6,requests:4});
+ const next=vllmSnapshot(phaseMetrics({running:1,first:7,done:4,g:10}),3000,idle);
+ assert.equal(next.phase,'decode');assert.equal(next.decoding_requests,1);
+ assert.equal(next.decoding_baseline.first_tokens,6);assert.equal(next.decoding_baseline.requests,4);
+});
+// Guard-rail, not a regression test: HEAD also refuses these, for unrelated
+// reasons. It pins the discipline the identity tempts you to break — an
+// out-of-bounds count is refused outright, never clamped into a phase. Asserted
+// exactly, because `x===null||x<=running` would be satisfied by a clamp and so
+// could never fail. running=2 keeps the single-request heuristic out of it.
+test('an identity wider than the running batch is refused, never clamped into a phase',()=>{
+ const idle=vllmSnapshot(phaseMetrics(),1000);
+ const inflated=vllmSnapshot(phaseMetrics({running:2,first:3,g:10}),3000,idle);
+ assert.equal(inflated.decoding_requests,null);assert.equal(inflated.phase,'working');
+ const wider=vllmSnapshot(phaseMetrics({running:2,first:9,g:20}),5000,inflated);
+ assert.equal(wider.decoding_requests,null);assert.equal(wider.phase,'working');
+});
+// Both counters are lifetime totals. Without an idle anchor their difference is
+// accumulated drift, not work, so a first sample must refuse to interpret them
+// rather than assume the drift happens to be zero.
+test('the first sample never interprets lifetime counters as current work',()=>{
+ const drifted=vllmSnapshot(phaseMetrics({running:1,first:13,done:0,g:10}),1000);
+ assert.equal(drifted.decoding_baseline,null);
+ assert.equal(drifted.decoding_requests,null);assert.equal(drifted.phase,'working');
+ const drained=vllmSnapshot(phaseMetrics({first:13,done:12}),3000,drifted);
+ assert.equal(drained.phase,'idle');
+ assert.deepEqual(drained.decoding_baseline,{first_tokens:13,requests:12});
+ const next=vllmSnapshot(phaseMetrics({running:1,first:14,done:12,g:20}),5000,drained);
+ assert.equal(next.decoding_requests,1);assert.equal(next.phase,'decode');
+});

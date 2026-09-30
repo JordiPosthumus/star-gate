@@ -9,6 +9,11 @@ class MetricsHttpError extends Error {
 }
 const canRediscover=error=>error instanceof UnsupportedMetrics||[404,405,415].includes(error.status);
 const validInterval=(now,previous)=>previous&&previous.connected!==false&&now>previous.at&&now-previous.at<=30000;
+// An absent epoch on either side is not evidence of a change: many builds never
+// export generation_tokens_created, so requiring one would disable the counter
+// identity on exactly the engines that most need it. Only two differing,
+// present epochs count as a restart.
+const epochUnchanged=(previous,epoch)=>epoch===null||previous.metrics_epoch===null||previous.metrics_epoch===undefined||epoch===previous.metrics_epoch;
 const delta=(value,old)=>finite(value)!==null&&finite(old)!==null&&value>=old?value-old:null;
 
 export function prometheusValues(text){
@@ -36,7 +41,7 @@ export function vllmSnapshot(text,now,previous){
     computed=Math.max(0,get('prompt_tokens_total')-get('prompt_tokens_cached_total'));
   const generationDelta=delta(generated,previous?.generated);
   const epoch=get('generation_tokens_created');
-  const sampleValid=validInterval(now,previous)&&generationDelta!==null&&(epoch===null||previous.metrics_epoch===null||previous.metrics_epoch===undefined||epoch===previous.metrics_epoch);
+  const sampleValid=validInterval(now,previous)&&generationDelta!==null&&epochUnchanged(previous,epoch);
   const prefillDelta=sampleValid?delta(computed,previous?.computed):null;
   const running=get('num_requests_running'),requests=get('request_generation_tokens_count');
   const firstTokens=get('time_to_first_token_seconds_count');
@@ -45,10 +50,34 @@ export function vllmSnapshot(text,now,previous){
   // Prompt counters are emitted at first output, not incrementally during
   // prefill. A whole prompt divided by the scrape interval is NOT its speed.
   // Track first-token/finish events from an observed idle baseline instead.
+  //
+  // A request decodes from its first token until it finishes, so the count
+  // decoding now is (requests that reached first token) - (requests that
+  // finished), measured since an engine was observed idle. Unlike the carry-
+  // forward below, this is recomputed from cumulative counters every sample, so
+  // one dropped or regressed sample no longer leaves the estimate unseedable
+  // for as long as the engine stays busy. An idle crossing is required, not
+  // optional: both counters are lifetime totals that already contain drift, so
+  // their difference without an anchor would count past drift as current work.
+  // Two guards narrow it further — the counters may not regress or change epoch,
+  // and the result must fit inside the running batch, a separate gauge. That
+  // bound is a plausibility filter rather than a proof: it only catches drift to
+  // the extent other requests are prefilling, and requests abandoned after
+  // their first token keep inflating it until the engine next drains.
+  const countersUsable=Number.isSafeInteger(firstTokens)&&Number.isSafeInteger(requests);
+  const countersComparable=!previous||(
+    previous.connected!==false&&epochUnchanged(previous,epoch)&&
+    Number.isSafeInteger(previous.first_tokens)&&Number.isSafeInteger(previous.requests)&&
+    firstTokens>=previous.first_tokens&&requests>=previous.requests);
+  const baseline=previous?.decoding_baseline??null;
+  const decodingFromBaseline=baseline!==null&&countersUsable&&countersComparable&&running!==null&&running>0
+    &&firstTokens>=baseline.first_tokens&&requests>=baseline.requests
+    ?(firstTokens-baseline.first_tokens)-(requests-baseline.requests):null;
   let decoding=null;
   if(running===0)decoding=0;
-  else if(sampleValid&&Number.isSafeInteger(firstDelta)&&Number.isSafeInteger(finishedDelta)){
-    if(Number.isSafeInteger(previous?.decoding_requests)){
+  else{
+    if(decodingFromBaseline!==null&&decodingFromBaseline>=0&&decodingFromBaseline<=running)decoding=decodingFromBaseline;
+    else if(sampleValid&&Number.isSafeInteger(firstDelta)&&Number.isSafeInteger(finishedDelta)&&Number.isSafeInteger(previous?.decoding_requests)){
       const next=previous.decoding_requests+firstDelta-finishedDelta;
       if(next>=0&&next<=running)decoding=next;
     }
@@ -91,6 +120,9 @@ export function vllmSnapshot(text,now,previous){
     interval_start:sampleValid?previous.at:null,interval_phase:intervalPhase,
     interval_generated:sampleValid?generationDelta:null,interval_prefill:prefillDelta,
     metrics_epoch:epoch,first_tokens:firstTokens,decoding_requests:decoding,single_since:singleSince,
+    // An idle engine anchors the identity; a busy one keeps the existing anchor
+    // and stays unresolved until it either drains or the carry-forward resolves.
+    decoding_baseline:running===0&&countersUsable?Object.freeze({first_tokens:firstTokens,requests}):baseline,
     prefill_seconds:prefillSeconds,prefill_tokens:prefillTokens,prefill_count:prefillCount,computed_count:computedCount,decode_seconds:decodeSeconds,decode_count:decodeCount,
     completed_prefill:completedPrefill,completed_decode:completedDecode,decode_tokens:decodeTokens,prefill_rate_scope:'completed_request_average',
     live_prefill_tps:null,
