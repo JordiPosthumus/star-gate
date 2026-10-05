@@ -202,6 +202,42 @@ function schedulingExplanation(g,workers,capacity) {
   if(row.automatic_reason==='automatic_ready')return ` ${route}${row.source}'s queued request is eligible for automatic core handover now.`;
   return ` ${route}${row.source}'s queue cannot move yet: ${relocationReason(row)}.`;
 }
+const capacitySlots=w=>Number.isSafeInteger(w.max_concurrent_requests)&&w.max_concurrent_requests>0?w.max_concurrent_requests:1;
+// Chip label prefers the physical machine name ("M3 Ultra") and only appends the worker id
+// when several profiles share that machine, so shared hardware stays unambiguous.
+const capacityName=w=>{const machine=physicalMachines(w).map(machineLabel).join(' + ');return machine&&machine!==w.id?`${machine} · ${w.id}`:machine||w.id;};
+// Full utilization is a healthy state, so occupancy is always rendered in the accent color.
+// Amber is reserved for waiting work (a server's queue, or the Continuity Door holding
+// requests) and hatching for offline capacity, which is excluded from the headline.
+function renderCapacityPanel(g,cap,stale,door,doorError){
+  const map=$('capacity-map'),chips=$('capacity-chips');
+  setDoorStatus(door,doorError);
+  if(!cap){
+    map.innerHTML='';chips.innerHTML='';
+    map.setAttribute('aria-label','Slot map unavailable');
+    $('capacity-value').textContent='—';
+    $('capacity-note').textContent=stale?'Live gateway status is unavailable.':'Gateway status is unavailable';
+    return;
+  }
+  const eligible=g.workers.filter(w=>w.is_healthy&&!w.drained&&!w.quarantine);
+  const offline=g.workers.filter(w=>!(w.is_healthy&&!w.drained&&!w.quarantine));
+  const loadOf=w=>Math.min(Math.max(0,w.load??0),capacitySlots(w));
+  const segTitle=w=>{const slots=capacitySlots(w);return `${capacityName(w)} · ${loadOf(w)}/${slots} busy${w.queued?` · ${fmt(w.queued)} queued — next slot is spoken for`:''}`;};
+  map.innerHTML=eligible.map(w=>{const slots=capacitySlots(w);return `<div class="capacity-seg${w.queued?' queued':''}" style="flex-grow:${slots}" title="${esc(segTitle(w))}"><div class="capacity-fill" style="width:${Math.round(100*loadOf(w)/slots)}%"></div></div>`;}).join('')
+    +offline.map(w=>{const slots=capacitySlots(w);return `<div class="capacity-seg offline" style="flex-grow:${slots}" title="${esc(`${capacityName(w)} · paused or unavailable — ${slots} slot${slots===1?'':'s'} offline`)}"></div>`;}).join('');
+  map.setAttribute('aria-label',`Slot map: ${eligible.map(w=>`${capacityName(w)} ${loadOf(w)} of ${capacitySlots(w)} busy${w.queued?`, ${fmt(w.queued)} queued`:''}`).join('; ')||'no eligible servers'}${offline.length?`. Offline: ${offline.map(w=>capacityName(w)).join(', ')}`:''}`);
+  chips.innerHTML=g.workers.map(w=>{const off=!(w.is_healthy&&!w.drained&&!w.quarantine);
+    return `<span class="capacity-chip${off?' offline':''}" title="${esc(segTitle(w))}"><b>${esc(capacityName(w))}</b> ${off?(w.drained?'paused':'offline'):`${loadOf(w)}/${capacitySlots(w)}`}${!off&&w.queued?` <span class="q">+${fmt(w.queued)} q</span>`:''}</span>`;}).join('');
+  const offlineSlots=offline.reduce((sum,w)=>sum+capacitySlots(w),0);
+  $('capacity-value').textContent=cap.eligible?`${cap.occupied} / ${cap.eligible}`:'—';
+  $('capacity-note').textContent=cap.eligible?`slots busy · ${fmt(cap.free)} free${offlineSlots?` · ${fmt(offlineSlots)} offline`:''}`:'no eligible servers';
+}
+function setDoorStatus(door,doorError){
+  const el=$('continuity-door-status');
+  el.classList.toggle('holding',!!(door&&door.holding&&!doorError));
+  el.title=doorError?`${doorError}.`:!door?'Continuity Door is not enabled.':door.holding?`Continuity Door holding ${fmt(door.held)} new request${door.held===1?'':'s'} while ${door.core_ready?'core dispatch is ready':'core dispatch is not ready (including when every eligible server is paused or unavailable)'}; existing streams remain connected.`:`Continuity Door ready · ${fmt(door.active)} active proxied stream${door.active===1?'':'s'} · no request-body spooling or replay.`;
+  el.textContent=doorError?'Door status unavailable':!door?'Continuity Door is not enabled.':door.holding?`Door holding ${fmt(door.held)} request${door.held===1?'':'s'}`:`Door ready · ${fmt(door.active)} stream${door.active===1?'':'s'}`;
+}
 function timeline(d,now,lanes=1) {
   const rows=d.activity||[],start=now-900000,height=10*lanes;
   const band=phase=>phase==='working'?'working':phase==='mixed'?'mixed':phase==='prefill'?'prefill':phase==='thinking'||phase==='decode'?'decode':['idle','paused'].includes(phase)?'idle-off':'unknown';
@@ -826,10 +862,7 @@ function render(s) {
   $('available').textContent = g&&!stale ? `${g.draining?0:fleetCount.available} / ${fleetCount.total}` : '—'; $('active').textContent = fmt(g?.active); $('queued').textContent = g?fmt(waiting.total):'—';
   $('queued').title=door?.holding?`${fmt(waiting.core)} admitted in the gateway core + ${fmt(waiting.held)} held safely at the Continuity Door. Pi/Hermes work not yet sent to Star Gate is not visible here.`:'Requests known to Star Gate and not yet dispatched. Pi/Hermes work not yet sent to Star Gate is not visible here.';
   const cap=capacity(g,stale),scales=rateScales(s.devices,s.rate_peaks,now);
-  $('capacity-value').textContent=cap?.percent!=null?`${cap.occupied} of ${cap.eligible} concurrent requests`:'Unknown';
-  $('capacity-note').textContent=cap?(g.workers.filter(w=>w.is_healthy&&!w.drained&&!w.quarantine).map(w=>`${physicalMachines(w).map(machineLabel).join(' + ')||w.id}: ${w.load??0}/${w.max_concurrent_requests??1}`).join(' · ')):'Gateway status is unavailable';
-  $('capacity-meter').value=cap?.percent||0;$('capacity-meter').hidden=cap?.percent==null;
-  $('continuity-door-status').textContent=s.continuity_door_error?`${s.continuity_door_error}.`:!door?'Continuity Door is not enabled.':door.holding?`Continuity Door holding ${fmt(door.held)} new request${door.held===1?'':'s'} while ${door.core_ready?'core dispatch is ready':'core dispatch is not ready (including when every eligible server is paused or unavailable)'}; existing streams remain connected.`:`Continuity Door ready · ${fmt(door.active)} active proxied stream${door.active===1?'':'s'} · no request-body spooling or replay.`;
+  renderCapacityPanel(g,cap,stale,door,s.continuity_door_error);
   visibleWorkers=g?.workers??[];workerUiStale=stale;workerControlsVisible=s.worker_management===true;
   $('capacity-note').title=stale?'Live gateway status is unavailable.':!g?.total?'No model servers are registered. Open Settings to add your first endpoint.':schedulingExplanation(g,visibleWorkers,cap).trim();
   if(s.fleet_power?.control&&workerControlsReady&&!fleetPowerPolling){fleetPowerPolling=true;void fetch('/api/workers/power',{headers:{}}).then(r=>r.ok?r.json():null).then(p=>{fleetPower=p&&p.enabled!==undefined?p:null;renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,lastDevicesSpec.now,lastDevicesSpec.stale,lastDevicesSpec.scales,lastDevicesSpec.controls);}).catch(()=>{}).finally(()=>{fleetPowerPolling=false;});}

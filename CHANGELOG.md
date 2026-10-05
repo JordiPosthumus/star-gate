@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-05 — Capacity panel shows a per-server slot map
+
+The Serving Capacity panel replaces its duplicated encodings with one slot map: a segment
+per registered server sized by configured request capacity and filled by busy slots.
+Full utilization stays green; amber marks waiting work only (a server with queued
+requests, or the Continuity Door holding new ones), and hatched segments are paused or
+offline — their slots are excluded from the headline and never read as free. The
+headline leads with busy slots and names free and offline counts; per-server chips carry
+load, capacity and queue counts without breaking mid-token, and the Continuity Door
+line stays short with its full explanation on hover. No gateway behavior, routing or
+other panels change.
+
 ## 2026-09-16 — Media placement controls
 
 The Media tab shows music/video jobs, machine return status, retained results
