@@ -24,7 +24,7 @@ export function endpointFleetSamples(node,value,previous){
   if(!ID.test(node??'')||!value?.connected||!Number.isFinite(value.at))return [];
   const rows=[];
   for(const phase of ['decode','prefill']){
-    let measurement=value.source==='vllm'?value['completed_'+phase]:null;
+    let measurement=['vllm','tensorfold'].includes(value.source)?value['completed_'+phase]:null;
     let basis='completed_request',start=value.at;
     if(value.source==='omlx'&&previous?.connected&&previous.source==='omlx'&&value.live_activity&&previous.live_activity&&value.at>previous.at&&value.at-previous.at<=30000&&!(value.uptime_seconds<previous.uptime_seconds)){
       const active=point=>point.phase===phase||point.phase==='mixed';
@@ -84,7 +84,7 @@ export class FleetSpeed {
     const key=`${row.node}:${row.sample_id}`;if(this.seen.has(key))return;this.seen.add(key);
     if(this.seen.size>400000)this.seen.delete(this.seen.values().next().value);
     if(row.kind==='endpoint_phase'){
-      const completed=row.source==='vllm'&&row.basis==='completed_request',sampled=row.source==='omlx'&&row.basis==='sampled_rate';
+      const completed=['vllm','tensorfold'].includes(row.source)&&row.basis==='completed_request',sampled=row.source==='omlx'&&row.basis==='sampled_rate';
       const rate=row.tokens/row.seconds;
       if(!(completed||sampled)||!['decode','prefill'].includes(row.phase)||!Number.isFinite(row.tokens)||row.tokens<0||seconds(row.seconds)===null||row.seconds<=0||!Number.isFinite(rate)||rate>100000||!Number.isFinite(row.start)||row.start<=0||row.start>row.time||(completed&&row.start!==row.time)||(sampled&&(row.time-row.start>30000||Math.abs(row.seconds-(row.time-row.start)/1000)>.001))){this.rejected++;return;}
       this.intervals.push({node:row.node,kind:row.phase,start:row.start,end:row.time,seconds:row.seconds,tokens:row.tokens,rate,basis:row.basis,source:row.source});
@@ -195,7 +195,9 @@ export class FleetSpeedReader {
       if([...this.cursors.keys()].some(file=>!files.includes(file))){this.rebuild();return;}
       let backlog=false;
       for(const file of files){
-        const full=path.join(this.directory,file);if(!fs.lstatSync(full).isFile())throw new Error('Not a regular file');
+        const full=path.join(this.directory,file),named=fs.lstatSync(full,{bigint:true});if(!named.isFile())throw new Error('Not a regular file');
+        const stamp=[named.dev,named.ino,named.size,named.mtimeNs,named.ctimeNs].join(':');
+        if(this.cursors.get(file)?.stamp===stamp)continue;
         const fd=fs.openSync(full,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
         try{
           const stat=fs.fstatSync(fd);if(!stat.isFile())throw new Error('Not a regular file');
@@ -213,6 +215,7 @@ export class FleetSpeedReader {
           }
           cursor.fragment=Buffer.from(buffer.subarray(from));if(cursor.fragment.length>LINE_BYTES||cursor.skipping){if(!cursor.skipping)this.malformed++;cursor.fragment=Buffer.alloc(0);cursor.skipping=true;}
           cursor.anchor=Buffer.alloc(Math.min(64,cursor.offset));if(cursor.anchor.length)fs.readSync(fd,cursor.anchor,0,cursor.anchor.length,cursor.offset-cursor.anchor.length);
+          if(cursor.offset===stat.size)cursor.stamp=stamp;
           backlog||=cursor.offset<stat.size;if(backlog)break;
         }finally{fs.closeSync(fd);}
       }

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {createSparkDiscovery,sparkIdentity,networkAddresses,neighborAddresses,localAddress,configuredSSH,sparkIdentityProbe,multicastInterfaces,multicastReplyAddresses,localNetworkSources,discoverySSHReason} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './genie-spark-setup.mjs';
+import {createSparkSetupTools} from './spark-setup-transport.mjs';
 
 // Generate synthetic RFC1918 addresses for locality tests; never use deployment inventory.
 const ip=(...octets)=>octets.join('.');

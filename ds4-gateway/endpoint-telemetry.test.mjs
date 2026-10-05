@@ -1,8 +1,8 @@
-import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {test} from 'node:test';import assert from 'node:assert/strict';import {EndpointTelemetry,vllmSnapshot,omlxSnapshot,omlxActivity} from './endpoint-telemetry.mjs';
+import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {test} from 'node:test';import assert from 'node:assert/strict';import {EndpointTelemetry,vllmSnapshot,omlxSnapshot,omlxActivity,tensorfoldSnapshot} from './endpoint-telemetry.mjs';
 const metrics=(tokens=100)=>`vllm:num_requests_running{engine="0"} 1\nvllm:num_requests_waiting{engine="0"} 2\nvllm:generation_tokens_total{engine="0"} ${tokens}\nvllm:request_generation_tokens_sum 100\nvllm:request_decode_time_seconds_sum 5\nvllm:request_prefill_kv_computed_tokens_sum 500\nvllm:request_prefill_time_seconds_sum 2\nvllm:request_generation_tokens_count 2\n`;
 test('vLLM separates session phase averages and live intervals, handles counter resets',()=>{const a=vllmSnapshot(metrics(),1000);assert.equal(a.prefill_tps,250);assert.equal(a.decode_tps,20);assert.equal(a.live_decode_tps,null);assert.equal(vllmSnapshot(metrics(140),3000,a).live_decode_tps,20);assert.equal(vllmSnapshot(metrics(1),3000,a).live_decode_tps,null);assert.throws(()=>vllmSnapshot('other 5',1));});
 test('oMLX exposes server measurements without inventing live phase rates',()=>{const a=omlxSnapshot({status:'ok',total_requests:3,avg_prefill_tps:1020,avg_generation_tps:28,active_requests:1},1);assert.equal(a.prefill_tps,1020);assert.equal(a.decode_tps,28);assert.equal(a.live_decode_tps,null);assert.throws(()=>omlxSnapshot({},1));});
-test('only OpenAI workers are sampled; status fallback is read-only and credentials remain local',async()=>{let calls=[];const t=new EndpointTelemetry({now:()=>1000,fetcher:async(url,opts)=>{calls.push({url:String(url),opts});return String(url).endsWith('/metrics')?new Response('',{status:404}):Response.json({status:'ok',total_requests:1,avg_prefill_tps:400,avg_generation_tps:30});}});const dwarf={id:'dwarf',url:'http://127.0.0.1:8000'},m={id:'m3',backend:'openai',url:'http://127.0.0.1:8013/v1'};t.sync([dwarf,m]);assert.deepEqual(t.workers,[m]);await t.sample(m);assert.equal(calls.length,3);assert.equal(t.snapshot('m3').source,'omlx');assert.equal(t.snapshot('m3').decode_tps,30);assert.equal(t.snapshot('dwarf'),null);assert.ok(calls.every(c=>c.opts.method===undefined&&c.opts.redirect==='error'));t.close();});
+test('only OpenAI workers are sampled; status fallback is read-only and credentials remain local',async()=>{let calls=[];const t=new EndpointTelemetry({now:()=>1000,fetcher:async(url,opts)=>{calls.push({url:String(url),opts});return String(url).endsWith('/metrics')?new Response('',{status:404}):Response.json({status:'ok',total_requests:1,avg_prefill_tps:400,avg_generation_tps:30});}});const dwarf={id:'dwarf',url:'http://127.0.0.1:8000'},m={id:'m3',backend:'openai',url:'http://127.0.0.1:8013/v1'};t.sync([dwarf,m]);assert.deepEqual(t.workers,[m]);await t.sample(m);assert.equal(calls.length,4);assert.equal(t.snapshot('m3').source,'omlx');assert.equal(t.snapshot('m3').decode_tps,30);assert.equal(t.snapshot('dwarf'),null);assert.ok(calls.every(c=>c.opts.method===undefined&&c.opts.redirect==='error'));t.close();});
 
 test('oMLX live activity includes prefill progress and generated thinking tokens',()=>{const a=omlxActivity({active_models:{models:[{active_requests:1,prefilling:[{processed:8192,total:150000,speed:1050}],generating:[]}]}});assert.equal(a.phase,'prefill');assert.equal(a.live_prefill_tps,1050);assert.equal(a.prefill_total,150000);const b=omlxActivity({active_models:{models:[{active_requests:1,prefilling:[],generating:[{generated_tokens:1200,tokens_per_second:31}]}]}});assert.equal(b.phase,'decode');assert.equal(b.live_decode_tps,31);assert.equal(b.generated_tokens,1200);});
 
@@ -217,4 +217,36 @@ test('the first sample never interprets lifetime counters as current work',()=>{
  assert.deepEqual(drained.decoding_baseline,{first_tokens:13,requests:12});
  const next=vllmSnapshot(phaseMetrics({running:1,first:14,done:12,g:20}),5000,drained);
  assert.equal(next.decoding_requests,1);assert.equal(next.phase,'decode');
+});
+
+// Tensorfold (the EXL3 spark pairs) — finish-scoped counters, running replies
+// only in completion_tokens_total, and exact phase from the streams gauges.
+const tfBase=(o={})=>`tensorfold:requests_running ${o.running??0}\ntensorfold:requests_waiting ${o.waiting??0}\ntensorfold:prompt_tokens_total ${o.prompt??1000}\ntensorfold:generation_tokens_total ${o.gen??100}\ntensorfold_health:completion_tokens_total ${o.comp??100}\ntensorfold_health:cached_tokens_total ${o.cached??0}\ntensorfold_health:requests_total ${o.req??2}\ntensorfold_health:prefill_seconds_total ${o.pre??2}\ntensorfold_health:decode_seconds_total ${o.dec??5}\ntensorfold_health:streams{state="decoding"} ${o.decoding??0}\ntensorfold_health:streams{state="filling"} ${o.filling??0}\n`;
+test('Tensorfold rewrites to session averages, stream-gauge phases and running-reply live decode',()=>{
+ const a=tensorfoldSnapshot(tfBase(),1000);
+ assert.equal(a.source,'tensorfold');assert.equal(a.phase,'idle');
+ assert.equal(a.decode_tps,20);assert.equal(a.prefill_tps,500);
+ assert.equal(a.live_decode_tps,null);assert.equal(a.completed_prefill,null);
+ const b=tensorfoldSnapshot(tfBase({running:1,comp:160,gen:160,dec:7,req:3,prompt:1500,pre:3,decoding:1}),3000,a);
+ assert.equal(b.phase,'decode');assert.equal(b.phase_basis,'engine_stream_gauges');assert.equal(b.decoding_requests,1);
+ assert.equal(b.live_decode_tps,30);
+ assert.equal(b.completed_prefill.tokens,500);assert.equal(b.completed_prefill.seconds,1);assert.equal(b.completed_prefill.tps,500);
+ assert.equal(b.completed_decode.tokens,60);assert.equal(b.completed_decode.seconds,2);assert.equal(b.completed_decode.tps,30);
+ assert.equal(b.completed_prefill_tokens,500);
+ const filling=tensorfoldSnapshot(tfBase({running:1,comp:160,filling:1}),5000,b);
+ assert.equal(filling.phase,'prefill');
+ const mixed=tensorfoldSnapshot(tfBase({running:2,comp:170,decoding:1,filling:1}),7000,filling);
+ assert.equal(mixed.phase,'mixed');
+ const idle=tensorfoldSnapshot(tfBase({req:4}),9000,mixed);
+ assert.equal(idle.phase,'idle');
+ assert.throws(()=>tensorfoldSnapshot('other 5',1));
+});
+test('OpenAI workers rediscover Tensorfold on the shared /metrics route',async()=>{
+ let calls=[];
+ const t=new EndpointTelemetry({now:()=>1000,fetcher:async url=>{calls.push(String(url));return new Response(tfBase({comp:100,gen:100}));}});
+ const w={id:'spark',backend:'openai',url:'http://127.0.0.1:38014/v1'};
+ t.sync([w]);await t.sample(w);
+ assert.equal(t.snapshot('spark').source,'tensorfold');
+ assert.ok(calls.length>=1&&calls.every(c=>c.endsWith('/metrics')));
+ t.close();
 });

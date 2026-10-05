@@ -6,10 +6,10 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {diagnoseSparkConnection,sshAuthenticationEvidence} from './spark-connection-diagnosis.mjs';
 import {sparkIdentity} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './genie-spark-setup.mjs';
+import {createSparkSetupTools} from './spark-setup-transport.mjs';
 import http from 'node:http';
-import {hermesProvider} from './genie-hermes.mjs';
-import {GenieChat} from './genie-chat.mjs';
+
+
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 function fixture(t){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'sg-auth-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
@@ -64,28 +64,4 @@ test('read-only diagnosis follows inspection permission independently from mutat
   assert.equal((await tools.tool({action:'inspect_connection',connection:'FixtureSpark'})).state,'observed');
   inspection=false;await assert.rejects(tools.tool({action:'inspect_connection',connection:'FixtureSpark'}),/switched off/);
   inspection=true;testing=true;await assert.rejects(tools.tool({action:'inspect_connection',connection:'FixtureSpark'}),/testing mode/);assert.equal(calls,1);
-});
-
-test('installed Hermes diagnoses through the real tool registry and preserves its diagnostic receipt',{skip:!process.env.DSG_TEST_HERMES_SOURCE||!process.env.DSG_TEST_HERMES_PYTHON},async t=>{
-  const f=fixture(t);f.fail=true;f.stderr='Offering public key: private-reference\nPermission denied (publickey,password).';let calls=0;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{connectionRepair:{inspect:input=>diagnoseSparkConnection(input,f.options)}});
-  const server=http.createServer((req,res)=>{
-    if(tools.handle(req,res))return;
-    if(req.method==='GET'){res.end(JSON.stringify({data:[{id:'fixture'}]}));return;}
-    let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{
-      if(req.url!=='/v1/chat/completions'){res.end('{}');return;}calls++;if(calls===2)assert.ok(raw.includes('authentication_unavailable'),JSON.stringify(JSON.parse(raw).messages.slice(-2)));
-      const message=calls===1?{role:'assistant',content:null,tool_calls:[{id:'diagnosis',type:'function',function:{name:'tool_call',arguments:JSON.stringify({name:'inspect_spark_connection',arguments:{connection:'FixtureSpark'}})}}]}:{role:'assistant',content:'Authentication failed. Its cause is undetermined; physical access is not established.'};
-      const delta={...message,...(message.tool_calls?{tool_calls:message.tool_calls.map((v,index)=>({...v,index}))}:{})};
-      res.setHeader('content-type','text/event-stream');res.end('data: '+JSON.stringify({id:'fixture',model:'fixture',choices:[{index:0,delta,finish_reason:null}]})+'\n\ndata: '+JSON.stringify({id:'fixture',model:'fixture',choices:[{index:0,delta:{},finish_reason:calls===1?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');
-    });
-  });
-  await new Promise(r=>server.listen(0,'127.0.0.1',r));tools.bind(server.address().port);
-  const provider=hermesProvider({python:process.env.DSG_TEST_HERMES_PYTHON,source:process.env.DSG_TEST_HERMES_SOURCE,url:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture',spark_setup:tools.toolConfig},{directory:f.directory});
-  const directory=path.join(f.directory,'chat'),chat=new GenieChat({directory,provider,getSnapshot:()=>({gateway:{}})});
-  t.after(()=>{chat.close();server.closeAllConnections();server.close();});
-  const c=chat.create();chat.submit(c.id,'Find why the enrolled connection is failing.','fixture-auth-request');await chat.idle();
-  const reply=chat.get(c.id).messages.at(-1);assert.equal(reply.state,'complete',JSON.stringify(reply));assert.equal(calls,2);
-  const event=reply.spark_setup.events.find(e=>e.state==='complete');assert.equal(event.tool,'inspect_spark_connection');assert.equal(event.result.cause,'undetermined');assert.equal(event.result.ssh.keys_offered,1);
-  assert.deepEqual(new GenieChat({directory,provider}).get(c.id).messages.at(-1).spark_setup,reply.spark_setup);
-
 });

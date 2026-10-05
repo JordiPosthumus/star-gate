@@ -11,7 +11,11 @@ export const MACHINE_GROUPS={
   'glm53f-sparks12':['spark1','spark2'],
   'ds41-sparks12':['spark1','spark2'],
   'glm53f-sparks34':['spark3','spark4'],
-  'ds41-sparks34':['spark3','spark4']
+  'ds41-sparks34':['spark3','spark4'],
+  // live qwen cluster lanes (2026-09-28): physical ids = the boxes' ssh hostnames
+  'qwen38-sparks12':['Spark','Spark2'],
+  'qwen38-sparks34':['Spark3','Spark4'],
+  'qwen38-sparks56':['Spark5','Spark6']
 };
 export const machineGroup=worker=>MACHINE_GROUPS[worker]??null;
 export const machinesFor=(worker,config)=>{

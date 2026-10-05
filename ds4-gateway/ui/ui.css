@@ -39,7 +39,6 @@
 
 .fleet-native-progress{margin:16px 0;padding:12px;background:rgba(185,214,139,.06);border-radius:6px}.fleet-native-progress>progress{display:block;width:100%;margin:10px 0;accent-color:#b9d68b}.fleet-native-progress>p{font-size:12px;margin:6px 0 0}
 
-.routing-summary{padding:13px 18px;border-radius:10px;border:1px solid var(--line);white-space:pre-line}.routing-summary[hidden]{display:none}.routing-summary.info{background:#1c2420;border-color:#3c5145;color:#cfe8d6}.routing-summary.warning{background:#3a2923;border-color:#80543e;color:#ffd1b5}.routing-summary.error{background:#3a2323;border-color:#8b4038;color:#ffb3a8}
 
 /* Compact fleet cards: dot + one live line + conditional chips + Details drawer. */
 .devices{grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:12px}
@@ -78,12 +77,12 @@
 .device-live .remaining-estimate{font-size:10px;color:var(--muted);white-space:nowrap}
 
 /* Always-visible utilization strip on the card face. */
-.device-bar{margin-top:8px;display:flex;align-items:center;gap:8px}
+.device-bar{margin-top:8px;display:grid;grid-template-columns:max-content minmax(0,1fr) 3rem;align-items:center;gap:8px}
 .device-bar .bar-label{font-size:8px;letter-spacing:1px;color:var(--muted);white-space:nowrap}
 .device-bar .activity-timeline{flex:1;margin:0;height:12px;min-width:0}
 
 .device-bar .activity-timeline .lane-divider{stroke:var(--bg);stroke-width:1.5;vector-effect:non-scaling-stroke}
-.device-bar .bar-note{font-size:8px;color:var(--muted);white-space:nowrap;cursor:help}
+.device-bar .bar-note{box-sizing:border-box;text-align:center;font-size:8px;color:var(--muted);white-space:nowrap;cursor:help}
 .device-bar .bar-note.pair{color:var(--accent);border:1px solid var(--line);border-radius:7px;padding:0 5px;line-height:1.6}
 .timeline-pair-note{display:none}
 .device-minicharts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:7px}

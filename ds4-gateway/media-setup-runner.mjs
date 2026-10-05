@@ -9,7 +9,7 @@ import {fileURLToPath} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {runMediaSetup} from './media-setup-cycle.mjs';
 import {saveMediaReceipt} from './media-execution.mjs';
-import {setupTransport} from './genie-spark-setup.mjs';
+import {setupTransport} from './spark-setup-transport.mjs';
 import {recoveryCall} from './recovery-transport.mjs';
 import {verifyRecovery,qwenRecoveryProofValid} from './recovery-verify.mjs';
 import {workerControl} from './worker-client.mjs';

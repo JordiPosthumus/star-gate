@@ -19,7 +19,7 @@ import uuid
 
 from operation_maintenance import GatewayControl, Maintenance
 from spark_recipe_trial import Executor, atomic
-from genie_inspection import peer_parameters
+from serving_artifacts import peer_parameters
 from image_peer_transfer import transfer as peer_stream
 
 

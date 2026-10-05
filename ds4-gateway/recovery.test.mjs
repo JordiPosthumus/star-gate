@@ -7,7 +7,7 @@ import {safeNativeRemoval,unavailableNativeRemoval} from './launchd-removal-evid
 import {AgentControl} from './agent-control.mjs';
 import {classifySshFailure,recoveryConfig,systemdCall} from './recovery-transport.mjs';
 import {verifyRecovery} from './recovery-verify.mjs';
-import {Genie,briefing,parseGenieReview} from './genie.mjs';
+
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -323,66 +323,9 @@ test('a late native capture cannot overwrite a newer live identity observation',
   sample={...live,instance:'2'.repeat(32),pid:456};await r.recovery.inspect('one');finish(unavailableNativeRemoval(r.deps.now()));await pending;
   assert.equal(r.recovery.workerStatus(r.n).removal,null);assert.equal(r.recovery.priorIdentity('one').pid,456);await r.recovery.close();
 });
-test('native removal evidence is strictly bounded before reaching Genie and carries no offer',()=>{
-  const now=Date.now(),value={...unavailableNativeRemoval(now),status:'exact_removal_observed',source_complete:true,records:1,observations:[{at:now-1000,caller:'loginwindow'}]};
-  assert.deepEqual(safeNativeRemoval(value,{now}),value);
-  const stop={...value,status:'exact_stop_request_observed',observations:[{at:now-1000,caller:'launchctl'}],native_stop_caller_observed:true};
-  assert.deepEqual(safeNativeRemoval(stop,{now}),stop);
-  for(const change of [{native_stop_caller_observed:false},{observations:[{at:now-1000,caller:'loginwindow'}]},{observations:[]},{authority:'bootstrap'}])
-    assert.equal(safeNativeRemoval({...stop,...change},{now}),null);
-  for(const change of [{raw:'PRIVATE_LOG'},{authority:'restart'},{status:'invented'},{checked_at:now+10001},{observations:[{at:now-1000,caller:'PRIVATE_CALLER'}]},
-    {status:'conflicting_callers'},{native_stop_caller_observed:true},{records:0},{source_complete:false},{observations_omitted:-1},{observations:Array(17).fill(value.observations[0])}])assert.equal(safeNativeRemoval({...value,...change},{now}),null);
-  const snapshot={time:new Date(now).toISOString(),devices:[],gateway:{workers:[{id:'one'}],recovery:{automatic:true,workers:[{worker_id:'one',configured:true,reason:'launchd_registration_absent',eligible:false,removal:value}]}}};
-  const brief=briefing(snapshot);assert.deepEqual(brief.workers[0].recovery_evidence.removal,value);assert.deepEqual(brief.recovery.offers,[]);
-  snapshot.gateway.recovery.workers[0].removal={...value,raw:'PRIVATE_LOG'};assert.equal(briefing(snapshot).workers[0].recovery_evidence.removal,null);assert.ok(!JSON.stringify(briefing(snapshot)).includes('PRIVATE_LOG'));
-});
-test('launchd absence diagnostics reach Genie but never authorize recovery or override a pause',async()=>{
-  for(const [registration,loaded,reason] of [['absent',false,'launchd_registration_absent'],['gui_domain_unavailable',null,'launchd_gui_domain_unavailable'],['unverified',null,'launchd_state_unverified']]){
-    const r=rig(),local={...config,adapter:'launchd',start_stopped:true,service_profile:'c'.repeat(64)};
-    r.recovery.configs.set('one',local);
-    const sample={version:1,machine:local.machine,service_profile:local.service_profile,registration,loaded,active:false,stopped:false,pid:0,instance:'',listener:null};
-    const actions=[];r.recovery.call=async(_config,request)=>{actions.push(request.action);return sample;};
-    r.recovery.setAutomatic(true);r.n.drained=true;
-    await r.recovery.tick();
-    const status=r.recovery.workerStatus(r.n);
-    assert.equal(status.reason,reason);assert.equal(status.state,'paused');assert.equal(status.eligible,false);assert.equal(status.evidence_id,null);
-    assert.throws(()=>r.recovery.request(r.input(),'genie'),new RegExp(reason));
-    assert.throws(()=>r.recovery.request(r.input(),'operator',{canary:true}),new RegExp(reason));
-    const data=briefing({devices:[],gateway:{workers:[{id:'one'}],recovery:r.recovery.status()}});
-    assert.equal(data.workers[0].recovery_evidence.reason,reason);
-    assert.deepEqual(data.recovery.offers,[]);
-    r.n.drained=false;await r.recovery.tick();
-    assert.equal(r.recovery.workerStatus(r.n).eligible,false);
-    assert.ok(actions.every(action=>action==='inspect'));assert.equal(r.store.data.recovery.operations.length,0);
-    for(const change of [{machine:'d'.repeat(64)},{service_profile:'d'.repeat(64)},{registration:'private raw stderr'}, {active:true}]){
-      assert.equal(r.recovery.reason(r.n,{...sample,...change}),'service_identity_or_profile_unverified');
-    }
-    r.recovery.close();
-  }
-});
-test('native Mac disable policy blocks recovery offers, canaries and automatic actions',async()=>{
-  for(const native_disabled of [true,null,undefined,'false']){
-    const r=rig(),local={...config,adapter:'launchd'};r.recovery.configs.set('one',local);
-    const snapshot={...r.sample(),native_disabled};const actions=[];
-    r.recovery.call=async(_config,request)=>{actions.push(request.action);return snapshot;};
-    r.recovery.setAutomatic(true);await r.ready();
-    const reason=native_disabled===true?'launchd_native_disabled':'launchd_disable_state_unverified';
-    assert.equal(r.recovery.workerStatus(r.n).reason,reason);assert.equal(r.recovery.workerStatus(r.n).eligible,false);
-    assert.throws(()=>r.recovery.request(r.input(),'genie'),new RegExp(reason));
-    r.n.drained=true;assert.throws(()=>r.recovery.request(r.input(),'operator',{canary:true}),new RegExp(reason));
-    const data=briefing({devices:[],gateway:{workers:[{id:'one'}],recovery:r.recovery.status()}});
-    assert.equal(data.workers[0].recovery_evidence.reason,reason);assert.deepEqual(data.recovery.offers,[]);
-    assert.ok(actions.every(action=>action==='inspect'));assert.equal(r.store.data.recovery.operations.length,0);
-    r.n.drained=false;assert.equal(r.recovery.reason(r.n,{...snapshot,native_disabled:false}),null,'known non-disabled policy leaves existing eligible behavior intact');
-    r.recovery.configs.set('one',{...local,start_stopped:true,service_profile:'c'.repeat(64)});
-    const stopped={version:1,machine:config.machine,service_profile:'c'.repeat(64),loaded:true,stopped:true,active:false,listener:false,stopped_epoch:'d'.repeat(64),native_disabled};
-    assert.equal(r.recovery.reason(r.n,stopped),reason,'stopped service also respects native policy');
-    assert.equal(r.recovery.reason(r.n,{...snapshot,profile:'e'.repeat(64)}),reason,'changed-profile hand-back cannot override native policy');
-    assert.equal(r.recovery.reason(r.n,{...snapshot,started_at:Date.parse(r.n.quarantine.at)+10000}),reason,'verification-only readmission cannot override native policy');
-    r.recovery.configs.set('one',config);assert.equal(r.recovery.reason(r.n,snapshot),null,'Linux policy is unchanged');
-    r.recovery.close();
-  }
-});
+
+
+
 function localEnrollment(t){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dsg-local-recovery-'));
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -784,11 +727,7 @@ test('controller restart resumes verification, never repeats an issued restart',
   const resumed=new Recovery({workers:[config]},r.deps);assert.equal(r.n.recovering,true);await resumed.tick();await resumed.task;
   assert.equal(r.restarts,1);assert.equal(resumed.status().operations[0].state,'recovered');
 });
-test('operator canary requires pause, remains paused afterward and is not available to Genie',async()=>{
-  const r=rig();r.n.quarantine=null;await r.ready();assert.throws(()=>r.recovery.request(r.input(),'operator',{canary:true}),/drain/);
-  r.n.drained=true;r.recovery.request(r.input(),'operator',{canary:true});await r.recovery.task;
-  assert.equal(r.restarts,1);assert.equal(r.n.drained,true);assert.equal(r.recovery.status().operations[0].state,'verified_paused');
-});
+
 test('operator canary can prove an enrolled stopped-service start while routing stays paused',async()=>{
   let time=1788390000000,started=false,starts=0;
   const enrolled={...config,start_stopped:true,service_profile:'c'.repeat(64)};
@@ -834,15 +773,7 @@ test('generation/cache verifier checks exact outputs, usage, context and both co
     }}));
   }
 });
-test('Genie can request offered recovery; invented evidence, shell fields and disabled policy are rejected',async()=>{
-  const offer={worker_id:'one',evidence_id:'a'.repeat(64)},snapshot={time:Date.now(),devices:[],events:[],gateway:{workers:[],recovery:{automatic:true,workers:[{...offer,eligible:true}]}}};
-  const answer={assessment:'Request recovery of the evidenced fatal worker.',ticker:[{severity:'warning',text:'Worker one has a fatal fault.',recommendation:'Verify recovery.',evidence_refs:['fleet']}],recovery_requests:[offer]};
-  const evidence=briefing(snapshot);assert.equal(parseGenieReview(JSON.stringify(answer),evidence).recovery_requests.length,1);
-  for(const request of [{...offer,command:'reboot'},{...offer,evidence_id:'invented'},{...offer,worker_id:'other'}])assert.equal(parseGenieReview(JSON.stringify({...answer,recovery_requests:[request]}),evidence).recovery_requests.length,0);
-  let sent;const g=new Genie({url:'http://127.0.0.1:39000/v1'},()=>snapshot,{fetchImpl:async()=>Response.json({choices:[{finish_reason:'stop',message:{content:JSON.stringify(answer)}}]}),recover:async input=>{sent=input;return {id:input.action_id,worker_id:input.worker_id,state:'queued'};}});
-  g.setEnabled(true);await g.ask();assert.equal(sent.worker_id,'one');assert.equal(g.status().reports[0].actions_taken[0].state,'queued');
-  snapshot.gateway.recovery.automatic=false;sent=null;await g.ask();assert.equal(sent,null);g.close();
-});
+
 test('full HTTP quarantine → local recovery → two cold/warm checks → durable reinstatement; no LAN action route',async t=>{
   let broken=true,instance='1'.repeat(32),restarts=0,calls=0;
   const backend=http.createServer((req,res)=>{
@@ -876,7 +807,7 @@ test('full HTTP quarantine → local recovery → two cold/warm checks → durab
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'state.json'))).recovery.operations[0].proof.samples.length,4);
 });
 test('dashboard recovery policy and action controls require CSRF; canary has no browser route',async t=>{
-  const calls=[],server=createDashboard(()=>({}),undefined,{read:async()=>({}),act:async(action,input)=>{calls.push({action,input});return {accepted:true};}});
+  const calls=[],server=createDashboard(()=>({}), {management:{read:async()=>({}),act:async(action,input)=>{calls.push({action,input});return {accepted:true};}}});
   await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>{server.closeAllConnections();server.close();});
   const base=`http://127.0.0.1:${server.address().port}`,token=(await(await fetch(base+'/api/workers')).json()).csrf_token;
   for(const action of ['recover','recovery-policy','recovery-handback-policy','recovery-recheck']) {

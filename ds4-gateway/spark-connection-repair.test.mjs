@@ -7,11 +7,11 @@ import {createHash,randomUUID} from 'node:crypto';
 import {createSparkConnectionRepair} from './spark-connection-repair.mjs';
 import {createSparkDiscovery,sparkIdentity} from './spark-discovery.mjs';
 import {inspectNewSpark} from './spark-enrollment.mjs';
-import {createSparkSetupTools} from './genie-spark-setup.mjs';
+import {createSparkSetupTools} from './spark-setup-transport.mjs';
 import {assertDashboardIdle} from './service-control.mjs';
 import http from 'node:http';
-import {hermesProvider} from './genie-hermes.mjs';
-import {GenieChat} from './genie-chat.mjs';
+
+
 
 const sha=b=>createHash('sha256').update(b).digest('hex');
 function fixture(t){
@@ -92,28 +92,4 @@ test('connection tools obey the existing capability and testing gates while rece
 
 test('dashboard restart waits for connection work even when chat is idle',async()=>{
   await assert.rejects(assertDashboardIdle({port:30000},{fetchImpl:async url=>new Response(JSON.stringify(url.endsWith('/spark-connections')?{busy:true}:url.endsWith('/chat')?{conversations:[]}:url.endsWith('/power')?{enabled:false}:{busy:false}),{status:200})}),/connection repair is running/);
-});
-
-test('installed Hermes discovers connection tools, executes the guarded repair and retains its terminal receipt',{skip:!process.env.DSG_TEST_HERMES_SOURCE||!process.env.DSG_TEST_HERMES_PYTHON,timeout:60000},async t=>{
-  const f=fixture(t);let calls=0;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true,targets:{}}},{connectionRepair:f.controller});
-  const server=http.createServer((req,res)=>{
-    if(tools.handle(req,res))return;
-    if(req.method==='GET'){res.end(JSON.stringify({data:[{id:'fixture'}]}));return;}
-    let raw='';req.on('data',c=>raw+=c);req.on('end',()=>{
-      if(req.url!=='/v1/chat/completions'){res.end('{}');return;}calls++;const body=JSON.parse(raw);if(calls===4)assert.match(JSON.stringify(body.messages),/verified_connection/);
-      const name=calls===2?'repair_spark_connection':'spark_connection_status',args=calls===2?f.input:calls===3?{repair_id:f.input.repair_id}:{};
-      const message=calls<=3?{role:'assistant',content:null,tool_calls:[{id:'connection-'+calls,type:'function',function:{name:'tool_call',arguments:JSON.stringify({name,arguments:args})}}]}:{role:'assistant',content:'The configured connection was verified. Model service recovery remains separate.'};
-      const delta={...message,...(message.tool_calls?{tool_calls:message.tool_calls.map((v,index)=>({...v,index}))}:{})};
-      res.setHeader('content-type','text/event-stream');res.end('data: '+JSON.stringify({id:'fixture',model:'fixture',choices:[{index:0,delta,finish_reason:null}]})+'\n\ndata: '+JSON.stringify({id:'fixture',model:'fixture',choices:[{index:0,delta:{},finish_reason:calls<=3?'tool_calls':'stop'}]})+'\n\ndata: [DONE]\n\n');
-    });
-  });
-  await new Promise(r=>server.listen(0,'127.0.0.1',r));tools.bind(server.address().port);
-  const provider=hermesProvider({python:process.env.DSG_TEST_HERMES_PYTHON,source:process.env.DSG_TEST_HERMES_SOURCE,url:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture',spark_setup:tools.toolConfig},{directory:f.root});
-  const directory=path.join(f.root,'chat'),chat=new GenieChat({directory,provider,getSnapshot:()=>({gateway:{}})});
-  t.after(()=>{chat.close();server.closeAllConnections();server.close();});
-  const c=chat.create();chat.submit(c.id,'Restore access to the existing fixture Spark while preserving its services.','fixture-repair-request');await chat.idle();
-  const reply=chat.get(c.id).messages.at(-1);assert.equal(reply.state,'complete',JSON.stringify(reply));assert.equal(calls,4);assert.equal(f.promotions.length,1);assert.equal(f.inspections.length,2);
-  const events=reply.spark_setup.events.filter(e=>e.state==='complete');assert.equal(events.length,3,JSON.stringify(reply.spark_setup));assert.equal(events[1].result.repair_id,f.input.repair_id);assert.equal(events[2].result.stage,'verified_connection');
-  const reload=new GenieChat({directory,provider});assert.deepEqual(reload.get(c.id).messages.at(-1).spark_setup,reply.spark_setup);
 });

@@ -19,7 +19,7 @@ const delta=(value,old)=>finite(value)!==null&&finite(old)!==null&&value>=old?va
 export function prometheusValues(text){
   const result={};
   for(const line of text.split('\n')){
-    const match=line.match(/^(vllm:[\w]+)(?:\{.*\})?\s+([\d.eE+\-]+)(?:\s|$)/);
+    const match=line.match(/^((?:vllm|tensorfold|tensorfold_health):[\w]+)(?:\{.*\})?\s+([\d.eE+\-]+)(?:\s|$)/);
     if(!match)continue;
     const value=finite(Number(match[2]));
     if(value!==null)result[match[1]]=(result[match[1]]??0)+value;
@@ -101,7 +101,11 @@ export function vllmSnapshot(text,now,previous){
   const decodeTokenDelta=sampleValid?delta(decodeTokens,previous?.decode_tokens):null;
   const completedDecode=Number.isSafeInteger(finishedDelta)&&finishedDelta>0&&finishedDelta===decodeCountDelta&&decodeDurationDelta>0&&decodeTokenDelta!==null
     ?{requests:finishedDelta,tokens:decodeTokenDelta,seconds:decodeDurationDelta,tps:decodeTokenDelta/decodeDurationDelta}:null;
-  const measured=Number.isSafeInteger(finishedDelta)&&finishedDelta>0&&finishedDelta===timingCountDelta&&finishedDelta===computedCountDelta&&durationDelta>0&&tokensDelta!==null;
+  // Engines without a computed-token count histogram must not have completed
+  // prefill vetoed: every count that IS present still has to match the finish
+  // count, and an absent series is simply not required evidence.
+  const measured=Number.isSafeInteger(finishedDelta)&&finishedDelta>0&&durationDelta>0&&tokensDelta!==null
+    &&[finishedDelta,timingCountDelta,computedCountDelta].every(count=>count===null||count===finishedDelta);
   const singleSince=running===0?now:sampleValid&&running===1&&previous.running<=1?previous.single_since??(finishedDelta>0&&decoding===0?previous.at:null):null;
   let completedPrefill=null;
   if(measured){
@@ -171,6 +175,52 @@ export function omlxActivity(value){
   };
 }
 
+// Tensorfold (the EXL3 spark pairs) exposes the same evidence under its own
+// namespace, so it is rewritten into the vLLM names the snapshot maths already
+// handles. Two semantic differences are accounted for: its per-request
+// counters are finish-scoped, and completion_tokens_total is the one series
+// that includes running replies, so it alone can drive live decode rates.
+// Its TTFT histogram is observed at completion (verified against a running
+// engine), so counter-based decode inference cannot resolve — the
+// streams-by-state gauges are the exact phase source instead.
+const TENSORFOLD_REMAP=[
+  ['tensorfold:requests_running','vllm:num_requests_running'],
+  ['tensorfold:requests_waiting','vllm:num_requests_waiting'],
+  ['tensorfold_health:completion_tokens_total','vllm:generation_tokens_total'],
+  ['tensorfold:generation_tokens_total','vllm:request_generation_tokens_sum'],
+  ['tensorfold_health:requests_total','vllm:request_generation_tokens_count'],
+  ['tensorfold_health:requests_total','vllm:request_prefill_time_seconds_count'],
+  ['tensorfold_health:requests_total','vllm:request_decode_time_seconds_count'],
+  ['tensorfold:prompt_tokens_total','vllm:prompt_tokens_total'],
+  ['tensorfold_health:cached_tokens_total','vllm:prompt_tokens_cached_total'],
+  ['tensorfold_health:prefill_seconds_total','vllm:request_prefill_time_seconds_sum'],
+  ['tensorfold_health:decode_seconds_total','vllm:request_decode_time_seconds_sum'],
+];
+const tensorfoldStreams=(text,state)=>{
+  const match=text.match(new RegExp(`^tensorfold_health:streams\\{[^}]*state="${state}"[^}]*\\}\\s+([\\d.eE+\\-]+)`,'m'));
+  return match?finite(Number(match[1])):null;
+};
+export function tensorfoldSnapshot(text,now,previous){
+  const raw=prometheusValues(text);
+  if(raw['tensorfold:requests_running']===null)throw new UnsupportedMetrics();
+  const lines=TENSORFOLD_REMAP.filter(([name])=>raw[name]!==null).map(([name,target])=>`${target} ${raw[name]}`);
+  const prompt=raw['tensorfold:prompt_tokens_total'],cached=raw['tensorfold_health:cached_tokens_total'];
+  if(prompt!==null&&cached!==null&&cached<=prompt)lines.push(`vllm:request_prefill_kv_computed_tokens_sum ${prompt-cached}`);
+  const snapshot=vllmSnapshot(lines.join('\n')+'\n',now,previous);
+  const decoding=tensorfoldStreams(text,'decoding'),filling=tensorfoldStreams(text,'filling');
+  if(decoding!==null||filling!==null){
+    const running=raw['tensorfold:requests_running']??0;
+    snapshot.decoding_requests=decoding??0;
+    snapshot.phase=running===0?'idle':decoding>0&&filling>0?'mixed':filling>0?'prefill':decoding>0?'decode':'working';
+    snapshot.phase_basis='engine_stream_gauges';
+  }
+  snapshot.source='tensorfold';
+  // Completion-scoped evidence for the activity markers, mirroring oMLX.
+  const finished=previous?.source==='tensorfold'&&previous.connected!==false&&Number.isSafeInteger(previous.requests)&&Number.isSafeInteger(snapshot.requests)?snapshot.requests-previous.requests:null;
+  snapshot.completed_prefill_tokens=Number.isSafeInteger(finished)&&finished>0?snapshot.interval_prefill??null:null;
+  return snapshot;
+}
+
 export class EndpointTelemetry {
   constructor({fetcher=fetch,now=Date.now,onSample=()=>{}}={}){
     Object.assign(this,{fetcher,now,onSample});
@@ -230,18 +280,23 @@ export class EndpointTelemetry {
     this.busy.set(worker.id,pending);
     const before=this.states.get(worker.id),current=()=>!this.closed&&this.identities.get(worker.id)===key&&this.busy.get(worker.id)===pending;
     const readVllm=async()=>vllmSnapshot(await this.read(worker,'/metrics',{},controller.signal),this.now(),before?.source==='vllm'?before:null);
+    const readTensorfold=async()=>tensorfoldSnapshot(await this.read(worker,'/metrics',{},controller.signal),this.now(),before?.source==='tensorfold'?before:null);
     const readOmlx=async()=>{
       const raw=await this.read(worker,'/api/status',{},controller.signal);let value;
       try{value=JSON.parse(raw);}catch{throw new UnsupportedMetrics();}
       return omlxSnapshot(value,this.now(),before?.source==='omlx'?before:null);
     };
     try{
-      let value;
-      if(before?.source==='omlx'){
-        try{value=await readOmlx();}catch(error){if(!canRediscover(error))throw error;value=await readVllm();}
-      }else{
-        try{value=await readVllm();}catch(error){if(before?.source==='vllm'&&!canRediscover(error))throw error;value=await readOmlx();}
+      const readers={vllm:readVllm,tensorfold:readTensorfold,omlx:readOmlx};
+      // Probe the previously seen source first, then the remaining engines. A
+      // known source is only abandoned when the failure shape (an unparseable
+      // or missing endpoint, not a network error) says the engine changed.
+      let value=null,failure=null;
+      for(const source of [...new Set([before?.source,'vllm','tensorfold','omlx'].filter(Boolean))]){
+        try{value=await readers[source]();break;}
+        catch(error){failure=error;if(before?.source===source&&!canRediscover(error))throw error;}
       }
+      if(!value)throw failure;
       if(value.source==='omlx'){
         value.live_activity=false;
         if(this.now()>=(this.activityRetry.get(worker.id)??0)){
@@ -253,7 +308,7 @@ export class EndpointTelemetry {
         this.states.set(worker.id,{...value,url:worker.url,retryAt:Math.max(started+POLL_MS,this.now())});
         const rows=(before?.source&&before.source!==value.source?[]:this.histories.get(worker.id)??[]).filter(point=>value.at>=point.time&&value.at-point.time<HISTORY_MS&&point.scope===(point.kind==='prefill'?value.prefill_rate_scope??value.live_rate_scope:value.live_rate_scope));
         for(const kind of ['prefill','decode']){
-          const completed=kind==='prefill'&&value.source==='vllm'?value.completed_prefill:null;
+          const completed=kind==='prefill'?value.completed_prefill??null:null;
           const rate=completed?completed.tps:value['live_'+kind+'_tps'];
           if(Number.isFinite(rate)&&(completed?rate>=0:rate>0))rows.push({time:value.activity_at??value.at,kind,tps:rate,scope:kind==='prefill'?value.prefill_rate_scope??value.live_rate_scope:value.live_rate_scope});
         }

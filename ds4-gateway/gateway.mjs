@@ -3,13 +3,13 @@ import {createPairEnrollment,restorePairEnrollments} from './recovery-pair-enrol
 import {requestAuthorized} from './request-auth.mjs';
 import {createMediaHosts} from './media-hosts.mjs';
 import {createMediaSetup} from './media-setup.mjs';
-import {genieCapabilityKeys,validateGenieCapabilities,genieCapabilities} from './genie-capabilities.mjs';
+import {genieCapabilityKeys,validateGenieCapabilities,genieCapabilities} from './fleet-feature-config.mjs';
 import {createMediaExecution} from './media-execution.mjs';
 import {sparkServiceBinding,validateServiceAddition,applyServiceAddition,restoreSparkServices} from './spark-services.mjs';
 import {MediaJobs,handleMediaRequest} from './media-jobs.mjs';
 import {inspectMediaJobInputs} from './media-input-placement.mjs';
 import {activeJobs,activeCount,hasCapacity,requestCapacity,oldestActive} from './worker-activity.mjs';
-import {PRIORITY_HEADER,requestPriority,priorityRank,priorityIndex,priorityOrder} from './job-priority.mjs';
+import {GENIE_KEY_HEADER,isGenieRequest,PRIORITY_HEADER,requestPriority,priorityRank,priorityIndex,priorityOrder} from './job-priority.mjs';
 import {outputShape} from './output-shape.mjs';
 import http from 'node:http';
 import {compose} from 'node:stream';
@@ -30,7 +30,7 @@ import { clientMetadata, CLIENT_METADATA_HEADER } from './client-metadata.mjs';
 import { RoutingShadow } from './routing-shadow.mjs';
 import { GenerationFaultObserver, verifyGeneration } from './generation-health.mjs';
 import { workerConfig, workerConfigs, workerFields, assertUniqueWorker, sshTargets, replaceSshFallbacks } from './worker-config.mjs';
-import {endpointUrl, endpointTransport, endpointHeaders, endpointMetadata} from './endpoint.mjs';
+import {endpointUrl, endpointTransport, endpointHeaders, endpointMetadata, endpointAliases} from './endpoint.mjs';
 import { Recovery } from './recovery.mjs';
 import { classifySshFailure } from './recovery-transport.mjs';
 import { loadConfig, isMain, gatewayPort, gatewayHost, continuityEnabled } from './config.mjs';
@@ -298,9 +298,12 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const serviceConfig={...config,recovery:structuredClone(config.recovery),media_jobs:structuredClone(config.media_jobs),genie_chat:structuredClone(config.genie_chat)};
   try { restoreSparkServices(serviceConfig,store.data.spark_services??{},definitions); restorePairEnrollments(serviceConfig,store.data.pair_recovery_enrollments??{},definitions); restoreOmlxEnrollments(serviceConfig,store.data.omlx_recovery_enrollments??{},definitions); }
   catch(e){store.close();throw e;}
-  let profiles;try{profiles=servingProfiles(config.serving_profiles,definitions);}catch(e){store.close();throw e;}
+  // Persisted registrations are authoritative after removals. Keep dormant profile/route
+  // definitions intact, but they cannot make a removed worker routable or block restart.
+  const registryOptions={allowUnregistered:store.data.workers!==undefined};
+  let profiles;try{profiles=servingProfiles(config.serving_profiles,definitions,registryOptions);}catch(e){store.close();throw e;}
   const nodes = definitions.map(makeNode);
-  let routes;try{routes=modelRoutes(config.model_routes,definitions);}catch(e){store.close();throw e;}
+  let routes;try{routes=modelRoutes(config.model_routes,definitions,registryOptions);}catch(e){store.close();throw e;}
   const dataset = new Dataset(path.join(path.dirname(config.state_file),'requests'),{enabled:config.dataset_enabled===true});
   const shadow = new RoutingShadow({enabled:config.routing_shadow_enabled===true && config.dataset_enabled===true});
   const observe = fn => {if(shadow.enabled)try{return fn();}catch{shadow.state.errors++;}};
@@ -334,7 +337,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   function currentJobsStatus(){
     const jobs=currentJobs();
     return {schema:1,queue_priority_version:1,genie_progress_version:1,observed_at:Date.now(),queued_body:{buffered_bytes:queuedBodyBudget.used,budget_bytes:queuedBodyBudget.limit},jobs:jobs.slice(0,512).map(job=>({
-      request_id:job.id,call_id:job.trafficClass==='genie'?job.callId:null,traffic_class:job.trafficClass,priority:job.priority,chat:job.key??null,title:null,request_preview:job.preview??null,machine:job.node?.id??job.fixedHome?.id??null,
+      request_id:job.id,call_id:job.trafficClass==='genie'?job.callId:null,traffic_class:job.trafficClass,priority:job.priority,priority_policy:job.geniePriority?'genie':null,chat:job.key??null,title:null,request_preview:job.preview??null,machine:job.node?.id??job.fixedHome?.id??null,
       state:job.dispatched?'running':job.waitReason||!jobEligible(job)?'blocked':'queued',
       request_reason:job.dispatched?'Request is already running':job.waitReason??(job.node?.drained?'Routing is paused':!jobEligible(job)?'Worker or conversation is not eligible':null),
       waiting_ms:job.dispatched?Math.max(0,job.dispatchedMono-job.createdMono):Math.max(0,performance.now()-job.createdMono),
@@ -423,7 +426,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       requested_thinking: activeCount(n)===1?n.active.thinking?.result??null:null,
       last_requested_thinking: n.lastThinking ?? null, last_request_finished_at: n.lastFinishedAt ?? null,
       context_length: n.contextLength ?? null,
-      served_model: n.model_aliases?.[config.model] ?? null,
+      served_model: (n.effectiveModelAliases ?? n.model_aliases)?.[config.model] ?? null,
       direct_reserved: directReserved(n),
       health_probe_deferred:n.healthProbeDeferred,
       health_state_source:n.probeError==='busy_probe_deferred'?'recent_upstream_progress':'model_probe',
@@ -579,10 +582,17 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   // job on it is in direct owner use (pi, curl, any client bypassing the gate).
   // While reserved, new admissions prefer other workers; the reservation lapses
   // after a quiet window so cache warmth survives short pauses.
+  //
+  // Engine gauges lag the slot books by up to one dashboard poll, so a sample
+  // scraped before the gate's own last dispatch or finish still shows the
+  // gate's own request as running. Only a sample newer than the gate's last
+  // touch of the node (plus a second of engine-lag grace) may prove a bypass;
+  // older samples are ambiguous, never evidence.
   function directReserveEnabled(){return store.data.direct_reserve_enabled===true;}
   function directReserved(node,now=Date.now()){return directReserveEnabled()&&Number.isFinite(node.directReservedUntil)&&now<node.directReservedUntil;}
   function observeDirectActivity(node,metrics,now=Date.now()){
     if(!metrics||metrics.connected===false||!Number.isFinite(metrics.at)||now-metrics.at>=15000)return;
+    if(Number.isFinite(node.lastGateActivityAt)&&metrics.at<=node.lastGateActivityAt+1000)return;
     if(metrics.running>0&&activeCount(node)===0)node.directReservedUntil=now+directReserveMs();
   }
   function reportDirectActivity(rows,now=Date.now()){
@@ -640,9 +650,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     clientWatch.observeRequest(job.watchId,job.id,'queued');
     evaluateShadow(node,job,wasAdmitted?'worker_free':'admission');schedule(node);
   }
-  const freeGenieNode=(modelRoute,priority='normal',arrival=Number.MAX_SAFE_INTEGER)=>nodes.filter(node=>{
+  const freeGenieNode=(modelRoute,priority='normal',arrival=Number.MAX_SAFE_INTEGER,geniePriority=false)=>nodes.filter(node=>{
     if(!allowsWorker(modelRoute,node)||!node.healthy||node.drained||node.quarantine||node.recovering||node.removed||!hasCapacity(node))return false;
-    const candidate={key:null,priority,sequence:arrival};
+    const candidate={key:null,priority,sequence:arrival,geniePriority};
     return canStartNow(node,candidate,[...node.queue,...parkedFor(node),candidate]);
   }).sort((a,b)=>store.count(a.id)-store.count(b.id)||a.id.localeCompare(b.id))[0];
   function pumpWaiting() {
@@ -652,7 +662,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     for(const job of priorityOrder(waiting)){
       if(job.cancelled)continue;
       heartbeat(job);
-      if(job.genieFlexible){const free=freeGenieNode(job.modelRoute,job.priority,job.sequence);if(free)admit(job,free);else job.waitReason='no_ready_worker';continue;}
+      if(job.genieFlexible){const free=freeGenieNode(job.modelRoute,job.priority,job.sequence,job.geniePriority);if(free)admit(job,free);else job.waitReason='no_ready_worker';continue;}
       if(job.key&&waiting.some(j=>j!==job&&j.sequence<job.sequence&&j.key===job.key)){job.waitReason='same_session_queued';continue;}
       const home=job.key&&store.get(job.key),outstanding=sessionWork(nodes,job.key);
       let node=job.fixedHome??(home&&nodes.find(n=>n.id===home.node));
@@ -760,7 +770,19 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     slot.turnTimer.unref?.();
   }
   function dispatch(node, job) {
+    // Capture one resolved mapping for the whole request, including image repair.
+    const resolvedAliases=node.effectiveModelAliases ?? node.model_aliases;
+    const aliases=resolvedAliases&&Object.keys(resolvedAliases).length?resolvedAliases:undefined;
     const { req, res } = job;
+    const effortAliases=req.url==='/v1/chat/completions'?node.reasoningEffortAliases:undefined;
+    const rewriteRequired=aliases||profiles[node.id]||effortAliases;
+    const rewriteBody=()=>{
+      const transforms=[];
+      if(profiles[node.id])transforms.push(servingProfileTransform(profiles[node.id],req.headers['content-encoding'],req.url));
+      if(aliases)transforms.push(modelAliasTransform(aliases,req.headers['content-encoding']));
+      if(effortAliases)transforms.push(modelAliasTransform(effortAliases,req.headers['content-encoding'],'reasoning_effort'));
+      return transforms.length===1?transforms[0]:compose(...transforms);
+    };
     const requestBody=job.queuedBody?.stream()??req;
     job.dispatched = Date.now();
     job.dispatchedMono=performance.now();
@@ -777,6 +799,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     // are intentionally unauthenticated behind loopback or an SSH tunnel, so
     // the ingress secret must never cross the worker boundary.
     delete headers.authorization;
+    delete headers[GENIE_KEY_HEADER]; // Local scheduling credential never reaches model servers.
     delete headers['x-api-key'];
     delete headers[MODEL_ROUTE_HEADER];
     Object.assign(headers, node.upstreamHeaders ?? {});
@@ -825,6 +848,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       requestBody.off('data', observeBody);requestBody.off('end',bodyEnded);req.off('aborted',bodyAborted);requestBody.off('error',bodyAborted);job.thinking.dispose();
       captureChunks=[];finishCapture(null);
       node.lastThinking = job.thinking.result; node.lastFinishedAt = new Date().toISOString();
+      node.lastGateActivityAt = Date.now();
       if (outcome === 'complete') node.completed++; else if(outcome==='vision_guidance')node.protected++;else if(outcome==='sse_observation_limited')node.observationLimited++;else node.failed++;
       clientWatch.observeRequest(job.watchId,job.id,['complete','vision_guidance'].includes(outcome)?'complete':outcome==='client_cancelled'?'cancelled':['incomplete_sse','sse_observation_limited'].includes(outcome)?'incomplete':'failed');
       if(job.visionNormalized){
@@ -989,7 +1013,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       let gotResponse=false,freshConnectingSocket=false,connected=false;
       const attemptHeaders={...headers};
       if(replacement){delete attemptHeaders['transfer-encoding'];attemptHeaders['content-length']=replacement.length;}
-      if(node.model_aliases||profiles[node.id])delete attemptHeaders['content-length'];
+      if(rewriteRequired)delete attemptHeaders['content-length'];
       const upstream=endpointTransport(target).request(target,{...upstreamOptions(node,target),method:req.method,headers:attemptHeaders},up=>{
         gotResponse=true;
         if(up.statusCode===400&&visionProtection.enabled&&(retry||captureLimit))bufferCandidate(up,retry);
@@ -1019,7 +1043,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       });
       upstream.on('close',()=>{if(!settled&&(job.cancelled||!gotResponse))finish(job.cancelled?'client_cancelled':'connection_closed');});
       if(replacement){
-        if(node.model_aliases||profiles[node.id]){const rewrite=(profiles[node.id]?compose(servingProfileTransform(profiles[node.id],req.headers['content-encoding'],req.url),modelAliasTransform(node.model_aliases??{},req.headers['content-encoding'])):modelAliasTransform(node.model_aliases,req.headers['content-encoding']));rewrite.on('error',e=>upstream.destroy(e));rewrite.pipe(upstream);rewrite.end(replacement);}
+        if(rewriteRequired){const rewrite=rewriteBody();rewrite.on('error',e=>upstream.destroy(e));rewrite.pipe(upstream);rewrite.end(replacement);}
         else upstream.end(replacement);
       }
       return upstream;
@@ -1027,11 +1051,12 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     const upstream=issue(null);
     job.deadline = setTimeout(() => { job.upstream?.destroy(Object.assign(new Error('100-hour request deadline'), { code: 'REQUEST_DEADLINE' })); }, config.request_timeout_ms ?? 360000000);
     log('request_dispatched', { request_id: job.id, node: node.id, session: job.key?.slice(0, 12), affinity: job.affinity, queue_ms: job.dispatched - job.created });
+    node.lastGateActivityAt = Date.now();
     dataset.record('dispatch',{request_id:job.id,node:node.id,queue_ms:job.dispatchedMono-job.createdMono});
     // A queued read-ahead prefix feeds the same observers and upstream once,
     // followed by the still-streaming original upload with backpressure.
     requestBody.on('data',observeBody);requestBody.once('end',bodyEnded);req.once('aborted',bodyAborted);requestBody.once('error',bodyAborted);
-    if(node.model_aliases||profiles[node.id]){const rewrite=(profiles[node.id]?compose(servingProfileTransform(profiles[node.id],req.headers['content-encoding'],req.url),modelAliasTransform(node.model_aliases??{},req.headers['content-encoding'])):modelAliasTransform(node.model_aliases,req.headers['content-encoding']));rewrite.on('error',e=>upstream.destroy(e));upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});requestBody.pipe(rewrite).pipe(upstream);}
+    if(rewriteRequired){const rewrite=rewriteBody();rewrite.on('error',e=>upstream.destroy(e));upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});requestBody.pipe(rewrite).pipe(upstream);}
     else requestBody.pipe(upstream);
   }
 
@@ -1055,10 +1080,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     }
     if (!accepted.has(route)) { req.resume(); return error(res, 404, 'unsupported_route', 'Endpoint is not on the inference allowlist'); }
     let priority;try{priority=requestPriority(req.headers[PRIORITY_HEADER]);}catch(e){req.resume();return error(res,400,'invalid_priority',e.message);}
+    const geniePriority=isGenieRequest(config,req.headers);
     const admissionMetadata=clientMetadata(req.headers[CLIENT_METADATA_HEADER]);
     const keyValue = req.headers['x-session-affinity'] || req.headers['x-ds4-conversation-id'] || req.headers['x-session-id'] || req.headers.session_id;
     const key = keyValue && req.method === 'POST' ? digest(String(keyValue)) : null;
-    const requestId=randomUUID(),callId=validCallId(req.headers[CALL_ID_HEADER]),watchId=validClientWatchId(req.headers[CLIENT_WATCH_HEADER]),trafficClass=req.headers['x-dsg-observer']==='gate-genie'?'genie':'unclassified';
+    const requestId=randomUUID(),callId=validCallId(req.headers[CALL_ID_HEADER]),watchId=validClientWatchId(req.headers[CLIENT_WATCH_HEADER]),trafficClass=geniePriority||req.headers['x-dsg-observer']==='gate-genie'?'genie':'unclassified';
     if(req.method==='POST')clientWatch.observeRequest(watchId,requestId,'received');
     if(draining)return reject(req,res,503,'draining','Gateway is draining; no new requests admitted',{id:requestId,callId,key,reason:'gateway_draining'});
     let modelRoute;try{modelRoute=routeSelection(routes,req.headers[MODEL_ROUTE_HEADER]);}catch(e){req.resume();return error(res,400,'unknown_model_route',e.message);}
@@ -1092,7 +1118,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           try {
             if (up.statusCode !== 200) throw new Error();
             const data = JSON.parse(body); if (!Array.isArray(data.data)) throw new Error();
-            if(node.model_aliases){const originals=[...data.data];for(const [alias,id] of Object.entries(node.model_aliases)){const model=originals.find(m=>m.id===id);if(model&&!data.data.some(m=>m.id===alias))data.data.push({...model,id:alias,owned_by:'dsg-pool'});}}
+            const aliases=endpointAliases(node,data,config);
+            node.effectiveModelAliases=aliases;
+            node.reasoningEffortAliases=endpointMetadata(node,data,config).reasoningEffortAliases;
+            if(Object.keys(aliases).length){const originals=[...data.data];for(const [alias,id] of Object.entries(aliases)){const model=originals.find(m=>m.id===id);if(model&&!data.data.some(m=>m.id===alias))data.data.push({...model,id:alias,owned_by:'dsg-pool'});}}
             const publishedContext=modelRoute?Math.min(...nodes.filter(n=>modelRoute.workers.has(n.id)).map(n=>n.context_length??contextLimit())):contextLimit();
             // Explicit routes publish their guarantee; unselected traffic keeps the pool limit.
             // Explicit per-worker aliases only rewrite the top-level request model.
@@ -1112,8 +1141,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       res.on('close', () => probe.destroy());
       return;
     }
-    const genieFlexible=trafficClass==='genie'&&!key&&req.headers['x-dsg-review-flexible']==='1';
-    if(genieFlexible){node=freeGenieNode(modelRoute,priority);waitReason=node?null:'no_ready_worker';}
+    const genieFlexible=!key&&(geniePriority||(trafficClass==='genie'&&req.headers['x-dsg-review-flexible']==='1'));
+    if(genieFlexible){node=freeGenieNode(modelRoute,priority,Number.MAX_SAFE_INTEGER,geniePriority);waitReason=node?null:'no_ready_worker';}
     if(trafficClass==='genie'&&req.headers['x-dsg-review-no-wait']==='1'){
       // Check atomically at admission. A previously free snapshot cannot grant
       // permission to put an advisory review behind user work after a race.
@@ -1121,7 +1150,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     }
     if ((node&&node.queue.length+parkedFor(node).length>=queueBound())||(!node&&waiting.length>=waitingBound()))return reject(req,res,429,'queue_full','DSG waiting capacity is full; request was not dispatched. Wait for capacity or use the patient client adapter.',{id:requestId,callId,key,node,reason:'queue_full'});
     const job = { req, res, key, affinity, id:requestId,callId,watchId, sequence:sequence++,admissionMetadata,created: Date.now(), createdMono:performance.now(), cancelled: false,queueTimeoutMs:queueTimeoutMs(),
-      trafficClass,genieFlexible,modelRoute,priority };
+      trafficClass,geniePriority,genieFlexible,modelRoute,priority };
     job.previewFromRequest=req.headers['x-dsg-priority-intent']!=='off'&&trafficClass!=='genie'&&req.url==='/v1/chat/completions';
     const cancel = () => {
       if (res.writableFinished) return;
@@ -1214,6 +1243,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
             const metadata = endpointMetadata(node, JSON.parse(body), config);
             node.modelMatches = res.statusCode === 200 && metadata.available;
             node.probeModel = metadata.probeModel;
+            if(res.statusCode===200&&metadata.available){node.effectiveModelAliases=metadata.aliases;node.reasoningEffortAliases=metadata.reasoningEffortAliases;}
             const previousContext=node.contextLength;
             node.contextLength = metadata.contextLength;
             if(previousContext!==undefined && previousContext!==node.contextLength)observe(()=>shadow.reset(node.id));
@@ -1610,7 +1640,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
             const recovered=[];
             for(const n of selected.filter(n=>n.quarantine)) {
               if(n.active || n.queue.length)throw new Error('Wait for this worker to become idle before recovery verification');
-              const proof=await verifyGeneration(n.url,n.probeModel ?? config.model,{worker:n});
+              const proof=await verifyGeneration(n.url,n.probeModel ?? config.model,{worker:n,timeoutMs:config.request_timeout_ms});
               if(shuttingDown || draining)throw new Error('Gateway is draining');
               recovered.push({node:n,proof});
             }

@@ -6,7 +6,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {createOmlxEnrollment,restoreOmlxEnrollments} from './recovery-omlx-enrollment.mjs';
 import {Recovery} from './recovery.mjs';
-import {createRecoveryTools} from './genie-recovery.mjs';
+
 import http from 'node:http';
 import {createGateway} from './gateway.mjs';
 import {workerControl} from './worker-client.mjs';
@@ -81,14 +81,7 @@ test('restore rejects collisions, changed adapter and invented stopped-start aut
     const bad=structuredClone(saved);Object.assign(Object.values(bad)[0].entry,change);assert.throws(()=>restoreOmlxEnrollments({},bad,[f.worker]),/journal_invalid/);
   }
 });
-test('Genie local enrollment accepts only the worker and its durable action ID under all capability gates',async()=>{
-  let enabled=true,changes=true,inspection=true,testing=false;const calls=[];
-  const q=createRecoveryTools({read:async()=>({version:1,recovery:{workers:[],operations:[]}}),enrollOmlx:async input=>{calls.push(input);return {...input,state:'queued'};},isEnabled:()=>enabled,isChangesEnabled:()=>changes,isInspectionEnabled:()=>inspection,isTesting:()=>testing});
-  const input={action:'enroll-omlx',action_id:randomUUID(),worker_id:'custom'};
-  assert.equal((await q.tool(input)).state,'queued');await assert.rejects(q.tool({...input,launcher:'/untrusted'}),/Specify/);
-  for(const toggle of [()=>enabled=false,()=>{enabled=true;changes=false;},()=>{changes=true;inspection=false;},()=>{inspection=true;testing=true;}]){toggle();await assert.rejects(q.tool(input),/suspended/);}
-  assert.equal(calls.length,1);
-});
+
 test('real core socket durably queues one local enrollment and refuses absent native files without actions',async t=>{
   const f=fixture(t,{cleanup:false}),server=http.createServer((_req,res)=>res.end(JSON.stringify({data:[{id:'fixture',max_model_len:400000}]})));let gateway;
   t.after(async()=>{try{await gateway?.close();}finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(f.directory,{recursive:true,force:true});}});

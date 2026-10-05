@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {mediaEngine} from './media-enrollment.mjs';
 import {mediaPair} from './media-pair.mjs';
-import {mediaStandardTargets} from './media-standard-watch.mjs';
+import {mediaStandardTargets} from './media-standard-targets.mjs';
 
 // Read-only native checks. Enrollment is retained even when its container is absent.
 export function createMediaStandardAudit({config,store,workers,isEnabled,isInspectionEnabled,active,transport,backup,now=Date.now}){

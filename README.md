@@ -1,3 +1,5 @@
+> **Gateway-only transition:** The legacy Genie agent, Telegram bridge and agent tool wrappers have been removed. Routing, fleet monitoring, model controls and media services remain. The complete, unmodified Hermes fork is saved separately in `vendor/hermes`; it is not installed or running. Older Genie descriptions below are historical and do not describe this transition build.
+
 # Star Gate
 
 **Seamless Continuity**
@@ -807,3 +809,35 @@ without warranty, as described in the license.
 
 DS4, dependencies and separately obtained model weights retain their own licenses
 and notices; DSG's license does not replace those terms. See [credits](CREDITS.md).
+
+
+The dashboard’s **Brain** tab edits Gate Genie’s native Hermes provider, model,
+API endpoint and reasoning setting. Saves preserve the rest of `config.yaml`
+and back up the previous file under the Hermes profile’s `brain-history/`.
+Hermes reads these defaults between turns; an explicit conversation `/model`
+override still takes precedence. Saving does not restart Hermes or reset its
+conversation. **Test connection** only lists provider models and submits no
+inference. Credentials remain managed by native Hermes setup. Dashboard status
+polling reads local runtime state and does not ask Genie to generate reports.
+
+### Pool model discovery
+
+For OpenAI-compatible or model-agnostic workers, the gateway resolves its logical
+pool name (usually `PoolModel`) from the existing `/v1/models` health check. A
+single-model endpoint automatically follows model replacements, including a
+stale saved pool alias. A valid configured pool alias takes precedence on a
+multi-model endpoint; otherwise a native model matching the pool name is used.
+An ambiguous catalogue requires an explicit pool alias; list order is never a
+model-selection policy. Other explicit model names and aliases remain unchanged.
+
+Model discovery, request translation and the displayed serving model use the
+same resolution. Updates take effect after the next successful existing health
+probe (normally within five seconds); model changes should finish before new
+work is admitted. This adds no polls, LLM calls or inference retries, and does
+not alter context limits, generation settings or request concurrency.
+
+On a single-model Qwen 3.8 backend, maximum reasoning is spelled `xhigh`.
+The gateway translates a top-level Chat Completions `reasoning_effort: "max"`
+to that native spelling. This preserves maximum reasoning; it does not change
+Genie's saved setting or requests sent to GLM. Other effort values, nested tool
+arguments, prompts and generation parameters pass through unchanged.

@@ -1,0 +1,12 @@
+{
+  "upstream": "https://github.com/NousResearch/hermes-agent.git",
+  "revision": "8c9fe964009096e46f44292d036c1e0ac33c3026",
+  "branch": "codex/gate-genie",
+  "baseline_tag": "dsg-hermes-baseline-20260927",
+  "shallow": false,
+  "tracked_files": 16509,
+  "removed_files": 0,
+  "modified_files": 0,
+  "github_fork_created": false,
+  "installed_or_started": false
+}

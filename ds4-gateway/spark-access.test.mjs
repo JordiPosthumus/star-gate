@@ -7,7 +7,7 @@ import http from 'node:http';
 import {randomUUID,createHash} from 'node:crypto';
 import {SparkAccess,handleSparkAccessSettings} from './spark-access.mjs';
 import {sparkIdentity} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './genie-spark-setup.mjs';
+import {createSparkSetupTools} from './spark-setup-transport.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const facts=(id='a')=>({system:'Linux',architecture:'aarch64',machine_id:id.repeat(64),gpus:[{name:'NVIDIA GB10',uuid:`GPU-${id.repeat(32)}`}]});

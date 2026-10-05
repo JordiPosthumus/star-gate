@@ -11,7 +11,7 @@ import {randomUUID,createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {saveMediaReceipt} from './media-execution.mjs';
-import {bundleRecipes,setupTransport} from './genie-spark-setup.mjs';
+import {bundleRecipes,setupTransport} from './spark-setup-transport.mjs';
 import {mediaPlanIdentity} from './spark-media-cycle.mjs';
 
 const kinds={'ace-step':'music',h3:'video'},terminal=new Set(['enrolled','failed_returned','failed_unchanged']);

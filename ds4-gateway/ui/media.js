@@ -8,7 +8,7 @@ function render(){
   $('media-status').textContent=state.enabled?'Genie media placement is on':'Genie media placement is off — change it under Gate Genie → Capabilities';
   const engines=state.engines??[{id:'ace-step',label:'ACE-Step',kind:'music',supported:true},{id:'h3',label:'MiniMax H3',kind:'video',supported:true},{id:'minimax-m3',label:'MiniMax M3',supported:false},{id:'ltx',label:'LTX',supported:false}];
   $('media-engines').replaceChildren(...engines.map(engine=>{
-    const button=el('button',engine.label+(engine.supported?'':' · planned'),'button');button.type='button';button.setAttribute('role','tab');button.setAttribute('aria-selected',String(engine.id===selected));button.addEventListener('click',()=>{selected=engine.id;signature='';render();});return button;
+    const button=el('button',undefined,'button media-engine-tab');button.dataset.supported=String(!!engine.supported);button.append(el('span',engine.label+(engine.supported?'':' · planned')));if(engine.supported){const count=el('span',String((state.jobs??[]).filter(job=>job.kind===engine.kind).length),'media-engine-count');count.title='Jobs for this engine';button.append(count);}button.type='button';button.setAttribute('role','tab');button.setAttribute('aria-selected',String(engine.id===selected));button.addEventListener('click',()=>{selected=engine.id;signature='';render();});return button;
   }));
   const engine=engines.find(e=>e.id===selected);
   $('media-video-form').hidden=selected!=='h3';
@@ -127,3 +127,13 @@ void refresh();setInterval(refresh,5000);
 
 // Fleet links select the corresponding engine before opening the Media tab.
 document.addEventListener('click',event=>{const link=event.target.closest?.('[data-media-engine]');if(link){selected=link.dataset.mediaEngine;signature='';render();}});
+
+$('media-native-refresh').addEventListener('click',async()=>{
+  const button=$('media-native-refresh'),message=$('media-native-status');button.disabled=true;message.textContent='Checking media engines…';
+  try{
+    const response=await fetch('/api/fleet-workloads?refresh=1',{signal:AbortSignal.timeout(12000)});
+    const value=await response.json();if(!response.ok)throw Error(value.error??'Media check failed.');
+    const rows=value.native_engines??[],count=state=>rows.filter(row=>row.state===state).length;
+    message.textContent=`${count('busy')} busy · ${count('idle')} empty · ${count('unknown')} unavailable. Idle engines are checked on demand.`;
+  }catch(error){message.textContent=error.message;}finally{button.disabled=false;}
+});

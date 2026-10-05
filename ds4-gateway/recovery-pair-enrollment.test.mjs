@@ -6,7 +6,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {createPairEnrollment,restorePairEnrollments} from './recovery-pair-enrollment.mjs';
 import {Recovery} from './recovery.mjs';
-import {createRecoveryTools} from './genie-recovery.mjs';
+
 import http from 'node:http';
 import {createGateway} from './gateway.mjs';
 import {workerControl} from './worker-client.mjs';
@@ -71,14 +71,7 @@ test('restore preserves static services and refuses conflicting or corrupt enrol
   const fresh={recovery:{workers:[structuredClone(Object.values(saved)[0].entry)]}};assert.throws(()=>restorePairEnrollments(fresh,saved,[f.worker]),/one registered/);
   const corrupt=structuredClone(saved);Object.values(corrupt)[0].entry.id='another';assert.throws(()=>restorePairEnrollments({},corrupt,[f.worker]),/journal_invalid/);
 });
-test('Genie receives only fixed enrollment inputs and respects independent mutation capabilities',async()=>{
-  let enabled=true,changes=true,inspection=true,testing=false;const calls=[];
-  const q=createRecoveryTools({read:async()=>({version:1,recovery:{workers:[],operations:[]}}),recover:()=>assert.fail('restart requested'),enroll:async input=>{calls.push(input);return {...input,state:'queued'};},isEnabled:()=>enabled,isChangesEnabled:()=>changes,isInspectionEnabled:()=>inspection,isTesting:()=>testing});
-  const input={action:'enroll-pair',action_id:randomUUID(),capture_id:randomUUID(),worker_id:'custom'};
-  assert.equal((await q.tool(input)).state,'queued');assert.equal(calls.length,1);
-  for(const toggle of [()=>enabled=false,()=>{enabled=true;changes=false;},()=>{changes=true;inspection=false;},()=>{inspection=true;testing=true;}]){toggle();await assert.rejects(q.tool(input),/unavailable/);}
-  testing=false;await assert.rejects(q.tool({...input,helper:'/untrusted'}),/Specify/);assert.equal(calls.length,1);
-});
+
 test('real private core protocol queues one enrollment and reports missing evidence without granting recovery',async t=>{
   const f=fixture(t,{cleanup:false}),server=http.createServer((_req,res)=>res.end(JSON.stringify({data:[{id:'fixture',max_model_len:400000}]})));let gateway;
   t.after(async()=>{try{await gateway?.close();}finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(f.directory,{recursive:true,force:true});}});

@@ -38,3 +38,13 @@ pickuphere.md
 docs/hourglass-spark-omlx-handoff.md
 docs/server-deployment-reference.md
 plans/
+
+# Private config variants and local support notes.
+**/config.local.json*
+**/.dsg-secrets/
+GENIE-HERMES-FORK-FIXLIST-*.md
+Gate-Genie-Embedded-Hermes-Fork-Plan-*.md
+
+# Local scratch and vendored clone never belong in Git.
+tmp/
+vendor/hermes/
