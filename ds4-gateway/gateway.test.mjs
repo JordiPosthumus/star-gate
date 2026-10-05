@@ -2653,3 +2653,17 @@ test('worker removal survives restart with dormant model routes and serving prof
   assert.equal(r.backends[0].records.length,0);
   assert.deepEqual(r.config.model_routes,{old:['spark1'],current:['spark2']});
 });
+
+test('aliased rewrites reach the backend exactly once (no phantom request)',async t=>{
+  const r=await rig(t,1);await r.gateway.close();
+  r.config.nodes[0].model_aliases={pool:'deepseek-v4-flash'};r.gateway=r.gatewayInstance=createGateway(r.config);r.address=await r.gateway.start();
+  let upstreamRequests=0;
+  r.backends[0].server.on('request',req=>{if(req.url!=='/v1/models')upstreamRequests++;});
+  const payload={model:'pool',stream:true,messages:[{role:'user',content:'single request check'}]};
+  const body=JSON.stringify(payload);
+  const response=await r.request(body,'phantom',{headers:{'content-length':Buffer.byteLength(body)}});
+  assert.equal(response.status,200);
+  await delay(80);
+  assert.equal(upstreamRequests,1);
+  assert.equal(r.backends[0].records.at(-1).payload.model,'deepseek-v4-flash');
+});

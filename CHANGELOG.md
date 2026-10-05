@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-05 — Rewritten uploads stop leaking a phantom second request
+
+The exact-length rewrite work left an orphaned upstream request in the
+dispatch path: every rewritten job opened a second request that carried
+headers but never a body. Engines held a concurrency slot open for each
+phantom, so lanes silently filled with dead weight while reporting healthy —
+the afternoon stall, the M3 quarantine, and the evening jam were all this one
+bug. The rewrite path is now the only issuer; a regression test asserts an
+aliased request reaches the backend exactly once.
+
 ## 2026-10-05 — Rewritten uploads reach engines with an exact Content-Length
 
 Model-alias rewrites streamed their substituted bodies with chunked transfer

@@ -1071,7 +1071,6 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(replacement!=null)upstream.end(replacement);
       return upstream;
     };
-    const upstream=issue(null);
     job.deadline = setTimeout(() => { job.upstream?.destroy(Object.assign(new Error('100-hour request deadline'), { code: 'REQUEST_DEADLINE' })); }, config.request_timeout_ms ?? 360000000);
     log('request_dispatched', { request_id: job.id, node: node.id, session: job.key?.slice(0, 12), affinity: job.affinity, queue_ms: job.dispatched - job.created });
     node.lastGateActivityAt = Date.now();
