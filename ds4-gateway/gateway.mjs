@@ -12,7 +12,7 @@ import {activeJobs,activeCount,hasCapacity,requestCapacity,oldestActive} from '.
 import {GENIE_KEY_HEADER,isGenieRequest,PRIORITY_HEADER,requestPriority,priorityRank,priorityIndex,priorityOrder} from './job-priority.mjs';
 import {outputShape} from './output-shape.mjs';
 import http from 'node:http';
-import {compose} from 'node:stream';
+import {compose,PassThrough} from 'node:stream';
 import {servingProfiles,servingProfileTransform} from './serving-profile.mjs';
 import {modelAliasTransform} from './model-alias.mjs';
 import {MODEL_ROUTE_HEADER,modelRoutes,routeSelection,allowsWorker} from './model-routing.mjs';
@@ -775,7 +775,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   function dispatch(node, job) {
     // Capture one resolved mapping for the whole request, including image repair.
     const resolvedAliases=node.effectiveModelAliases ?? node.model_aliases;
-    const aliases=resolvedAliases&&Object.keys(resolvedAliases).length?resolvedAliases:undefined;
+    // Identity mappings substitute nothing; treating them as a rewrite would only
+    // reframe the upload (chunked) for no change at all.
+    const aliases=resolvedAliases&&Object.entries(resolvedAliases).some(([alias,id])=>alias!==id)?resolvedAliases:undefined;
     const { req, res } = job;
     const effortAliases=req.url==='/v1/chat/completions'?node.reasoningEffortAliases:undefined;
     const rewriteRequired=aliases||profiles[node.id]||effortAliases;
@@ -784,7 +786,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(profiles[node.id])transforms.push(servingProfileTransform(profiles[node.id],req.headers['content-encoding'],req.url));
       if(aliases)transforms.push(modelAliasTransform(aliases,req.headers['content-encoding']));
       if(effortAliases)transforms.push(modelAliasTransform(effortAliases,req.headers['content-encoding'],'reasoning_effort'));
-      return transforms.length===1?transforms[0]:compose(...transforms);
+      return transforms.length===1?transforms[0]:transforms.length?compose(...transforms):new PassThrough();
     };
     // Buffered alias/profile rewriting for paths that already hold the full body
     // (vision recovery turns): the rewritten body ships with an exact
@@ -1029,10 +1031,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       up.on('end',()=>{const streamEnd=isSSE?(responseEncoded?'encoded_unobserved':observer.finishState()):null;finish(up.statusCode>=400?'upstream_http_error':!isSSE?'complete':streamEnd==='engine_error'?'upstream_engine_error':['terminal','terminal_without_done','terminal_without_finish_reason','terminal_reason_unobserved'].includes(streamEnd)?'complete':['observation_limited','encoded_unobserved'].includes(streamEnd)?'sse_observation_limited':'incomplete_sse',up.statusCode,streamEnd);});
       up.pipe(res);
     };
-    const issue=(replacement,retry=false)=>{
+    const issue=(replacement,retry=false,exactLength=null)=>{
       let gotResponse=false,freshConnectingSocket=false,connected=false;
       const attemptHeaders={...headers};
-      if(replacement){delete attemptHeaders['transfer-encoding'];attemptHeaders['content-length']=replacement.length;}
+      if(exactLength!=null)attemptHeaders['content-length']=exactLength;
+      else if(replacement){delete attemptHeaders['transfer-encoding'];attemptHeaders['content-length']=replacement.length;}
       else if(rewriteRequired)delete attemptHeaders['content-length'];
       const upstream=endpointTransport(target).request(target,{...upstreamOptions(node,target),method:req.method,headers:attemptHeaders},up=>{
         gotResponse=true;
@@ -1076,29 +1079,46 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     // A queued read-ahead prefix feeds the same observers and upstream once,
     // followed by the still-streaming original upload with backpressure.
     requestBody.on('data',observeBody);requestBody.once('end',bodyEnded);req.once('aborted',bodyAborted);requestBody.once('error',bodyAborted);
-    if(rewriteRequired){
-      // Exact-length uploads. Some engine HTTP frontends cannot decode chunked
-      // request bodies (observed on TensorFold 0.6.5: an empty body, then a
-      // double-framed 400). Rewritten requests are therefore buffered up to a
-      // bound so the upstream request carries the true Content-Length; larger
-      // uploads keep streaming chunked, as before.
-      const rewrite=rewriteBody();
-      const pieces=[];let size=0,overflow=false,upstream=null;
-      rewrite.on('data',chunk=>{
-        if(!overflow){
-          if(size+chunk.length<=rewriteBufferBytes){pieces.push(chunk);size+=chunk.length;return;}
-          overflow=true;upstream=issue(null);
+    if(rewriteRequired&&!profiles[node.id]&&!effortAliases){
+      // Exact-length streaming rewrite. Some engine HTTP frontends cannot decode
+      // chunked request bodies (observed on TensorFold 0.6.5: an empty body, then
+      // a double-framed 400). The alias rewrite substitutes only the top-level
+      // model string, so once that substitution is observed the final body length
+      // is known: send the corrected Content-Length and stream the remainder
+      // through unchanged. Uploads without a match (or beyond the pre-read bound,
+      // or without a declared length) keep streaming chunked, as before.
+      const state={delta:0,settled:false};
+      const rewrite=modelAliasTransform(aliases,req.headers['content-encoding'],'model',state);
+      const pieces=[];let size=0,mode=null,upstream=null;
+      const clientLength=/^\d+$/.test(req.headers['content-length']??'')?Number(req.headers['content-length']):null;
+      const writePiece=chunk=>{if(upstream.write(chunk))return;rewrite.pause();upstream.once('drain',()=>rewrite.resume());};
+      const onData=chunk=>{
+        if(mode)return;
+        pieces.push(chunk);size+=chunk.length;
+        if(state.settled&&clientLength!=null){
+          mode='exact';rewrite.removeListener('data',onData);
+          upstream=issue(null,null,clientLength+state.delta);
           upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
-          for(const piece of pieces)if(!upstream.write(piece)){rewrite.pause();upstream.once('drain',()=>rewrite.resume());}
+          for(const piece of pieces)writePiece(piece);
           pieces.length=0;
+          // The transform keeps draining its buffered tail and the remainder;
+          // after the settled substitution it is a pass-through.
+          rewrite.pipe(upstream);
         }
-        if(!upstream.write(chunk)){rewrite.pause();upstream.once('drain',()=>rewrite.resume());}
-      });
+        else if(state.settled||size>rewriteBufferBytes){
+          mode='chunked';rewrite.removeListener('data',onData);
+          upstream=issue(null);
+          upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
+          for(const piece of pieces)writePiece(piece);
+          pieces.length=0;
+          rewrite.pipe(upstream);
+        }
+      };
+      rewrite.on('data',onData);
       rewrite.once('error',e=>{if(upstream)upstream.destroy(e);else requestBody.destroy(e);});
-      rewrite.once('end',()=>{
-        if(overflow)upstream.end();
-        else upstream=issue(Buffer.concat(pieces,size));
-      });
+      requestBody.once('end',()=>{if(mode===null)upstream=issue(Buffer.concat(pieces,size));});
+      requestBody.pipe(rewrite);
+      res.once('close',()=>rewrite.destroy());
     }
     else{const upstream=issue(null);requestBody.pipe(upstream);}
   }

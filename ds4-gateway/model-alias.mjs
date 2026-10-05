@@ -2,7 +2,7 @@ import {Transform,PassThrough} from 'node:stream';
 
 // Scan bytes, retaining only a bounded top-level key/model string. Prompts,
 // images and tool arguments pass through incrementally, without reserialization.
-export function modelAliasTransform(aliases,encoding,field='model') {
+export function modelAliasTransform(aliases,encoding,field='model',state=null) {
   aliases=Object.fromEntries(Object.entries(aliases).filter(([a,b])=>a!==b));
   // Opaque encoded uploads remain byte-identical. Alias translation requires JSON.
   if((encoding&&encoding!=='identity')||!Object.keys(aliases).length)return new PassThrough();
@@ -22,7 +22,8 @@ export function modelAliasTransform(aliases,encoding,field='model') {
           // Model identifiers beyond the bound are invalid config matches; flush
           // them unchanged, without buffering an arbitrarily large string.
           if(!overflow){let value;try{value=JSON.parse(Buffer.from(token).toString());}catch{}
-            parts.push(Object.hasOwn(aliases,value)?Buffer.from(JSON.stringify(aliases[value])):Buffer.from(token));}
+            if(Object.hasOwn(aliases,value)){const replacement=Buffer.from(JSON.stringify(aliases[value]));parts.push(replacement);if(state){state.delta+=replacement.length-token.length;state.settled=true;}}
+            else parts.push(Buffer.from(token));}
           start=i+1;
         }
         role=null;token=[];overflow=false;continue;

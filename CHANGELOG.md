@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-05 — Rewritten uploads reach engines with an exact Content-Length
+
+Model-alias rewrites streamed their substituted bodies with chunked transfer
+encoding, which the upgraded TensorFold 0.6.5 frontend cannot decode: it saw an
+empty body, answered 400, and its error path appended a second HTML document
+beyond its own Content-Length. That malformed response tripped llhttp inside the
+gateway (HPE_INVALID_CONSTANT) and — before the previous fix — crashed the
+process. The alias rewrite now tracks its substitution delta: once the top-level
+model string has been rewritten, the gateway sends the corrected Content-Length
+and streams the remainder through unchanged. Uploads without a match, beyond a
+bounded pre-read, or without a declared length keep streaming chunked as before;
+vision recovery turns ship their rewritten bodies buffered with exact lengths.
+Identity-only alias sets no longer count as rewrites and never reframe uploads.
+
 ## 2026-10-05 — Gateway survives malformed upstream responses
 
 An upstream that fails mid-response (here: the freshly upgraded TensorFold engine
