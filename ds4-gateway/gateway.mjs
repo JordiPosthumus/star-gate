@@ -908,6 +908,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(isSSE&&!responseEncoded)observer.accept(chunk);
     };
     const sendBuffered=(up,body)=>{
+      // A settle path (upstream error, deadline, client abort) may already have
+      // answered or destroyed the client. Re-writing headers here throws
+      // ERR_HTTP_HEADERS_SENT inside this async handler, which takes down the
+      // whole gateway process — the crash this guard prevents.
+      if(settled||res.destroyed||res.headersSent){if(!settled)finish('upstream_stream_error','RESPONSE_ALREADY_SENT');return;}
       const isSSE=String(up.headers['content-type']).includes('text/event-stream');
       observeResponse(up,isSSE);if(body.length)acceptResponseChunk(up,body,isSSE);
       res.writeHead(up.statusCode,responseHeaders(up));res.end(body);
@@ -930,8 +935,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       job.upstreamResponse=up;
       let chunks=[],bytes=0,passthrough=false,isSSE=false;
       const write=chunk=>{acceptResponseChunk(up,chunk,isSSE);if(!res.write(chunk)){up.pause();res.once('drain',()=>up.resume());}};
-      const beginPassthrough=()=>{if(passthrough)return;passthrough=true;observeResponse(up,isSSE);res.writeHead(up.statusCode,responseHeaders(up));res.flushHeaders();for(const chunk of chunks)write(chunk);chunks=[];};
+      const beginPassthrough=()=>{if(passthrough||settled||res.destroyed||res.headersSent)return;passthrough=true;observeResponse(up,isSSE);res.writeHead(up.statusCode,responseHeaders(up));res.flushHeaders();for(const chunk of chunks)write(chunk);chunks=[];};
       up.on('data',chunk=>{
+        if(settled||res.destroyed)return;
         if(passthrough)return write(chunk);
         if(bytes+chunk.length<=JPEG_REJECTION_INSPECTION_BYTES){chunks.push(chunk);bytes+=chunk.length;}
         else{beginPassthrough();write(chunk);}
@@ -996,10 +1002,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           const guidanceKind=error.message==='gif_not_supported'?'gif':kind;
           sendGuidance(/^[a-z_]{1,64}$/.test(error.message)?error.message:'normalization_failed',stream,guidanceKind);
         }
-      })());
+      })().catch(()=>{if(!settled){res.destroy();finish('upstream_stream_error','END_HANDLER');}}));
     };
     const forwardResponse=up=>{
       job.upstreamResponse=up;
+      if(settled||res.destroyed){up.destroy();return;}
       const isSSE = String(up.headers['content-type']).includes('text/event-stream');
       observeResponse(up,isSSE);
       res.writeHead(up.statusCode,responseHeaders(up));res.flushHeaders();

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-05 — Gateway survives malformed upstream responses
+
+An upstream that fails mid-response (here: the freshly upgraded TensorFold engine
+answering during its warm-up window) could crash the whole gateway process: a late
+response event wrote headers after the client had already been answered, and the
+uncaught ERR_HTTP_HEADERS_SENT killed the process. The gateway now guards every
+late response write (buffered send, passthrough begin, forward, stream data) against
+already-settled or already-sent responses and finishes the job instead of dying,
+so a bad upstream window degrades to clean 502s rather than a crash loop.
+
 ## 2026-10-05 — Capacity panel shows a per-server slot map
 
 The Serving Capacity panel replaces its duplicated encodings with one slot map: a segment
