@@ -395,6 +395,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const agent = new http.Agent({ keepAlive: true, maxSockets: Math.max(16,definitions.reduce((sum,node)=>sum+requestCapacity(node),0)) });
   const tlsAgent = new https.Agent({ keepAlive: true, maxSockets: Math.max(16,definitions.reduce((sum,node)=>sum+requestCapacity(node),0)) });
   const upstreamOptions = (node, url) => ({ agent: url.protocol === 'https:' ? tlsAgent : agent, headers: node.upstreamHeaders ?? {} });
+  // Rewritten uploads buffer up to this bound so the upstream request can carry
+  // an exact Content-Length; larger uploads keep streaming chunked.
+  const rewriteBufferBytes=Number.isSafeInteger(config.rewrite_buffer_bytes)&&config.rewrite_buffer_bytes>0?config.rewrite_buffer_bytes:268435456;
   const accepted = new Set(['POST /v1/chat/completions', 'POST /v1/completions', 'POST /v1/responses', 'POST /v1/messages', 'GET /v1/models']);
   const lastOperatorAction=id=>Object.hasOwn(store.data.operator_action_heads??{},id)?store.data.operator_action_heads[id]:[...(store.data.operator_actions??[])].reverse().find(action=>action.workers.includes(id))??null;
   const oldestQueued=queue=>queue.reduce((oldest,job)=>!oldest||job.createdMono<oldest.createdMono?job:oldest,null);
@@ -783,6 +786,16 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(effortAliases)transforms.push(modelAliasTransform(effortAliases,req.headers['content-encoding'],'reasoning_effort'));
       return transforms.length===1?transforms[0]:compose(...transforms);
     };
+    // Buffered alias/profile rewriting for paths that already hold the full body
+    // (vision recovery turns): the rewritten body ships with an exact
+    // Content-Length instead of relying on the streaming rewrite.
+    const rewriteBodyToBuffer=body=>new Promise((resolve,reject)=>{
+      const rewrite=rewriteBody();const pieces=[];
+      rewrite.on('data',piece=>pieces.push(piece));
+      rewrite.once('error',reject);
+      rewrite.once('end',()=>resolve(Buffer.concat(pieces)));
+      rewrite.end(body);
+    });
     const requestBody=job.queuedBody?.stream()??req;
     job.dispatched = Date.now();
     job.dispatchedMono=performance.now();
@@ -956,7 +969,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
             const repaired=visionProtection.recoverImageLimit(original,req.url);
             job.visionNormalized={images:repaired.removed,formats:['image_limit'],totalImages:repaired.retained,kind:'image_limit',stream:repaired.stream};firstBodyByte=null;
             log('vision_image_limit_recovery',{request_id:job.id,node:node.id,withheld:repaired.removed,retained:repaired.retained});
-            issue(repaired.body,true);
+            issue(await rewriteBodyToBuffer(repaired.body),true);
           }catch{sendBuffered(up,rejected);}
           return;
         }
@@ -977,7 +990,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
               const repaired=visionProtection.recoverGif(original,req.url);
               job.visionNormalized={images:repaired.removed,formats:['gif'],totalImages:repaired.totalImages,kind:'gif',stream:repaired.stream};firstBodyByte=null;
               log('vision_gif_recovery',{request_id:job.id,node:node.id,withheld:repaired.removed});
-              issue(repaired.body,true);
+              issue(await rewriteBodyToBuffer(repaired.body),true);
             }
           }catch{
             // A generic JSON response is not enough evidence. Preserve it
@@ -995,7 +1008,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           const normalized=await visionProtection.normalize(original,req.url);
           if(job.cancelled){finish('client_cancelled','CLIENT_CLOSED');return;}
           job.visionNormalized={images:normalized.converted,formats:normalized.formats,totalImages:normalized.totalImages,kind:'jpeg',stream:normalized.stream};firstBodyByte=null;
-          issue(normalized.body,true);
+          issue(await rewriteBodyToBuffer(normalized.body),true);
         }catch(error){
           let stream=job.requestStream===true;
           if(Buffer.isBuffer(original))try{stream=JSON.parse(original.toString('utf8'))?.stream===true;}catch{}
@@ -1020,7 +1033,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       let gotResponse=false,freshConnectingSocket=false,connected=false;
       const attemptHeaders={...headers};
       if(replacement){delete attemptHeaders['transfer-encoding'];attemptHeaders['content-length']=replacement.length;}
-      if(rewriteRequired)delete attemptHeaders['content-length'];
+      else if(rewriteRequired)delete attemptHeaders['content-length'];
       const upstream=endpointTransport(target).request(target,{...upstreamOptions(node,target),method:req.method,headers:attemptHeaders},up=>{
         gotResponse=true;
         if(up.statusCode===400&&visionProtection.enabled&&(retry||captureLimit))bufferCandidate(up,retry);
@@ -1046,13 +1059,13 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
         const retryMessage=job.visionNormalized?.kind==='image_limit'?'Image-limit recovery turn could not reach DS4. Execution may have started; DSG did not retry again.':job.visionNormalized?.kind==='gif'?'GIF recovery turn could not reach DS4. Execution may have started; DSG did not retry again.':'Normalized image retry could not reach DS4. Execution may have started; DSG did not retry again.';
         if(!res.headersSent)error(res,502,'upstream_error',retry?retryMessage:'Upstream connection failed. Execution may have started; gateway did not retry.');
         else res.destroy();
+        // Parse faults carry the raw received bytes; a bounded preview turns an
+        // opaque llhttp code into evidence about what the engine actually sent.
+        if(errorValue?.rawPacket?.length)log('upstream_parse_fault',{node:node.id,request_id:job.id,bytes:errorValue.rawPacket.length,preview:errorValue.rawPacket.toString('latin1').slice(0,400)});
         finish(job.cancelled?'client_cancelled':'upstream_error',errorValue.code);
       });
       upstream.on('close',()=>{if(!settled&&(job.cancelled||!gotResponse))finish(job.cancelled?'client_cancelled':'connection_closed');});
-      if(replacement){
-        if(rewriteRequired){const rewrite=rewriteBody();rewrite.on('error',e=>upstream.destroy(e));rewrite.pipe(upstream);rewrite.end(replacement);}
-        else upstream.end(replacement);
-      }
+      if(replacement!=null)upstream.end(replacement);
       return upstream;
     };
     const upstream=issue(null);
@@ -1063,8 +1076,31 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     // A queued read-ahead prefix feeds the same observers and upstream once,
     // followed by the still-streaming original upload with backpressure.
     requestBody.on('data',observeBody);requestBody.once('end',bodyEnded);req.once('aborted',bodyAborted);requestBody.once('error',bodyAborted);
-    if(rewriteRequired){const rewrite=rewriteBody();rewrite.on('error',e=>upstream.destroy(e));upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});requestBody.pipe(rewrite).pipe(upstream);}
-    else requestBody.pipe(upstream);
+    if(rewriteRequired){
+      // Exact-length uploads. Some engine HTTP frontends cannot decode chunked
+      // request bodies (observed on TensorFold 0.6.5: an empty body, then a
+      // double-framed 400). Rewritten requests are therefore buffered up to a
+      // bound so the upstream request carries the true Content-Length; larger
+      // uploads keep streaming chunked, as before.
+      const rewrite=rewriteBody();
+      const pieces=[];let size=0,overflow=false,upstream=null;
+      rewrite.on('data',chunk=>{
+        if(!overflow){
+          if(size+chunk.length<=rewriteBufferBytes){pieces.push(chunk);size+=chunk.length;return;}
+          overflow=true;upstream=issue(null);
+          upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
+          for(const piece of pieces)if(!upstream.write(piece)){rewrite.pause();upstream.once('drain',()=>rewrite.resume());}
+          pieces.length=0;
+        }
+        if(!upstream.write(chunk)){rewrite.pause();upstream.once('drain',()=>rewrite.resume());}
+      });
+      rewrite.once('error',e=>{if(upstream)upstream.destroy(e);else requestBody.destroy(e);});
+      rewrite.once('end',()=>{
+        if(overflow)upstream.end();
+        else upstream=issue(Buffer.concat(pieces,size));
+      });
+    }
+    else{const upstream=issue(null);requestBody.pipe(upstream);}
   }
 
   const server = http.createServer((req, res) => {
