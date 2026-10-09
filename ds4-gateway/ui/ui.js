@@ -114,6 +114,46 @@ function hardwareMarkup(h,now){
   const item=(kind,label,display,chart,secondary,detail)=>`<div class="hardware-reading ${kind}${stale?' stale':''}" title="${esc(`${detail} · ${status}`)}"><span>${label}</span><strong>${display}</strong>${chart}<small>${secondary}</small></div>`;
   return `<div class="hardware-strip" aria-label="Read-only hardware telemetry; ${esc(status)}">${item('memory','RAM',Number.isFinite(memoryPct)?fmtWhole(memoryPct)+'%':'—',hardwareMiniChart(series,s=>Number.isFinite(s.memory_used_bytes)&&Number.isFinite(s.memory_total_bytes)&&s.memory_total_bytes>0?100*s.memory_used_bytes/s.memory_total_bytes:null,100,'host memory used'),current.memory_scope==='host_unified'?'unified host':'host',current.memory_scope==='host_unified'?'Unified host memory used; not dedicated GPU RAM':'Host memory used')}${item('accelerator','GPU',Number.isFinite(activity)?fmtWhole(activity)+'%':'—',hardwareMiniChart(series,s=>s.accelerator_activity_pct,100,'accelerator activity'),`${Number.isFinite(clockMhz)?`${fmtWhole(clockMhz)} MHz${current.clock_scope==='sm'?' SM':''}`:'clock —'} ${temperatureMarkup(h,now)}`,current.accelerator_scope==='gpu_kernel_time'?'Share of the sample period with GPU kernels executing':'Accelerator activity')}${item('power','POWER',Number.isFinite(power)?fmtWhole(power)+' W':'—',hardwareMiniChart(series,s=>s.power_watts,powerMax,'measured power draw'),current.power_scope==='compute_module'?'compute module':current.power_scope==='system'?'whole system':current.power_scope==='gpu_only'?'GPU only':'scope —',current.power_scope==='compute_module'?'Measured compute-module power used for energy integration':current.power_scope==='system'?'Measured whole-system power used for energy integration':current.power_scope==='gpu_only'?'Measured GPU power only; excluded from whole-machine energy estimates':'Power unavailable; no TDP estimate is substituted')}</div>`;
 }
+// Physical machine temperature and clock, read-only. These numbers only compare a
+// measured GPU against operator-set reference thresholds; they never gate, cap,
+// throttle or command a machine. Thresholds are named here so the console states
+// its own rule rather than implying a hardware limit.
+const MACHINE_WARN_C = 78, MACHINE_CRITICAL_C = 85, MACHINE_STALE_MS = 120000;
+function machineHeat(temp, clock, ceiling) {
+  if (!Number.isFinite(temp)) return { key: 'unknown', label: 'no reading', reason: 'No GPU temperature sample has arrived yet.' };
+  if (temp >= MACHINE_CRITICAL_C) return { key: 'critical', label: 'very hot', reason: `${fmtWhole(temp)} °C is at or above the ${MACHINE_CRITICAL_C} °C advisory threshold. Reason to investigate cooling: airflow, dust, fan floor or room ambient.` };
+  if (temp >= MACHINE_WARN_C) return { key: 'warn', label: 'hot', reason: `${fmtWhole(temp)} °C is above the ${MACHINE_WARN_C} °C advisory threshold. Warm; temperature alone does not establish throttling.` };
+  if (Number.isFinite(clock) && Number.isFinite(ceiling) && clock > ceiling) return { key: 'warn', label: 'clock above ceiling', reason: `${fmtWhole(clock)} MHz exceeds the declared ${fmtWhole(ceiling)} MHz ceiling.` };
+  return { key: 'ok', label: 'normal', reason: `Within the advisory thresholds (below ${MACHINE_WARN_C} °C${Number.isFinite(ceiling) ? ` and at or below ${fmtWhole(ceiling)} MHz` : ''}).` };
+}
+function renderHardwareFleet(s, now) {
+  const container = $('hardware-fleet'), status = $('hardware-fleet-status');
+  if (!container) return;
+  const rows = (s.hardware_machines ?? []).filter(m => m.hardware && m.hardware.configured !== false);
+  const ceiling = Number.isFinite(s.hardware_clock_ceiling_mhz) ? s.hardware_clock_ceiling_mhz : null;
+  if (!rows.length) {
+    status.textContent = 'No machine hardware telemetry is configured.';
+    container.innerHTML = '<p class="machine-empty">Add a hardware_telemetry entry carrying its own SSH alias to observe a machine\'s temperature and clock read-only.</p>';
+    return;
+  }
+  const cards = rows.map(m => {
+    const h = m.hardware, cur = h.current ?? {};
+    const temps = h.temperature_current?.temperatures ?? [];
+    const gpu = temps.find(t => t.sensor === 'nvidia_gpu') ?? temps[0] ?? null;
+    const temp = gpu ? gpu.celsius : null;
+    const clock = Number.isFinite(cur.clock_mhz) ? cur.clock_mhz : null;
+    const at = Math.max(h.temperature_at ?? 0, h.last_sample_at ?? 0) || null;
+    const stale = !at || now - at > MACHINE_STALE_MS;
+    const heat = stale ? { key: 'unknown', label: 'stale', reason: `The newest sample is ${age(at, now)}; not used for a heat judgement.` } : machineHeat(temp, clock, ceiling);
+    return { id: m.id, label: machineLabel(m.id), temp, clock, heat, throttle: h.temperature_current?.thermal_throttling, at };
+  });
+  cards.sort((a, b) => (Number.isFinite(b.temp) ? b.temp : -1) - (Number.isFinite(a.temp) ? a.temp : -1));
+  const attention = cards.filter(c => c.heat.key === 'warn' || c.heat.key === 'critical');
+  const hottest = cards.find(c => Number.isFinite(c.temp));
+  container.dataset.level = cards.some(c => c.heat.key === 'critical') ? 'critical' : attention.length ? 'warn' : 'ok';
+  status.textContent = `${cards.length} machine${cards.length === 1 ? '' : 's'} reporting · hottest ${hottest ? `${hottest.label} at ${fmtWhole(hottest.temp)} °C` : 'unknown'}${ceiling ? ` · declared ceiling ${fmtWhole(ceiling)} MHz` : ''} · ${attention.length ? `${attention.length} needing attention` : 'all within advisory limits'}.`;
+  container.innerHTML = cards.map(c => `<div class="machine ${esc(c.heat.key)}" role="listitem" title="${esc(`${c.label}: ${c.heat.reason}`)}"><span class="machine-name">${esc(c.label)}</span><div class="machine-values"><strong>${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)}<span>°C</span>` : '—'}</strong><span class="machine-clock">${Number.isFinite(c.clock) ? `${fmtWhole(c.clock)}<span>MHz</span>` : '—'}</span></div><small>${esc(c.heat.label)}${c.throttle === true ? ' · throttle flagged' : ''}</small></div>`).join('');
+}
 function telemetryStatus(d) {
   if (d.telemetry_configured === false) return 'Engine timings not configured';
   return `${d.telemetry_source === 'file' ? 'Model log' : 'Journal'} ${d.connected ? 'connected' : 'disconnected'}`;
@@ -325,6 +365,19 @@ function managementPathDetail(w) {
 }
 function recoveryRecheckable(action){return !!(action?.restart_issued||action?.service_action_issued)&&['reconciliation_needed','failed'].includes(action.state);}
 function recoveryIssuanceText(op){return !op.service_action_issued?'':op.service_action==='bootstrap'?(op.bootstrap_acknowledged===true?' · bootstrap acknowledged':' · bootstrap attempted · acknowledgement unknown'):` · ${op.service_action} issued`;}
+// A blocked control must never be a silent dead end. A truly disabled button
+// gets no click and no focus, so the operator sees the control "do nothing".
+// Explainable blocks therefore use aria-disabled and carry their reason, and the
+// click handler reports it instead of returning in silence.
+// Attribute appended to a control (after data-action): the dashboard tests and
+// the rest of this file read disabled state as `data-action="x" ... disabled`,
+// so it is appended rather than prefixed. The explainable (soft) form carries
+// aria-disabled + its reason so the click handler can report it instead of
+// silently doing nothing.
+const blockedTail=(reason,hardDisabled)=>hardDisabled
+  ?` disabled title="${esc(reason)}"`
+  :` aria-disabled="true" data-blocked-reason="${esc(reason)}" title="${esc(reason)}"`;
+const blockedNotice=button=>button.getAttribute('aria-disabled')==='true'&&!!button.dataset.blockedReason;
 function routingMarkup(w,{stale=false,controls=true,recovering=false,busy=workerBusy,blockedBy=[]}={}) {
   const info=routingInfo(w,{stale,recovering});
   if(!controls||!info.action)return `<span class="worker-routing" data-level="${info.level}" aria-label="${esc(info.label)}"></span>`;
@@ -332,7 +385,9 @@ function routingMarkup(w,{stale=false,controls=true,recovering=false,busy=worker
   const recorded=at&&Number.isFinite(Date.parse(at))?` Excluded ${new Date(at).toLocaleString()}; recorded by Star Gate.`:'';
   const tooltip=`${info.label} for ${name}. ${info.detail}${recorded} ${info.title}${blockedBy.length?' Shared hardware is active on '+blockedBy.join(', ')+'. Manage that service before resuming this one.':''}`;
   const icon=info.action==='drain'?'<path d="M5 4h4v16H5zM15 4h4v16h-4z"/>':'<path d="M6 4l14 8-14 8z"/>';
-  return `<span class="worker-routing" data-level="${info.level}"><button class="routing-toggle" type="button" data-action="${info.action}" data-id="${esc(w.id)}" data-tooltip="${esc(tooltip)}" aria-label="${esc(tooltip)}" ${stale||busy||info.blocked||!workerControlsReady||blockedBy.length&&info.action!=='drain'?'disabled':''}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${icon}</svg></button></span>`;
+  const blockedReason=blockedBy.length?` Shared hardware is active on ${blockedBy.join(', ')}. Manage that service before resuming this one.`:info.title;
+  const blocked=stale||busy||info.blocked||!workerControlsReady||blockedBy.length&&info.action!=='drain';
+  return `<span class="worker-routing" data-level="${info.level}"><button class="routing-toggle" type="button" data-action="${info.action}" data-id="${esc(w.id)}" data-tooltip="${esc(tooltip)}" aria-label="${esc(tooltip)}"${blocked?blockedTail(blockedReason,stale||busy||!workerControlsReady):''}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${icon}</svg></button></span>`;
 }
 function updateRoutingNode(current,fresh) {
   // Keep the button DOM stable during normal polling so keyboard focus, hover
@@ -869,6 +924,7 @@ function render(s) {
   lastDevicesSpec={devices:s.devices.map(d=>({...d,cache_continuity:s.cache_continuity,performance_history:s.performance_lights})),workers:visibleWorkers,now,stale,scales,controls:workerControlsVisible};
   renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,now,stale,scales,workerControlsVisible);
   renderCatalogue(s,now);
+  renderHardwareFleet(s,now);
   const ds=g?.dataset;
   $('cache-evidence-status').textContent=cacheEvidenceText(s,stale);
   const selector=$('cache-cost-worker'),selected=selector.value,options=(g?.workers||[]).map(w=>`<option value="${esc(w.id)}">${esc(w.id)}</option>`).join('');
@@ -962,6 +1018,7 @@ let fleetPower=null,fleetPowerBusy=new Set(),fleetPowerPolling=false,lastDevices
 let endpointEdit=null, registeredWorkers=[];
 let contextDirty=false, contextExpected=null;
 let queueDirty=false,queueExpected=null;
+let marginDirty=false,marginExpected=null;
 let turnsDirty=false,turnsExpected=null;
 let visionProtectionEnabled=false;
 let directReserveEnabled=false;
@@ -979,7 +1036,7 @@ function workerRows(workers) {
     const ownership=`${w.operator_paused?'<br><small>Operator pause</small>':''}${holds.map(h=>`<br><small>Held by ${esc(h.owner_id)}${h.reason?`: ${esc(h.reason)}`:''}</small>`).join('')}${locks.map(lock=>`<br><small class="maintenance-lock${Number.isFinite(lock.review_at)&&lock.review_at<=Date.now()?' overdue':''}">Maintenance: ${esc(lock.name)}${lock.reason?` · ${esc(lock.reason)}`:''}${Number.isFinite(lock.review_at)?` · review ${lock.review_at<=Date.now()?'overdue':`in ${remaining(lock.review_at,Date.now())}`}`:' · no automatic expiry'}</small>`).join('')}`;
     const routes=w.ssh?`<button class="button" title="Edit only the host-key-verified SSH fallback aliases. The current inference stream and primary route are not interrupted; the new list applies on the next reconnect." data-action="fallbacks" data-id="${id}" ${workerBusy?'disabled':''}>Routes ${fmt(1+(w.ssh_fallbacks?.length??0))}</button>`:'';
     const lockActions=locks.map(lock=>`<button class="button" title="Release only ${esc(lock.name)}. The server stays paused until a separate checked Resume." data-action="unlock" data-id="${id}" data-lock-id="${esc(lock.id)}" ${workerBusy?'disabled':''}>Release ${esc(lock.name)}</button>`).join('');
-    return `<tr><td>${id}<br><small class="muted">${esc(w.url??'')}</small>${Object.entries(w.model_aliases??{}).map(([alias,id])=>`<br><small>Model: ${esc(alias)} → ${esc(id)}</small>`).join('')}</td><td>${fmt(w.context_length)}</td><td title="${esc(info.detail)}">${routing}${ownership}</td><td>${fmt(w.load)} / ${fmt(w.queued)}</td><td class="worker-actions"><button class="button" title="${esc(info.title)}" data-action="${info.action}" data-id="${id}" ${workerBusy||info.blocked?'disabled':''}>${info.button}</button><button class="button" title="Create a named durable maintenance lock. It immediately stops new admission and never auto-expires." data-action="lock" data-id="${id}" ${workerBusy?'disabled':''}>Maintenance lock</button>${lockActions}${held&&!w.operator_paused?`<button class="button" title="Keep an operator pause even after all agents release their holds." data-action="drain" data-id="${id}" ${workerBusy?'disabled':''}>Keep paused</button>`:''}${routes}<button class="button" data-action="concurrency" data-id="${id}" title="Change gateway request capacity after this worker is paused and idle. Use capacity qualified for its model server." ${workerBusy||!w.drained||busy||w.recovery_waiting||!Number.isSafeInteger(w.max_concurrent_requests)?'disabled':''}>Capacity ${fmt(w.max_concurrent_requests??1)}</button><button class="button" data-action="endpoint" data-id="${id}" ${workerBusy?'disabled':''}>Edit endpoint</button><button class="button" title="Remove registration only after draining and releasing all holds and maintenance locks. Does not stop the model server." data-action="remove" data-id="${id}" ${workerBusy||!w.drained||busy||held||locked?'disabled':''}>Remove</button></td></tr>`;
+    return `<tr><td>${id}<br><small class="muted">${esc(w.url??'')}</small>${Object.entries(w.model_aliases??{}).map(([alias,id])=>`<br><small>Model: ${esc(alias)} → ${esc(id)}</small>`).join('')}</td><td>${fmt(w.context_length)}</td><td title="${esc(info.detail)}">${routing}${ownership}</td><td>Gateway: ${fmt(w.load)} active / ${fmt(w.queued)} queued<br><small>Engine: ${fmt(w.execution_capacity?.running)} running / ${fmt(w.execution_capacity?.waiting)} waiting</small><br><small>${w.execution_capacity?.engine_execution!=null?`${w.execution_capacity.source==='manual_execution'?'Manual':'Detected'} execution capacity: ${fmt(w.execution_capacity.engine_execution)}`:w.execution_capacity?.manual_stale?'Saved execution limit is stale; verify and re-enter it':'Execution capacity unverified; enter the engine limit below'}${w.execution_capacity?.mismatch?' · MISMATCH with gateway admissions':''}</small></td><td class="worker-actions"><button class="button" data-action="${info.action}" data-id="${id}"${(workerBusy||info.blocked)?blockedTail(info.title,workerBusy):''}>${info.button}</button><button class="button" title="Create a named durable maintenance lock. It immediately stops new admission and never auto-expires." data-action="lock" data-id="${id}" ${workerBusy?'disabled':''}>Maintenance lock</button>${lockActions}${held&&!w.operator_paused?`<button class="button" title="Keep an operator pause even after all agents release their holds." data-action="drain" data-id="${id}" ${workerBusy?'disabled':''}>Keep paused</button>`:''}${routes}${w.execution_capacity?.manual_identity?`<button class="button" data-action="execution-capacity" data-id="${id}" title="Record the engine execution limit for routing when detection is unavailable. Does not change the engine or interrupt running work." ${workerBusy?'disabled':''}>Manual execution limit ${fmt(w.execution_capacity.manual_execution)}</button>`:''}<button class="button" data-action="concurrency" data-id="${id}" title="Change gateway request capacity after this worker is paused and idle. Use capacity qualified for its model server." ${workerBusy||!w.drained||busy||w.recovery_waiting||!Number.isSafeInteger(w.max_concurrent_requests)?'disabled':''}>Gateway capacity ${fmt(w.max_concurrent_requests??1)}</button><button class="button" data-action="endpoint" data-id="${id}" ${workerBusy?'disabled':''}>Edit endpoint</button><button class="button" title="Remove registration only after draining and releasing all holds and maintenance locks. Does not stop the model server." data-action="remove" data-id="${id}" ${workerBusy||!w.drained||busy||held||locked?'disabled':''}>Remove</button></td></tr>`;
   }).join('') || '<tr><td colspan="5">No workers registered.</td></tr>';
 }
 async function loadWorkers() {
@@ -1002,6 +1059,11 @@ async function loadWorkers() {
     if(data.queue_timeout_control){
       $('queue-timeout-current').textContent=`Current: ${fmt(data.queue_timeout_ms/3600000)} hours (${data.queue_timeout_source}).`;
       if(!queueDirty){queueExpected=data.queue_timeout_ms;$('queue-timeout-input').value=String(data.queue_timeout_ms/3600000);}
+    }
+    $('routing-margin-control').hidden=!data.routing_margin_control;
+    if(data.routing_margin_control){
+      $('routing-margin-current').textContent=`Current: ${fmt(data.routing_switching_margin_seconds)} seconds. ${data.routing_time_mode==='active'?'Time-based routing is active.':data.routing_time_mode==='observation_only'?'Observation only — placement still uses existing routing.':'Time-based routing is off.'}`;
+      if(!marginDirty){marginExpected=data.routing_switching_margin_seconds;$('routing-margin-input').value=String(marginExpected);}
     }
     $('conversation-turn-control').hidden=!data.conversation_turns_control;
     if(data.conversation_turns_control){
@@ -1046,6 +1108,7 @@ async function workerAction(action, input) {
   $('worker-form').querySelector('button[type=submit]').disabled=true;
   $('pool-context-form').querySelector('button').disabled=true;
   $('queue-timeout-form').querySelector('button').disabled=true;
+  $('routing-margin-form').querySelector('button').disabled=true;
   $('conversation-turn-apply').disabled=true;
   if(action==='conversation-turns'){$('conversation-turn-message').textContent='Applying conversation turn allowance…';$('conversation-turn-message').classList.remove('error');}
   $('vision-protection-toggle').disabled=true;
@@ -1056,17 +1119,19 @@ async function workerAction(action, input) {
   try {
     const r=await fetch(`/api/workers/${action}`,{method:'POST',headers:{'content-type':'application/json','x-dsg-csrf':csrfToken},body:JSON.stringify(input),signal:AbortSignal.timeout(35000)});
     const data=await r.json();if(!r.ok)throw new Error(data.error||'Worker control failed');
-    workerMessage(action==='lock'?`${data.result.worker_id}: durable maintenance lock created. Automatic recovery and routing are vetoed until its exact release.`:action==='unlock'?`${data.result.worker_id}: maintenance lock released; routing remains paused until a separate checked Resume.`:action==='recover'?`Recovery accepted: ${data.id}. See executor receipts below.`:action==='recovery-policy'?`Automatic recovery ${data.automatic?'enabled':'disabled'}.`:action==='recovery-handback-policy'?`Verified profile hand-back ${data.profile_handback_automatic?'enabled':'disabled'}. Automatic recovery remains ${data.automatic?'on':'off'}.`:action==='protection'?`Image compatibility protection ${data.vision_jpeg?.enabled?'enabled':'disabled'}. Existing requests and model-server settings are unchanged.`:action==='context'?`Pool limit saved: ${fmt(data.minimum_context)} tokens. Applied now; model servers and Pi unchanged.`:action==='fallbacks'?`Management fallbacks saved. Active inference was not interrupted; the list applies on the next reconnect.`:action==='add'?'Registered paused. Enable routing when ready.':action==='drain'?'Draining. Admitted requests will finish before removal.':action==='remove'?'Removed from this gateway. Model server left running.':action==='relocate'?`${data.source} → ${data.destination}: undispatched request handed over with its original client and deadline.`:'Routing enabled.');
+    workerMessage(action==='lock'?`${data.result.worker_id}: durable maintenance lock created. Automatic recovery and routing are vetoed until its exact release.`:action==='unlock'?`${data.result.worker_id}: maintenance lock released; routing remains paused until a separate checked Resume.`:action==='recover'?`Recovery accepted: ${data.id}. See executor receipts below.`:action==='recovery-policy'?`Automatic recovery ${data.automatic?'enabled':'disabled'}.`:action==='recovery-handback-policy'?`Verified profile hand-back ${data.profile_handback_automatic?'enabled':'disabled'}. Automatic recovery remains ${data.automatic?'on':'off'}.`:action==='protection'?`Image compatibility protection ${data.vision_jpeg?.enabled?'enabled':'disabled'}. Existing requests and model-server settings are unchanged.`:action==='context'?`Pool limit saved: ${fmt(data.minimum_context)} tokens. Applied now; model servers and Pi unchanged.`:action==='fallbacks'?`Management fallbacks saved. Active inference was not interrupted; the list applies on the next reconnect.`:action==='add'?'Registered paused. Enable routing when ready.':action==='drain'?'Draining. New admission stopped; admitted requests finish. Removal is a separate step.':action==='remove'?'Removed from this gateway. Model server left running.':action==='relocate'?`${data.source} → ${data.destination}: undispatched request handed over with its original client and deadline.`:'Routing enabled after the readiness check passed.');
     if(action==='conversation-turns'){turnsDirty=false;turnsExpected=data.conversation_turns;const message=`Applied: ${fmt(data.conversation_turns)} turns.`;workerMessage('');$('conversation-turn-message').textContent=message;}
     if(action==='context'){contextDirty=false;contextExpected=data.minimum_context;}
     if(action==='queue-timeout'){queueDirty=false;queueExpected=data.queue_timeout_ms;workerMessage(`Queue allowance saved: ${fmt(data.queue_timeout_ms/3600000)} hours for new requests. Existing waits and model servers unchanged.`);}
+    if(action==='routing-margin'){marginDirty=false;marginExpected=data.routing_switching_margin_seconds;workerMessage(`Switching margin saved: ${fmt(marginExpected)} seconds. ${data.routing_time_mode==='active'?'The new margin applies to subsequent routing comparisons.':data.routing_time_mode==='observation_only'?'Observation only; existing routing still places requests.':'Time-based routing remains off.'}`);}
+    if(action==='execution-capacity')workerMessage(`${input.id}: manual engine limit recorded as ${fmt(input.capacity)}. Engine settings and running requests are unchanged.`);
     if(action==='concurrency')workerMessage(`${input.id}: capacity saved as ${fmt(data.workers?.find(w=>w.id===input.id)?.max_concurrent_requests??input.max_concurrent_requests)}. Routing remains paused.`);
     if(action==='endpoint'){endpointEdit=null;$('endpoint-edit-form').hidden=true;workerMessage('Endpoint saved. Server remains paused; resume routing when ready.');}
     if(action==='add')$('worker-form').reset();
     if(action==='resume')workerMessage(`${target}: routing enabled after checks passed. Model settings unchanged.`);
     if(action==='drain')workerMessage(`${target}: paused for new work. Admitted requests finish; Resume routing reverses this.`);
-  } catch(e) { workerMessage(`${e.message}. Check the current setting before retrying.`,true);if(action==='conversation-turns'){turnsDirty=false;$('conversation-turn-message').textContent=`${e.message}. Review the refreshed current value before applying again.`;$('conversation-turn-message').classList.add('error');} }
-  finally { workerBusy=false;$('worker-form').querySelector('button[type=submit]').disabled=false;$('pool-context-form').querySelector('button').disabled=false;$('queue-timeout-form').querySelector('button').disabled=false;updateConnectionFields();refreshRoutingControls();void loadWorkers(); }
+  } catch(e) { workerMessage(`${e.message}. Check the current setting before retrying.`,true);if(action==='routing-margin')marginDirty=false;if(action==='conversation-turns'){turnsDirty=false;$('conversation-turn-message').textContent=`${e.message}. Review the refreshed current value before applying again.`;$('conversation-turn-message').classList.add('error');} }
+  finally { workerBusy=false;$('worker-form').querySelector('button[type=submit]').disabled=false;$('pool-context-form').querySelector('button').disabled=false;$('queue-timeout-form').querySelector('button').disabled=false;$('routing-margin-form').querySelector('button').disabled=false;updateConnectionFields();refreshRoutingControls();void loadWorkers(); }
 }
 function updateConnectionFields() {
   const form=$('worker-form'), remote=form.elements.connection.value==='ssh', generic=form.elements.backend.value==='openai';
@@ -1105,6 +1170,12 @@ function wireWorkerControls() {
     if(!Number.isSafeInteger(value)||value<1){$('conversation-turn-message').textContent='Enter a positive whole number of turns.';return;}
     void workerAction('conversation-turns',{conversation_turns:value,expected_conversation_turns:turnsExpected});
   });
+  $('routing-margin-input').addEventListener('input',()=>{marginDirty=true;});
+  $('routing-margin-form').addEventListener('submit',e=>{
+    e.preventDefault();const value=Number($('routing-margin-input').value);
+    if(!Number.isFinite(value)||value<0){workerMessage('Enter a finite non-negative number of seconds.',true);return;}
+    void workerAction('routing-margin',{margin_seconds:value,expected_margin_seconds:marginExpected});
+  });
   $('queue-timeout-input').addEventListener('input',()=>{queueDirty=true;});
   $('queue-timeout-form').addEventListener('submit',e=>{
     e.preventDefault();const hours=Number($('queue-timeout-input').value),ms=hours*3600000;
@@ -1135,6 +1206,7 @@ function wireWorkerControls() {
   });
   const handleWorkerClick=e=>{
     const button=e.target.closest('button[data-action]');if(!button||button.disabled)return;
+    if(blockedNotice(button)){workerMessage(button.dataset.blockedReason,true);return;}
     const {action,id}=button.dataset;
     if(action==='concurrency'){
       const worker=registeredWorkers.find(w=>w.id===id);if(!worker)return;
@@ -1142,6 +1214,13 @@ function wireWorkerControls() {
       const answer=window.prompt(`Concurrent gateway requests for ${id}. Use a capacity already tested with this model server. The server stays paused after saving.`,String(before));if(answer===null)return;
       const value=Number(answer);if(!Number.isSafeInteger(value)||value<1){workerMessage('Enter a positive whole request capacity.',true);return;}
       void workerAction('concurrency',{id,expected_max_concurrent_requests:before,max_concurrent_requests:value});return;
+    }
+    if(action==='execution-capacity'){
+      const worker=registeredWorkers.find(w=>w.id===id),current=worker?.execution_capacity;if(!current)return;
+      const value=window.prompt(`How many requests can ${id}'s engine actually execute at once? This records a routing limit; it does not change the engine. Automatic detection takes precedence when available.`,String(current.manual_execution??current.engine_execution??worker.max_concurrent_requests));
+      if(value===null)return;const capacity=Number(value);
+      if(!Number.isSafeInteger(capacity)||capacity<1){workerMessage('Enter a positive whole execution capacity.',true);return;}
+      void workerAction('execution-capacity',{id,capacity,expected_capacity:current.manual_execution,expected_identity:current.manual_identity});return;
     }
     if(action==='endpoint'){
       const worker=registeredWorkers.find(w=>w.id===id);if(!worker)return;

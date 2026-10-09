@@ -1,3 +1,4 @@
+import {queueChoice} from './queue-choice.mjs';
 import {createOmlxEnrollment,restoreOmlxEnrollments} from './recovery-omlx-enrollment.mjs';
 import {createPairEnrollment,restorePairEnrollments} from './recovery-pair-enrollment.mjs';
 import {requestAuthorized} from './request-auth.mjs';
@@ -8,9 +9,10 @@ import {createMediaExecution} from './media-execution.mjs';
 import {sparkServiceBinding,validateServiceAddition,applyServiceAddition,restoreSparkServices} from './spark-services.mjs';
 import {MediaJobs,handleMediaRequest} from './media-jobs.mjs';
 import {inspectMediaJobInputs} from './media-input-placement.mjs';
-import {activeJobs,activeCount,hasCapacity,requestCapacity,oldestActive} from './worker-activity.mjs';
+import {activeJobs,activeCount,requestCapacity,oldestActive} from './worker-activity.mjs';
 import {GENIE_KEY_HEADER,isGenieRequest,PRIORITY_HEADER,requestPriority,priorityRank,priorityIndex,priorityOrder} from './job-priority.mjs';
 import {outputShape} from './output-shape.mjs';
+import {upstreamAgentOptions} from './upstream-agent.mjs';
 import http from 'node:http';
 import {compose,PassThrough} from 'node:stream';
 import {servingProfiles,servingProfileTransform} from './serving-profile.mjs';
@@ -28,6 +30,8 @@ import {QueuedBodyBudget,QueuedRequestBody} from './queued-request-body.mjs';
 import { Dataset } from './dataset.mjs';
 import { clientMetadata, CLIENT_METADATA_HEADER } from './client-metadata.mjs';
 import { RoutingShadow } from './routing-shadow.mjs';
+import {RoutingObservations,routingRequestMetadata,routingIdentity} from './routing-observations.mjs';
+import {EndpointTelemetry} from './endpoint-telemetry.mjs';
 import { GenerationFaultObserver, verifyGeneration } from './generation-health.mjs';
 import { workerConfig, workerConfigs, workerFields, assertUniqueWorker, sshTargets, replaceSshFallbacks } from './worker-config.mjs';
 import {endpointUrl, endpointTransport, endpointHeaders, endpointMetadata, endpointAliases} from './endpoint.mjs';
@@ -38,6 +42,28 @@ import { AgentControl } from './agent-control.mjs';
 import {deadlineTimer,queueTimeout,queueTimeoutMessage} from './deadline.mjs';
 import {CALL_ID_HEADER,DISPATCH_HEADER,validCallId,unavailableReason,sessionWork,rejectionReceipt} from './continuity.mjs';
 import {JsonUsageObserver} from './json-usage.mjs';
+
+// Quarantine threshold: how many qualifying ENGINE failures a worker may
+// accumulate before it is pulled out of rotation. Deliberately generous: a
+// flaky transport link must not sideline a healthy worker, so only a worker
+// that keeps failing this many times in a row is treated as broken. Any
+// completed request clears the streak.
+const QUARANTINE_FAILURE_THRESHOLD = 20;
+
+// Transport failures are NOT engine evidence and must never advance the
+// quarantine counter. A dead ssh tunnel and a dying engine produce identical
+// request outcomes (ECONNRESET/EPIPE) from identical call sites, so the outcome
+// string alone cannot separate them. ENGINE_FAILURE_OUTCOMES are the only
+// outcomes that prove the engine itself produced a response that failed;
+// everything in AMBIGUOUS_FAILURE_OUTCOMES can equally be a severed link, so
+// finish() arbitrates those with the ssh supervisor's own state, which a
+// separate process writes and the engine cannot influence.
+const ENGINE_FAILURE_OUTCOMES = new Set(['incomplete_sse','upstream_engine_error']);
+const AMBIGUOUS_FAILURE_OUTCOMES = new Set(['upstream_error','upstream_stream_error','upstream_aborted','connection_closed']);
+// Tunnel states the ssh supervisor itself declares broken. It writes these only
+// from ssh stderr/error/exit, never from anything the engine reports, and no
+// other subsystem writes managementPath except the health probe.
+const TRANSPORT_DEAD_STATES = new Set(['ssh_error','retrying']);
 import {dsgReport,invalidHttp} from './report.mjs';
 import {ClientWatch,CLIENT_WATCH_HEADER,CLIENT_WATCH_ROUTE,validClientWatchId} from './client-watch.mjs';
 import {JPEG_REJECTION_INSPECTION_BYTES,VisionProtection,visionGuidance,visionRejectionKind} from './vision-protection.mjs';
@@ -272,7 +298,7 @@ export class UsageObserver {
   }
 }
 
-export function createGateway(config,{visionTranscode,tunnelFactory=superviseTunnel}={}) {
+export function createGateway(config,{visionTranscode,tunnelFactory=superviseTunnel,routingFetcher}={}) {
   if (!validContext(config.context_length)) throw new Error('Invalid configured pool context limit');
   if (config.model_agnostic !== undefined && typeof config.model_agnostic !== 'boolean') throw new Error('model_agnostic must be a boolean');
   const configuredQueueTimeout=queueTimeout(config.queue_timeout_ms);
@@ -280,6 +306,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const conversationTurnIdleMs=config.conversation_turn_idle_ms??2000;
   if(!Number.isSafeInteger(configuredConversationTurns)||configuredConversationTurns<1)throw new Error('conversation_turns must be a positive whole number');
   if(!Number.isSafeInteger(conversationTurnIdleMs)||conversationTurnIdleMs<0||conversationTurnIdleMs>2147483647)throw new Error('conversation_turn_idle_ms must be a whole millisecond count from 0 to 2147483647');
+  if(config.routing_time_enabled!==undefined&&typeof config.routing_time_enabled!=='boolean')throw new Error('routing_time_enabled must be boolean');
+  const timeRouting=config.routing_time_enabled===true;
   const initial = workerConfigs(config.nodes);
   if(config.media_jobs!==undefined&&(!config.media_jobs||typeof config.media_jobs!=='object'||typeof config.media_jobs.enabled!=='boolean'))throw new Error('media_jobs.enabled must be a boolean');
   const store = new AffinityStore(config.state_file);
@@ -290,7 +318,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   // Like registered workers, an explicit UI setting survives process restarts.
   const contextLimit = () => store.data.pool_context_length ?? config.context_length;
   const requiredContext = node => node.route_only ? node.context_length : contextLimit();
-  const makeNode = n => ({ ...n, drained: store.data.drained?.[n.id] === true, quarantine:store.data.quarantined?.[n.id] ?? null, inferenceFailures:0, healthy: false, failures: 0, slots: [{}], get active(){return oldestActive(this);}, queue: [], completed: 0, failed: 0, protected:0, observationLimited:0, probing: false, healthProbeDeferred:0,
+  const makeNode = n => ({ ...n, drained: store.data.drained?.[n.id] === true, quarantine:store.data.quarantined?.[n.id] ?? null, inferenceFailures:0, transportFailures:0, healthy: false, failures: 0, slots: [{}], get active(){return oldestActive(this);}, queue: [], completed: 0, failed: 0, protected:0, observationLimited:0, probing: false, healthProbeDeferred:0,
     managementPath:n.ssh?{transport:'ssh_tunnel',state:'pending',reason:null,attempts:0,route_count:sshTargets(n).length,changed_at:new Date().toISOString(),last_verified_at:null}:{transport:'local',state:'local',reason:null,attempts:0,route_count:0,changed_at:new Date().toISOString(),last_verified_at:null} });
   let definitions;
   try { definitions = store.data.workers === undefined ? initial : workerConfigs(store.data.workers); }
@@ -306,8 +334,15 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   let routes;try{routes=modelRoutes(config.model_routes,definitions,registryOptions);}catch(e){store.close();throw e;}
   const dataset = new Dataset(path.join(path.dirname(config.state_file),'requests'),{enabled:config.dataset_enabled===true});
   const shadow = new RoutingShadow({enabled:config.routing_shadow_enabled===true && config.dataset_enabled===true});
+  const routingObservations=new RoutingObservations({enabled:timeRouting||config.routing_time_observe===true,mode:timeRouting?'active':'observation_only',
+    filename:path.join(path.dirname(config.state_file),'routing-estimates.json')});
+  const routingMargin=()=>store.data.routing_switching_margin_seconds??config.routing_switching_margin_seconds??30;
+  if(!Number.isFinite(routingMargin())||routingMargin()<0){store.close();throw new Error('Switching margin must be a finite non-negative number of seconds');}
+  const routingTelemetry=routingObservations.enabled?new EndpointTelemetry({includeLegacy:true,fetcher:routingFetcher,onSample:(id,value)=>{
+    const node=nodes.find(node=>node.id===id);if(node)routingObservations.observeNative(routingWorker(node),value,activeJobs(node));
+  }}):null;
   const observe = fn => {if(shadow.enabled)try{return fn();}catch{shadow.state.errors++;}};
-  let draining = false, shuttingDown = false, healthTimer, recoveryTimer, waitingTimer;
+  let draining = false, shuttingDown = false, healthTimer, recoveryTimer, waitingTimer, routingTimer;
   const startup={barrier:continuityEnabled(config),complete:false,started_at:new Date().toISOString(),completed_at:null,unavailable:[]};
   // Undispatched HTTP requests only. Bodies remain on their original streams,
   // with backpressure; no prompt spool and no optimistic 200/SSE response.
@@ -325,7 +360,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   // locality for a truly empty compatible server. `false` keeps strict affinity.
   const automaticAffinityWait=config.automatic_affinity_rebalance_min_wait_ms===false?null:(config.automatic_affinity_rebalance_min_wait_ms??300000);
   if(automaticAffinityWait!==null&&(!Number.isSafeInteger(automaticAffinityWait)||automaticAffinityWait<0))throw new Error('automatic_affinity_rebalance_min_wait_ms must be false or a non-negative whole millisecond count');
-  const automaticRelocationScope=automaticAffinityWait===null?'first_dsg_request_or_unaffined':'first_unaffined_or_affinity_wait_expired';
+  const automaticRelocationScope=timeRouting?'completion_time_margin':automaticAffinityWait===null?'first_dsg_request_or_unaffined':'first_unaffined_or_affinity_wait_expired';
   const parkedFor=n=>waiting.filter(j=>j.fixedHome===n);
   const rejections=[];
   const clientWatch=new ClientWatch();
@@ -341,7 +376,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       state:job.dispatched?'running':job.waitReason||!jobEligible(job)?'blocked':'queued',
       request_reason:job.dispatched?'Request is already running':job.waitReason??(job.node?.drained?'Routing is paused':!jobEligible(job)?'Worker or conversation is not eligible':null),
       waiting_ms:job.dispatched?Math.max(0,job.dispatchedMono-job.createdMono):Math.max(0,performance.now()-job.createdMono),
-      running_ms:job.dispatched?Math.max(0,performance.now()-job.dispatchedMono):null
+      running_ms:job.dispatched?Math.max(0,performance.now()-job.dispatchedMono):null,
+      routing_observation:job.routingObservation??null,routing_decision:job.routingDecision??null
     })),jobs_truncated:jobs.length>512};
   }
   function setJobPriority(input){
@@ -380,7 +416,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(n.removed || n.drained || n.active || (n.queue.length&&!recovery.omlxReadmissionOwnsQueue(n,recoveryState)) || JSON.stringify(n.quarantine)!==JSON.stringify(expected) || shuttingDown || draining)throw new Error('reinstatement_state_changed');
       const quarantined={...store.data.quarantined};delete quarantined[n.id];
       store.save({...store.data,quarantined,recovery:recoveryState});
-      n.quarantine=null;n.inferenceFailures=0;n.healthy=true;n.failures=0;
+      n.quarantine=null;n.inferenceFailures=0;n.transportFailures=0;n.healthy=true;n.failures=0;
       observe(()=>shadow.reset(n.id));
     }}); } catch(e){store.close();throw e;}
   const pairEnrollment=createPairEnrollment({config:serviceConfig,store,recovery,isEnabled:()=>!draining&&!shuttingDown&&capabilityStatus().server_changes&&capabilityStatus().inspection&&recovery.state.automatic});
@@ -392,8 +428,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     if(shuttingDown||draining||n.recovering||n.quarantine||n.probeError||!n.modelMatches||!validContext(n.contextLength)||n.contextLength<requiredContext(n))throw new Error('Fresh compatible worker readiness required; hold retained');
   }});}catch(e){store.close();throw e;}
   const visionProtection=new VisionProtection(config.vision_compatibility,store,path.dirname(config.state_file),visionTranscode?{transcode:visionTranscode}:undefined);
-  const agent = new http.Agent({ keepAlive: true, maxSockets: Math.max(16,definitions.reduce((sum,node)=>sum+requestCapacity(node),0)) });
-  const tlsAgent = new https.Agent({ keepAlive: true, maxSockets: Math.max(16,definitions.reduce((sum,node)=>sum+requestCapacity(node),0)) });
+  const upstreamPoolSockets = Math.max(16,definitions.reduce((sum,node)=>sum+requestCapacity(node),0));
+  const agent = new http.Agent(upstreamAgentOptions(upstreamPoolSockets));
+  const tlsAgent = new https.Agent(upstreamAgentOptions(upstreamPoolSockets));
   const upstreamOptions = (node, url) => ({ agent: url.protocol === 'https:' ? tlsAgent : agent, headers: node.upstreamHeaders ?? {} });
   // Rewritten uploads buffer up to this bound so the upstream request can carry
   // an exact Content-Length; larger uploads keep streaming chunked.
@@ -409,17 +446,17 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const mediaSetup=mediaJobs?createMediaSetup(serviceConfig,store,{directory:path.join(path.dirname(config.state_file),'media-setup'),workers:()=>nodes.map(definition),binding:(id,c)=>{const n=nodes.find(n=>n.id===id);return !!n&&recovery.binding(n,c);},isEnabled:()=>!draining&&capabilityStatus().media,isInspectionEnabled:()=>capabilityStatus().inspection,isAllowed:mediaHosts.allowed}):null;
   const rebalanceEnabled=()=>capabilityStatus().rebalance;
   const allocationStatus=slot=>slot.turnAllocation?{turns_used:slot.turnAllocation.used,remaining:Math.max(0,conversationTurns()-slot.turnAllocation.used),waiting_for_next_turn:!slot.active&&slot.turnAllocation.until>performance.now(),idle_remaining_ms:Math.max(0,Math.ceil(slot.turnAllocation.until-performance.now()))}:null;
-  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
-    genie_admission_version:1,genie_flexible_assignment:true,continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
+  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
+    genie_admission_version:1,genie_flexible_assignment:true,placement_policy:timeRouting?'completion_time_v1':'live_load_v1',capacity_basis:'configured_gateway_admissions',continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
       relocation:{completed:relocation.completed,rejected:relocation.rejected,offers:relocationOffers().length,genie_enabled:rebalanceEnabled(),genie_offers:genieRelocationOffers(),diagnostics:relocationDiagnostics(),last:relocation.last},
       waiting:waiting.length,oldest_wait_seconds:waiting.length?Math.max(0,(performance.now()-oldestQueued(waiting).createdMono)/1000):null,
       waiting_reasons:Object.fromEntries([...new Set(waiting.map(j=>j.waitReason))].map(reason=>[reason,waiting.filter(j=>j.waitReason===reason).length]))},
     total: nodes.length, healthy: nodes.filter(n => n.healthy).length, available: nodes.filter(n => n.healthy && !n.drained).length,
     active: nodes.reduce((sum,n)=>sum+activeCount(n),0), queued: waiting.length+nodes.reduce((s, n) => s + n.queue.length, 0),media_uploads:mediaJobs?.inputs.active??0,
-    workers: nodes.map(n => ({ id: n.id, url: n.url, is_healthy: n.healthy, drained: n.drained, quarantine:n.quarantine, inference_failures:n.inferenceFailures,
+    workers: nodes.map(n => ({ id: n.id, url: n.url, is_healthy: n.healthy, drained: n.drained, quarantine:n.quarantine, inference_failures:n.inferenceFailures, transport_failures:n.transportFailures, last_failure_class:n.lastFailureClass??null,
       ...agents.pauseStatus(n.id),last_operator_action:lastOperatorAction(n.id),
       gateway_drained: n.drained && !n.active && !n.queue.length, load: activeCount(n),
-      max_concurrent_requests:requestCapacity(n),
+      max_concurrent_requests:requestCapacity(n),execution_capacity:routingCapacity(n),
       turn_allocation:requestCapacity(n)===1?allocationStatus(n.slots[0]):null,
       turn_allocations:n.slots.map(allocationStatus).filter(Boolean),
       queued: n.queue.length, recovery_waiting:parkedFor(n).length, assigned_sessions: store.count(n.id), completed: n.completed, failed: n.failed, protected:n.protected, observation_limited:n.observationLimited,
@@ -437,6 +474,113 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       last_probe: n.lastProbe, probe_error: n.probeError })) });
 
   const briefJob = j => ({key:j.key,route:j.req.url,trafficClass:j.trafficClass});
+  function routingWorker(node){
+    const model=(node.effectiveModelAliases??node.model_aliases)?.[config.model]??node.probeModel??config.model;
+    return {id:node.id,model,identity:routingIdentity(node,model,profiles[node.id]),workRevision:node.routingWorkRevision??0};
+  }
+  function routingCapacity(node){
+    const native=routingTelemetry?.snapshot(node.id),fresh=native?.connected&&Date.now()>=native.at&&Date.now()-native.at<=5000;
+    const detected=fresh&&Number.isSafeInteger(native.execution_capacity)&&native.execution_capacity>0?native.execution_capacity:null;
+    const identity=routingWorker(node).identity,saved=store.data.routing_execution_capacity?.[node.id];
+    const manual=saved?.identity===identity&&Number.isSafeInteger(saved.capacity)&&saved.capacity>0?saved.capacity:null;
+    const execution=detected??manual;
+    return {gateway_admissions:requestCapacity(node),engine_execution:execution,
+      source:detected!==null?native.capacity_source:manual!==null?'manual_execution':'configured_gateway_admissions',
+      manual_execution:manual,manual_identity:identity,manual_stale:!!saved&&manual===null,
+      running:fresh?native.running:null,waiting:fresh?native.waiting:null,
+      effective_dispatch:timeRouting?Math.min(requestCapacity(node),execution??requestCapacity(node)):requestCapacity(node),
+      mismatch:execution===null?null:execution!==requestCapacity(node)};
+  }
+  function dispatchCapacity(node){return timeRouting?routingCapacity(node).effective_dispatch:requestCapacity(node);}
+  function hasCapacity(node){return activeCount(node)<dispatchCapacity(node);}
+
+  function evaluateRoutingTime(node,job,reason){
+    if(!routingObservations.enabled||job.cancelled||job.dispatched||shuttingDown)return;
+    return routingObservations.attempt(()=>{
+      const workers=[node,...nodes.filter(candidate=>candidate!==node)].map(candidate=>({...routingWorker(candidate),
+        capacity:Math.min(requestCapacity(candidate),routingCapacity(candidate).engine_execution??requestCapacity(candidate)),
+        running:activeJobs(candidate).filter(active=>active!==job).map(active=>({...active,slotIndex:candidate.slots.indexOf(active.slot)})),queue:candidate.queue,
+        conversationTurns:conversationTurns(),turnIdleSeconds:conversationTurnIdleMs/1000,
+        native:routingTelemetry?.snapshot(candidate.id),
+        turnReservations:candidate.slots.flatMap((slot,index)=>slot.active!==job&&slot.turnAllocation?[{...slot.turnAllocation,slot:index,until:Math.max(0,(slot.turnAllocation.until-performance.now())/1000)}]:[])}));
+      const result=routingObservations.evaluate({job,workers,currentWorkerId:timeRouting&&!job.routingPlaced&&['new','none'].includes(job.affinity)?null:node.id,marginSeconds:routingMargin(),
+        eligibility:(_request,worker)=>{
+          const target=nodes.find(candidate=>candidate.id===worker.id);
+          const ok=target.healthy&&!target.drained&&!target.quarantine&&!target.recovering&&!target.removed&&allowsWorker(job.modelRoute,target)
+            &&(target===node||target.queue.length+parkedFor(target).length<queueBound())
+            &&(!job.genieFlexible||target===node||canStartNow(target,job,[...target.queue,...parkedFor(target),job].sort((a,b)=>a.sequence-b.sequence)));
+          const conflict=target!==node&&conflictingSessionWork(job);
+          return {eligible:ok&&!conflict,reason:conflict?'same_session_work':ok?null:'existing_worker_eligibility'};
+        }});
+      if(result&&!timeRouting)job.routingObservation={...result,decision_point:reason};
+      return result?{...result,source:node.id,decision_point:reason}:null;
+    });
+  }
+  function observeRoutingBody(job,body){
+    if(!routingObservations.enabled||job.cancelled)return;
+    routingObservations.attempt(()=>{job.routingInput=routingRequestMetadata(body,job.req.url);
+      if(job.node&&job.dispatched)routingObservations.started({job,worker:routingWorker(job.node),fleet:nodes.map(routingWorker),concurrency:activeCount(job.node)});
+      if(job.node){if(timeRouting)reconsiderRouting(job,'queued_body_ready');else evaluateRoutingTime(job.node,job,'queued_body_ready');}});
+  }
+  // All active time-based handovers reach this synchronous compare-and-commit.
+  // There are no network awaits between the snapshot, durable owner and booking.
+  function reconsiderRouting(job,reason,actor='scheduler',expected=null){
+    const source=job.node;
+    if(!timeRouting||draining||shuttingDown||!source||!source.queue.includes(job)||job.cancelled||job.dispatched||job.upstream)return null;
+    const decision=evaluateRoutingTime(source,job,reason);
+    if(!decision)return null;
+    const destination=nodes.find(node=>node.id===decision.destination);
+    if(expected&&(expected.destination!==decision.destination||expected.evidence_id!==relocationEvidence(job,source,destination)))
+      throw new Error('Routing estimate changed; request was left in place');
+    if(!destination||destination===source||!['move','place','reassign'].includes(decision.action)){
+      job.routingLastComparison={...decision,mode:'active',applied:true};
+      if(!job.routingDecision||!['move','reassign'].includes(job.routingDecision.action))job.routingDecision=job.routingLastComparison;
+      return null;
+    }
+    const home=job.key&&store.get(job.key);
+    if(conflictingSessionWork(job)||(job.key&&home?.node!==source.id))return null;
+    // Persist first. A failed write cannot strand the client between queues.
+    const previousOwnership=store.data;
+    try{if(job.key)store.set(job.key,destination.id);}catch{
+      // A directory fsync can fail after rename. Restore the complete old state,
+      // not merely the in-memory queue, before continuing on the old worker.
+      try{store.save(previousOwnership);}catch{draining=true;job.routingCommitBlocked=true;}
+      job.routingDecision={...decision,mode:'active',action:'stay',destination:source.id,reason:job.routingCommitBlocked?'ownership_recovery_required':'ownership_write_failed',applied:true};
+      log('queue_relocation_persistence_failed',{request_id:job.id,source:source.id,destination:destination.id});return null;
+    }
+    source.queue.splice(source.queue.indexOf(job),1);
+    job.node=destination;job.fixedHome=null;job.affinity='rebalanced';job.routingPlaced=true;
+    destination.queue.push(job);destination.queue.sort((a,b)=>a.sequence-b.sequence);
+    // An empty continuation reservation must not pull the next tool return back.
+    for(const slot of source.slots)if(!slot.active&&slot.turnAllocation?.key===job.key)releaseTurns(source,slot);
+    job.routingDecision={...decision,mode:'active',applied:true};
+    const receipt={schema:1,request_id:job.id,source:source.id,destination:destination.id,actor,
+      waiting_ms:performance.now()-job.createdMono,dispatch_state:'not_dispatched',body_replayed:false,deadline_preserved:true,
+      reason:decision.reason,estimated_saving_seconds:decision.savingSeconds,margin_seconds:decision.marginSeconds};
+    relocation.completed++;relocation.last={...receipt,time:new Date().toISOString()};
+    log('queued_request_relocated',receipt);dataset.record('queue_relocation',{...receipt,node:destination.id});
+    setImmediate(()=>{if(!shuttingDown){schedule(source);schedule(destination);}});
+    return {state:'relocated',...receipt};
+  }
+  function timeRoutingCandidates(){
+    // Reconsider one eligible head per worker per tick; later jobs also get
+    // their own arrival/body-ready/pre-dispatch comparisons.
+    return priorityOrder(nodes.flatMap(node=>{
+      const eligible=node.queue.filter(job=>!conflictingSessionWork(job));
+      const head=eligible[priorityIndex(eligible)];return head?[head]:[];
+    }).sort((a,b)=>a.sequence-b.sequence)).slice(0,32);
+  }
+  function timeRoutingOffers(){
+    if(draining||shuttingDown)return [];
+    return timeRoutingCandidates().flatMap(job=>{
+      const source=job.node,decision=evaluateRoutingTime(source,job,'offer');
+      if(!decision||decision.destination===source.id||!['move','place','reassign'].includes(decision.action))return [];
+      const destination=nodes.find(node=>node.id===decision.destination);if(!destination)return [];
+      return [{schema:1,evidence_id:relocationEvidence(job,source,destination),request_id:job.id,priority:job.priority,geniePriority:job.geniePriority,
+        source:source.id,destination:destination.id,source_queued:source.queue.length,waiting_seconds:(performance.now()-job.createdMono)/1000,
+        estimated_saving_seconds:decision.savingSeconds,margin_seconds:decision.marginSeconds,destination_immediately_free:canStartNow(destination,job,[...destination.queue,job].sort((a,b)=>a.sequence-b.sequence)),automatic:true}];
+    }).slice(0,32);
+  }
   function candidate(n,key) {
     return {node:n.id,healthy:n.healthy,paused:n.drained,active:activeCount(n),max_concurrent_requests:requestCapacity(n),queued:n.queue.length,
       assigned_sessions:store.count(n.id),context_length:n.contextLength,
@@ -461,7 +605,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     // This callback never reads/consumes queued uploads or changes ownership.
     if(shuttingDown)return;
     let count=0;
-    for(const n of nodes)if(n.queue.length){if(count++>=32){shadow.state.skipped++;continue;}const next=nextQueued(n);if(next)evaluateShadow(n,next,'worker_free');}
+    for(const n of nodes)if(n.queue.length){if(count++>=32){shadow.state.skipped++;continue;}const next=nextQueued(n);if(next){evaluateShadow(n,next,'worker_free');if(!timeRouting)evaluateRoutingTime(n,next,'worker_free');}}
   }
 
   const eligibleDestination=n=>n.healthy&&!n.drained&&!n.quarantine&&!n.recovering&&!n.removed&&!n.active&&n.queue.length===0;
@@ -488,6 +632,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   }
   const queuedCount=source=>source.queue.filter(job=>!job.cancelled).length;
   function relocationDiagnostics() {
+    if(timeRouting)return {schema:1,policy:'completion_time_v1',sources:timeRoutingCandidates().map(job=>({source:job.node.id,request_id:job.id,...evaluateRoutingTime(job.node,job,'diagnostic')})),truncated:false};
     const idle=nodes.filter(eligibleDestination).sort((a,b)=>store.count(a.id)-store.count(b.id)||a.id.localeCompare(b.id));
     const gateway_reason=shuttingDown?'gateway_stopping':draining?'gateway_draining':null;
     const sources=[];
@@ -505,6 +650,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     return {schema:1,gateway_reason,idle_destinations:idle.map(node=>node.id).slice(0,32),sources,truncated:nodes.some(node=>node.queue.some(job=>!job.cancelled))&&sources.length>=32};
   }
   function relocationOffers() {
+    if(timeRouting)return timeRoutingOffers();
     if(shuttingDown||draining)return [];
     const idle=nodes.filter(eligibleDestination).sort((a,b)=>store.count(a.id)-store.count(b.id)||a.id.localeCompare(b.id));
     if(!idle.length)return [];
@@ -520,6 +666,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   }
   function genieRelocationOffers(){
     if(!rebalanceEnabled())return [];
+    if(timeRouting)return timeRoutingOffers().slice(0,8).map(offer=>({...offer,trigger:'completion_time'}));
     const minimum=(config.genie_rebalance_min_wait_ms??60000)/1000;
     if(!Number.isFinite(minimum)||minimum<0)throw new Error('genie_rebalance_min_wait_ms must be non-negative');
     return relocationOffers().filter(offer=>offer.source_queued>=2||offer.waiting_seconds>=minimum).slice(0,8)
@@ -529,6 +676,13 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     const keys=Object.keys(input??{}).sort().join(',');
     if(keys!=='destination,evidence_id,request_id,source'||!validCallId(input.request_id)||!/^[a-f0-9]{64}$/.test(input.evidence_id)||
       !/^[\w-]{1,64}$/.test(input.source)||!/^[\w-]{1,64}$/.test(input.destination))throw new Error('Specify one current queued-handover offer exactly');
+    if(timeRouting){
+      const job=nodes.find(n=>n.id===input.source)?.queue.find(job=>job.id===input.request_id);
+      if(!job)throw new Error('Queued-handover offer is stale; refresh before retrying');
+      const receipt=reconsiderRouting(job,'explicit_handover',actor,input);
+      if(!receipt)throw new Error('The current routing comparison does not permit this move; request was left in place');
+      return receipt;
+    }
     const source=nodes.find(n=>n.id===input.source),destination=nodes.find(n=>n.id===input.destination),job=nextQueued(source);
     const rejectMove=message=>{relocation.rejected++;throw new Error(message);};
     if(!source||!destination||source===destination||!job||job.id!==input.request_id)return rejectMove('Queued-handover offer is stale; refresh before retrying');
@@ -552,6 +706,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     return {state:'relocated',...receipt};
   }
   function rebalanceUndispatched() {
+    if(timeRouting){
+      for(const job of timeRoutingCandidates())reconsiderRouting(job,'waiting');
+      return;
+    }
     const offer=relocationOffers().filter(candidate=>{
       const job=nextQueued(nodes.find(node=>node.id===candidate.source));
       return job&&(['new','none'].includes(job.affinity)||(automaticAffinityWait!==null&&candidate.waiting_seconds*1000>=automaticAffinityWait));
@@ -572,9 +730,14 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   }
 
   function pick(exclude,modelRoute) {
+    return placementChoice(nodes.filter(n => n.healthy && !n.drained && n.id !== exclude && allowsWorker(modelRoute,n)));
+  }
+  function placementChoice(eligible) {
+    // Share ranking, not eligibility: flexible Genie must still pass its
+    // immediate-start/turn checks, while ordinary placement may enqueue.
+    // Capacity comes from the worker registry, never a model or machine name.
     // Direct-reserve is soft: a worker in active owner use is deprioritized, not
     // excluded. If every eligible worker is reserved, the pool still serves.
-    const eligible=nodes.filter(n => n.healthy && !n.drained && n.id !== exclude && allowsWorker(modelRoute,n));
     const preferred=eligible.filter(n=>!directReserved(n));
     return (preferred.length?preferred:eligible).sort((a, b) =>
       Number(!hasCapacity(a))-Number(!hasCapacity(b)) ||
@@ -651,13 +814,19 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     job.waitReason=null;
     node.queue.push(job);node.queue.sort((a,b)=>a.sequence-b.sequence);
     clientWatch.observeRequest(job.watchId,job.id,'queued');
-    evaluateShadow(node,job,wasAdmitted?'worker_free':'admission');schedule(node);
+    evaluateShadow(node,job,wasAdmitted?'worker_free':'admission');evaluateRoutingTime(node,job,'admission');
+    if(timeRouting){
+      reconsiderRouting(job,'admission');
+      // Give already-arriving body bytes one event-loop turn for observation.
+      // Slow/oversized uploads still dispatch with labelled unknown estimates.
+      setImmediate(()=>{if(!shuttingDown&&!job.cancelled&&job.node)schedule(job.node);});
+    }else schedule(node);
   }
-  const freeGenieNode=(modelRoute,priority='normal',arrival=Number.MAX_SAFE_INTEGER,geniePriority=false)=>nodes.filter(node=>{
+  const freeGenieNode=(modelRoute,priority='normal',arrival=Number.MAX_SAFE_INTEGER,geniePriority=false)=>placementChoice(nodes.filter(node=>{
     if(!allowsWorker(modelRoute,node)||!node.healthy||node.drained||node.quarantine||node.recovering||node.removed||!hasCapacity(node))return false;
     const candidate={key:null,priority,sequence:arrival,geniePriority};
     return canStartNow(node,candidate,[...node.queue,...parkedFor(node),candidate]);
-  }).sort((a,b)=>store.count(a.id)-store.count(b.id)||a.id.localeCompare(b.id))[0];
+  }));
   function pumpWaiting() {
     if(shuttingDown)return;
     for(const n of nodes)for(const job of n.queue)heartbeat(job);
@@ -704,37 +873,23 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     try{job.res.writeProcessing();}catch{job.res.destroy();}
   }
   function queuedChoice(node,slot,queue){
-    if(slot.turnAllocation?.until&&slot.turnAllocation.until<=performance.now())releaseTurns(node,slot);
-    if(!node.healthy||node.quarantine||node.recovering||shuttingDown)releaseTurns(node,slot);
-    const eligible=queue.filter(job=>!job.cancelled&&(!job.key||(
-      !nodes.some(n=>activeJobs(n).some(active=>active.key===job.key))&&
-      !node.slots.some(other=>other!==slot&&other.turnAllocation?.key===job.key&&other.turnAllocation.used<conversationTurns())
-    )));
-    let index=priorityIndex(eligible);if(index<0)return null;
-    const highest=priorityRank(eligible[index]);let allocation=slot.turnAllocation;
-    if(allocation&&priorityRank(eligible.find(job=>job.key===allocation.key)??allocation)<highest){releaseTurns(node,slot);allocation=null;}
-    if(allocation){
-      if(allocation.used<conversationTurns()){
-        const next=eligible.findIndex(job=>job.key===allocation.key);
-        if(next>=0)index=next;
-        else if(allocation.until>performance.now())return null;
-        else releaseTurns(node,slot);
-      }else{
-        const next=priorityIndex(eligible.map(job=>job.key===allocation.key?{...job,cancelled:true}:job));
-        if(next>=0&&priorityRank(eligible[next])===highest)index=next;
-        releaseTurns(node,slot);
-      }
-    }
-    return eligible[index];
+    const release=!!(slot.turnAllocation?.until&&slot.turnAllocation.until<=performance.now())||!node.healthy||node.quarantine||node.recovering||shuttingDown;
+    // Release before checking other slots, matching the dispatcher's original order.
+    if(release)releaseTurns(node,slot);
+    const choice=queueChoice({queue,allocation:slot.turnAllocation,turns:conversationTurns(),now:performance.now(),
+      blocked:job=>job.routingCommitBlocked||!!job.key&&(nodes.some(n=>activeJobs(n).some(active=>active.key===job.key))||
+        node.slots.some(other=>other!==slot&&other.turnAllocation?.key===job.key&&other.turnAllocation.used<conversationTurns()))});
+    if(choice.clearAllocation)releaseTurns(node,slot);
+    return choice.job;
   }
   function canStartNow(node,job,queue){
     if(!hasCapacity(node))return false;
     // Preview reservation changes without clearing real timers or assigning a
     // flexible request to a worker whose free slot belongs to another turn.
     const slots=node.slots.map(slot=>({...slot,turnTimer:null,turnAllocation:slot.turnAllocation?{...slot.turnAllocation}:null}));
-    if(slots.length<requestCapacity(node))slots.push({});
+    if(slots.length<dispatchCapacity(node))slots.push({});
     const preview={...node,slots},pending=[...queue].sort((a,b)=>a.sequence-b.sequence);
-    return slots.some(slot=>!slot.active&&queuedChoice(preview,slot,pending)===job);
+    return slots.some((slot,index)=>index<dispatchCapacity(node)&&!slot.active&&queuedChoice(preview,slot,pending)===job);
   }
   function schedule(node) {
     if(node.scheduling||!hasCapacity(node))return;
@@ -742,10 +897,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     try{
       node.queue=node.queue.filter(job=>!job.cancelled);
       // Allocate additional slots only as work needs them; capacity is explicit.
-      for(let i=0;i<requestCapacity(node)&&node.queue.length;i++){
+      for(let i=0;i<dispatchCapacity(node)&&node.queue.length;i++){
         const slot=node.slots[i]??(node.slots[i]={});if(slot.active)continue;
         let job;
         while((job=queuedChoice(node,slot,node.queue))){
+          if(timeRouting&&reconsiderRouting(job,'before_dispatch'))continue;
           node.queue.splice(node.queue.indexOf(job),1);
           if(!node.healthy||node.quarantine||node.recovering){park(job,node,unavailableReason(node));continue;}
           job.queueTimer?.cancel();clearTimeout(slot.turnTimer);slot.turnTimer=null;
@@ -799,8 +955,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       rewrite.end(body);
     });
     const requestBody=job.queuedBody?.stream()??req;
+    if(!timeRouting)evaluateRoutingTime(node,job,'before_dispatch');
     job.dispatched = Date.now();
     job.dispatchedMono=performance.now();
+    if(routingObservations.enabled)routingObservations.started({job,worker:routingWorker(node),fleet:nodes.map(routingWorker),concurrency:activeCount(node)});
+    if(routingObservations.enabled)node.routingWorkRevision=(node.routingWorkRevision??0)+1;
     clientWatch.observeRequest(job.watchId,job.id,'dispatched');
     observe(()=>shadow.started(node.id,job.key));
     let requestBytes=0, firstBodyByte=null;
@@ -832,6 +991,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     job.thinking = new RequestedThinkingObserver(req.headers['content-encoding'],(body,thinking)=>{
       job.requestStream=typeof body?.stream==='boolean'?body.stream:null;
       job.requestedUsage=typeof body?.stream_options?.include_usage==='boolean'?body.stream_options.include_usage:null;
+      observeRoutingBody(job,body);
       if(job.previewFromRequest)observeJobPreview(job,requestUserExcerpt(body));
     },{route:req.url,model:node.backend === 'openai' ? undefined : node.probeModel ?? config.model,contextLength:node.contextLength});
     const observeBody = chunk => {
@@ -850,15 +1010,30 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     let settled = false, response, faults,jsonUsage,responseFormat='no_response',clientStatus=null,responseEncoded=false;
     const finish = (outcome, detail, observedStreamEnd=null) => {
       if (settled) return; settled = true;
+      if(routingObservations.enabled)node.routingWorkRevision=(node.routingWorkRevision??0)+1;
       const streamEnd=responseFormat==='sse'?(observedStreamEnd??(responseEncoded?'encoded_unobserved':observer.finishState({cleanEOF:false}))):null;
       const jsonMetadata=jsonUsage?.finish();
       if(jsonMetadata){observer.usage=jsonMetadata.usage??undefined;observer.finish_reason=jsonMetadata.finish_reason??null;}
       const usageObservation=responseEncoded?'encoded_body':jsonMetadata?.status??(responseFormat!=='sse'?'unsupported_format':!observer.usage?'not_reported':observer.usage.prompt_tokens!=null&&observer.usage.completion_tokens!=null?'observed':'partial');
       const fault=faults?.finish();
       if(fault){quarantine(node,fault,job.id);if(outcome==='complete')outcome='upstream_engine_error';}
-      else if(!job.cancelled && ((outcome==='upstream_http_error' && detail>=500) || ['incomplete_sse','upstream_engine_error','upstream_error','upstream_stream_error','upstream_aborted','connection_closed'].includes(outcome))) {
-        if(++node.inferenceFailures>=3)quarantine(node,'repeated_inference_failures',job.id);
-      } else if(outcome==='complete')node.inferenceFailures=0;
+      else if(!job.cancelled && ((outcome==='upstream_http_error' && detail>=500) || ENGINE_FAILURE_OUTCOMES.has(outcome) || AMBIGUOUS_FAILURE_OUTCOMES.has(outcome))) {
+        // A severed ssh tunnel and a dying engine produce the same outcomes from
+        // the same call sites, so the outcome string alone must not convict the
+        // engine. The ssh supervisor tracks the link independently; when it
+        // reports the tunnel dead, the ambiguous outcomes are transport failures
+        // and must not advance the engine counter. A response the engine itself
+        // emitted (truncated SSE, fatal reason envelope) stays engine evidence
+        // even while the tunnel is down.
+        const tunnelDead=node.managementPath?.transport==='ssh_tunnel'&&TRANSPORT_DEAD_STATES.has(node.managementPath.state);
+        if(!ENGINE_FAILURE_OUTCOMES.has(outcome)&&tunnelDead){
+          node.transportFailures++;node.lastFailureClass='transport';
+        }else{
+          if(node.transportFailures)node.transportFailures=0;
+          node.lastFailureClass='engine';
+          if(++node.inferenceFailures>=QUARANTINE_FAILURE_THRESHOLD)quarantine(node,'repeated_inference_failures',job.id);
+        }
+      } else if(outcome==='complete'){node.inferenceFailures=0;node.transportFailures=0;node.lastFailureClass='complete';}
       clearTimeout(job.deadline);
       requestBody.off('data', observeBody);requestBody.off('end',bodyEnded);req.off('aborted',bodyAborted);requestBody.off('error',bodyAborted);job.thinking.dispose();
       captureChunks=[];finishCapture(null);
@@ -883,13 +1058,14 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
         generation:jsonMetadata?.generation??(responseFormat==='sse'&&!responseEncoded?{thinking_characters:observer.thinkingCharacters,answer_characters:observer.answerCharacters,tool_characters:observer.toolCharacters,output_present:observer.outputPresent,observation_complete:observer.shapeComplete&&!observer.limited&&!observer.reasonEofAmbiguous&&observer.singleChoiceFinish,first_semantic_ms:observer.firstSemanticAt===null?null:observer.firstSemanticAt-job.dispatchedMono}:null)});
       observe(()=>shadow.finished(node.id,job.key,{outcome,finish_reason:observer.finish_reason,
         service_ms:performance.now()-job.dispatchedMono,usage:observer.usage,route:req.url,traffic_class:job.trafficClass,remaining_active:activeCount(node)-1}));
+      if(routingObservations.enabled)routingObservations.complete({job,worker:routingWorker(node),usage:observer.usage,outcome,finishReason:observer.finish_reason});
       job.cleanup();
       job.upstream=null;job.upstreamResponse=null;
       job.slot.active = null;
       finishTurn(node,job.slot,outcome);
       pumpWaiting();
       schedule(node);
-      if(shadow.enabled)setImmediate(evaluateWaiting);
+      if(shadow.enabled||routingObservations.enabled)setImmediate(evaluateWaiting);
     };
     const responseHeaders=up=>{
       const outHeaders = forwardHeaders(up.headers);
@@ -1243,9 +1419,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       dataset.record('queue_timeout',{request_id:job.id,node:owner?.id??null,total_ms:performance.now()-job.createdMono});
       job.cleanup(); req.resume();pumpWaiting();
     }, job.queueTimeoutMs);
-    if(job.previewFromRequest&&(!req.headers['content-encoding']||req.headers['content-encoding']==='identity')){
+    if((job.previewFromRequest||routingObservations.enabled)&&(!req.headers['content-encoding']||req.headers['content-encoding']==='identity')){
       job.queuedBody=new QueuedRequestBody(req,{budget:queuedBodyBudget,onBody:body=>{
-        if(!job.cancelled)observeJobPreview(job,requestUserExcerpt(body));
+        if(!job.cancelled&&job.previewFromRequest)observeJobPreview(job,requestUserExcerpt(body));
+        observeRoutingBody(job,body);
       }});
     }
     if(node)admit(job,node);else park(job,null,waitReason??'no_ready_worker');
@@ -1324,7 +1501,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const startTunnel = node => {
     if (node.ssh) node.stopTunnel = tunnelFactory(node, () => shuttingDown || node.removed);
   };
-  const registry = () => ({ spark_services_version:1,genie_capabilities:capabilityStatus(), model: config.model, minimum_context: contextLimit(), context_limit_control:true,concurrency_control_version:1,conditional_resume_version:1,media_maintenance_version:1,direct_reserve_control:true,direct_reserve_enabled:directReserveEnabled(),direct_reserve_release_ms:directReserveMs(),
+  const registry = () => ({ routing_capacity_control:true,routing_margin_control:true,routing_switching_margin_seconds:routingMargin(),routing_time_mode:timeRouting?'active':routingObservations.enabled?'observation_only':'off',spark_services_version:1,genie_capabilities:capabilityStatus(), model: config.model, minimum_context: contextLimit(), context_limit_control:true,concurrency_control_version:1,conditional_resume_version:1,media_maintenance_version:1,direct_reserve_control:true,direct_reserve_enabled:directReserveEnabled(),direct_reserve_release_ms:directReserveMs(),
     genie_admission_version:1,genie_flexible_assignment:true,
     context_limit_source:store.data.pool_context_length === undefined ? 'config' : 'saved',
     conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs,conversation_turns_control:true,conversation_turns_source:store.data.conversation_turns!==undefined?'saved':config.conversation_turns!==undefined?'config':'default',
@@ -1334,6 +1511,29 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   async function freshProbe(node) {
     while (node.probing) await delay(10);
     await probe(node);
+  }
+  function setExecutionCapacity(input){
+    if(shuttingDown||draining)throw new Error('Gateway is draining');
+    if(!input||Object.keys(input).sort().join(',')!=='capacity,expected_capacity,expected_identity,id'
+      ||!Number.isSafeInteger(input.capacity)||input.capacity<1)throw new Error('Specify a positive whole execution capacity, worker ID and the displayed current values');
+    const node=nodes.find(node=>node.id===input.id);if(!node)throw new Error('Unknown worker');
+    const current=routingCapacity(node);
+    if(input.expected_identity!==current.manual_identity||input.expected_capacity!==current.manual_execution)throw new Error('Worker or manual execution capacity changed; refresh before saving');
+    if(fs.existsSync(store.filename)){const backup=`${store.filename}.execution-capacity-${Date.now()}-${randomUUID()}.bak`;fs.copyFileSync(store.filename,backup,fs.constants.COPYFILE_EXCL);fs.chmodSync(backup,0o600);}
+    store.save({...store.data,routing_execution_capacity:{...store.data.routing_execution_capacity,[node.id]:{capacity:input.capacity,identity:current.manual_identity}}});
+    log('manual_execution_capacity_changed',{node:node.id,capacity:input.capacity,engine_settings_changed:false});
+    pumpWaiting();for(const worker of nodes)schedule(worker);
+    return registry();
+  }
+  function setRoutingMargin(input){
+    if(shuttingDown||draining)throw new Error('Gateway is draining');
+    if(!input||Array.isArray(input)||Object.keys(input).sort().join(',')!=='expected_margin_seconds,margin_seconds'
+      ||!Number.isFinite(input.margin_seconds)||input.margin_seconds<0)throw new Error('Specify a finite non-negative switching margin in seconds and the expected current value');
+    if(input.expected_margin_seconds!==routingMargin())throw new Error('Switching margin changed; refresh before saving');
+    if(fs.existsSync(store.filename)){const backup=`${store.filename}.routing-margin-${Date.now()}-${randomUUID()}.bak`;fs.copyFileSync(store.filename,backup,fs.constants.COPYFILE_EXCL);fs.chmodSync(backup,0o600);}
+    store.save({...store.data,routing_switching_margin_seconds:input.margin_seconds});
+    log('routing_switching_margin_changed',{margin_seconds:routingMargin(),mode:timeRouting?'active':routingObservations.enabled?'observation_only':'off'});
+    return registry();
   }
   function setConversationTurns(input){
     if(shuttingDown||draining)throw new Error('Gateway is draining');
@@ -1619,7 +1819,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       let body='';req.on('data',chunk=>{body+=chunk;if(Buffer.byteLength(body)>2048)req.destroy();});req.on('error',()=>{});
       req.on('end',()=>{void serialize(async()=>{try{const input=JSON.parse(body);return json(res,202,await (req.url==='/genie-media-start'?mediaExecution.start(input):req.url==='/genie-media-setup'?mediaSetup.start(input):req.url==='/genie-media-repair'?mediaSetup.repair(input):req.url==='/genie-media-audit'?mediaSetup.audit(input):mediaSetup.finish(input)));}catch(e){return error(res,409,'media_start_failed',e.message);}});});return;
     }
-    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
+    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-execution-capacity','/set-routing-margin','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
     let body = '';
     req.on('data', chunk => { body += chunk; if (Buffer.byteLength(body) > 4096) req.destroy(); });
     req.on('error', () => {});
@@ -1629,6 +1829,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           const input = JSON.parse(body);
           // Actor is revalidated after waiting for the shared mutation queue.
           if(agentRoute){agents.agent(actor);if(req.url==='/agent/v1/receipt')return json(res,200,agents.receipt(actor,input));return json(res,200,await agents.act(actor,req.url.endsWith('/drain')?'drain':'resume',input));}
+          if(req.url==='/set-execution-capacity')return json(res,200,setExecutionCapacity(input));
+          if(req.url==='/set-routing-margin')return json(res,200,setRoutingMargin(input));
           if(req.url==='/media-host-eligibility')return json(res,200,mediaHosts.change(input));
           if(req.url==='/grant-agent')return json(res,201,agents.grant(input));
           if(req.url==='/revoke-agent')return json(res,200,agents.revoke(input));
@@ -1701,7 +1903,13 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
             if (selected.some(n=>n.probeError || !validContext(n.contextLength) || n.contextLength<requiredContext(n))) throw new Error('Cannot enable a server without a fresh compatible model/context probe');
             const recovered=[];
             for(const n of selected.filter(n=>n.quarantine)) {
-              if(n.active || n.queue.length)throw new Error('Wait for this worker to become idle before recovery verification');
+              // The readmission proof sends a real generation straight to the
+              // endpoint, outside the scheduler, so it needs a free execution
+              // slot rather than a completely empty worker. Requiring zero
+              // active work deadlocked recovery on any continuously-loaded
+              // worker: quarantine blocks new admission, so the pre-quarantine
+              // work could never drain and the operator had no way back in.
+              if(activeCount(n)>=dispatchCapacity(n))throw new Error('Wait for this worker to have a free execution slot before recovery verification');
               const proof=await verifyGeneration(n.url,n.probeModel ?? config.model,{worker:n,timeoutMs:config.request_timeout_ms});
               if(shuttingDown || draining)throw new Error('Gateway is draining');
               recovered.push({node:n,proof});
@@ -1713,7 +1921,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
             checkExpectedActions();
             const action=operatorAction(input.workers,false,req.headers['x-dsg-control-channel']??'unidentified_local_client');
             store.save({...store.data,quarantined,...agents.manualUpdate(input.workers,false),...recordOperatorAction(action)});
-            for(const {node,proof} of recovered){node.quarantine=null;node.inferenceFailures=0;node.healthy=true;log('worker_recovery_verified',{node:node.id,...proof});}
+            for(const {node,proof} of recovered){node.quarantine=null;node.inferenceFailures=0;node.transportFailures=0;node.lastFailureClass='recovered';node.healthy=true;log('worker_recovery_verified',{node:node.id,...proof});}
             for(const n of selected)n.drained=false;
             log('workers_drain_changed',{ids:input.workers,drained:false,operator_action_id:action.id,control_channel:action.control_channel});
             return json(res,200,stats());
@@ -1725,7 +1933,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   }) : null;
   control?.on('clientError',invalidHttp);
   return {
-    server, nodes, stats, store, mediaJobs, drainNodes, registry,recovery,relocateQueued,visionProtection,currentJobsStatus,
+    server, nodes, stats, store, mediaJobs, drainNodes, registry,recovery,relocateQueued,visionProtection,currentJobsStatus,routingObservations,
     async start() {
       nodes.forEach(startTunnel);
       if(startup.barrier){
@@ -1753,6 +1961,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       }
       if(!startup.barrier){await Promise.all(nodes.map(probe));startup.complete=true;startup.completed_at=new Date().toISOString();startup.unavailable=nodes.filter(n=>!n.healthy&&!n.drained&&!n.quarantine).map(n=>n.id);}
       healthTimer = setInterval(() => { for (const n of nodes) void probe(n); }, config.health_interval_ms ?? 5000);
+      if(routingTelemetry){
+        const pollRouting=()=>{routingTelemetry.sync(nodes);routingTelemetry.poll();evaluateWaiting();};
+        pollRouting();routingTimer=setInterval(pollRouting,2000);routingTimer.unref?.();
+      }
       waitingTimer=setInterval(pumpWaiting,1000);waitingTimer.unref?.();
       void recovery.tick();pairEnrollment.tick();omlxEnrollment.tick();recoveryTimer=setInterval(()=>{void recovery.tick();pairEnrollment.tick();omlxEnrollment.tick();},30000);
       return server.address();
@@ -1763,11 +1975,12 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       shuttingDown = true; draining = true;
       for(const node of nodes)releaseTurns(node);
       clearInterval(waitingTimer);
+      clearInterval(routingTimer);routingTelemetry?.close();
       for(const job of [...waiting]){detach(job);reject(job.req,job.res,503,'draining','Gateway is stopping; the waiting request was not dispatched. A compatible patient client may retry after DSG returns.',{...job,node:job.fixedHome,reason:'gateway_draining'});job.cleanup();}
       clearInterval(recoveryTimer);pairEnrollment.close();omlxEnrollment.close();await Promise.all([pairEnrollment.idle(),omlxEnrollment.idle()]);await recovery.close();
       if (control) await new Promise(resolve => control.close(resolve));
       await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); });
-      clearInterval(healthTimer); agent.destroy(); tlsAgent.destroy(); store.close();await dataset.close();
+      clearInterval(healthTimer); agent.destroy(); tlsAgent.destroy(); store.close();await dataset.close();await routingObservations.close();
       nodes.forEach(n => { n.removed = true; n.stopTunnel?.(); });
     },
   };

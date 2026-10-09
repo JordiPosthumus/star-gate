@@ -40,7 +40,7 @@ import { RequestHistoryReader } from './request-history.mjs';
 import {FleetSpeedReader,endpointFleetSamples} from './fleet-speed.mjs';
 import {PerformanceReader,performanceProfile,performanceActive} from './performance-lights.mjs';
 import {RatePeaks} from './rate-peaks.mjs';
-import {HardwareTelemetry} from './hardware-telemetry.mjs';
+import {HardwareTelemetry, physicalMachineIds} from './hardware-telemetry.mjs';
 import { estimateCacheCost } from './cache-cost.mjs';
 import {CacheInventoryReader,cacheInventoryDirectories,loadCacheInventoryKey} from './cache-inventory.mjs';
 import { loadConfig, dashboardPort, isMain, continuityEnabled, doorSocket } from './config.mjs';
@@ -73,6 +73,7 @@ assets.set('/fleet-catalogue.js',['fleet-catalogue.js','text/javascript']);
 assets.set('/logo.svg',['logo.svg','image/svg+xml']);
 assets.set('/media.js',['media.js','text/javascript']);
 assets.set('/current-jobs.js',['current-jobs.js','text/javascript']);
+assets.set('/routing-observation.js',['routing-observation.js','text/javascript']);
 for(const [route,file,mime] of [
   ['favicon.ico','favicon.ico','image/x-icon'],['favicon-v2.ico','favicon.ico','image/x-icon'],
   ['favicon-v1.svg','favicon-v1.svg','image/svg+xml'],['favicon-v2.svg','favicon-v1.svg','image/svg+xml'],
@@ -124,12 +125,12 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
       void memory.read().then(value=>reply(200,value)).catch(()=>reply(503,{error:'Could not read native Hermes memory files.'}));return;
     }
     if(req.url==='/api/brain/status'&&req.method==='GET')return reply(200,brain?.runtime()??{state:'unavailable'});
-    if(req.url==='/api/brain'||req.url==='/api/brain/test'){
+    if(req.url==='/api/brain'||req.url==='/api/brain/test'||req.url==='/api/brain/terminal'){
       if(!brain)return reply(503,{error:'Native Hermes profile is not configured.'});
       if(req.method==='GET'&&req.url==='/api/brain'){
         void brain.read().then(value=>reply(200,{...value,csrf_token:csrf})).catch(error=>reply(503,{error:error.message}));return;
       }
-      if(!((req.method==='PUT'&&req.url==='/api/brain')||(req.method==='POST'&&req.url==='/api/brain/test')))return reply(405,{error:'Unsupported method.'});
+      if(!((req.method==='PUT'&&req.url==='/api/brain')||(req.method==='POST'&&['/api/brain/test','/api/brain/terminal'].includes(req.url))))return reply(405,{error:'Unsupported method.'});
       const token=Buffer.from(req.headers['x-dsg-csrf']??''),expected=Buffer.from(csrf);
       if(req.headers.origin!==`http://${req.headers.host}`||token.length!==expected.length||!timingSafeEqual(token,expected))return reply(403,{error:'Reload this local dashboard before changing brain settings.'});
       if(req.headers['content-type']!=='application/json')return reply(415,{error:'JSON required.'});
@@ -139,6 +140,10 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
       req.on('data',chunk=>{if(ended)return;body+=chunk;if(Buffer.byteLength(body)>65536){ended=true;clearTimeout(timer);reply(413,{error:'Settings request is too large.'});}});
       req.on('end',()=>{clearTimeout(timer);if(ended)return;ended=true;
         let input;try{input=JSON.parse(body);}catch{return reply(400,{error:'Invalid JSON.'});}
+        if(req.url==='/api/brain/terminal'){
+          if(!brain.openTerminal)return reply(503,{error:'The native terminal launcher is unavailable.'});
+          void brain.openTerminal(input).then(value=>reply(200,value)).catch(error=>reply(error.status??500,{error:error.status?error.message:'Terminal could not be opened. Use the launcher in startScripts.'}));return;
+        }
         void (req.url==='/api/brain/test'?brain.test(input):brain.save(input)).then(value=>reply(200,{...value,csrf_token:csrf})).catch(error=>reply(error.status??500,{error:error.message}));
       });return;
     }
@@ -256,7 +261,7 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
       void (management?.catalogue?.()??Promise.resolve({unavailable:true,entries:[],warnings:[]})).then(value => reply(200,value)).catch(e => reply(503,{error:e.message}));
       return;
     }
-    const actions = { '/api/media/video/jobs':'media-video-submit', '/api/media/setup':'media-setup', '/api/media/inspect':'media-inspect', '/api/media/eligibility':'media-eligibility', '/api/current-jobs/priority':'job-priority', '/api/workers/concurrency':'concurrency', '/api/workers/add':'add', '/api/workers/endpoint':'endpoint', '/api/workers/test':'test', '/api/workers/remove':'remove', '/api/workers/drain':'drain', '/api/workers/resume':'resume','/api/workers/lock':'lock','/api/workers/unlock':'unlock','/api/workers/fallbacks':'fallbacks', '/api/workers/context':'context','/api/workers/conversation-turns':'conversation-turns','/api/workers/queue-timeout':'queue-timeout','/api/workers/protection':'protection','/api/workers/direct-reserve':'direct-reserve','/api/workers/relocate':'relocate', '/api/workers/recover':'recover', '/api/workers/genie-capability':'genie-capability','/api/workers/genie-thinking':'genie-thinking','/api/workers/recovery-policy':'recovery-policy','/api/workers/recovery-handback-policy':'recovery-handback-policy','/api/workers/recovery-recheck':'recovery-recheck','/api/workers/power':'power' };
+    const actions = { '/api/media/video/jobs':'media-video-submit', '/api/media/setup':'media-setup', '/api/media/inspect':'media-inspect', '/api/media/eligibility':'media-eligibility', '/api/current-jobs/priority':'job-priority', '/api/workers/concurrency':'concurrency','/api/workers/execution-capacity':'execution-capacity', '/api/workers/add':'add', '/api/workers/endpoint':'endpoint', '/api/workers/test':'test', '/api/workers/remove':'remove', '/api/workers/drain':'drain', '/api/workers/resume':'resume','/api/workers/lock':'lock','/api/workers/unlock':'unlock','/api/workers/fallbacks':'fallbacks', '/api/workers/context':'context','/api/workers/conversation-turns':'conversation-turns','/api/workers/queue-timeout':'queue-timeout','/api/workers/routing-margin':'routing-margin','/api/workers/protection':'protection','/api/workers/direct-reserve':'direct-reserve','/api/workers/relocate':'relocate', '/api/workers/recover':'recover', '/api/workers/genie-capability':'genie-capability','/api/workers/genie-thinking':'genie-thinking','/api/workers/recovery-policy':'recovery-policy','/api/workers/recovery-handback-policy':'recovery-handback-policy','/api/workers/recovery-recheck':'recovery-recheck','/api/workers/power':'power' };
     if (management && req.method === 'POST' && Object.hasOwn(actions,req.url)) {
       const token = Buffer.from(req.headers['x-dsg-csrf'] || ''), expected = Buffer.from(csrf);
       if (req.headers.origin !== `http://${req.headers.host}` || token.length !== expected.length || !timingSafeEqual(token,expected)) return reply(403,{error:'Same-origin worker-control session required; refresh and retry'});
@@ -348,6 +353,10 @@ export async function runDashboard(configPath, port) {
     catch { writeError = 'Telemetry file could not be written; live monitoring continues'; }
   };
   const hardware=new HardwareTelemetry(config.hardware_telemetry,row=>appendMetric(row));
+  // Physical machines observed as independent read-only sensors. These are shown
+  // on the home page as a machine temperature/clock panel; they are never added to
+  // the gateway worker roster and never influence routing or readiness.
+  const physicalMachines=physicalMachineIds(config.hardware_telemetry);
   const attribution=new EngineAttribution(appendMetric);
   const save = entry => {
     // Never stamp today's configuration onto journal backfill. Profiles are
@@ -487,6 +496,7 @@ export async function runDashboard(configPath, port) {
           last_request_finished_at: typeof w.last_request_finished_at === 'string' && Number.isFinite(Date.parse(w.last_request_finished_at)) ? w.last_request_finished_at : null })) };
       gatewayAt = Date.now(); gatewayError = null;
       syncDevices(s.workers);
+      endpointTelemetry.useShared(s.routing_metrics);
       hardware.poll();
       // Keep installed static targets intact. Only the local core supplies new
       // setup enrollments; an older core can continue without this endpoint.
@@ -508,7 +518,9 @@ export async function runDashboard(configPath, port) {
     performance_lights:performanceHistory.snapshot(Date.now(),[...devices.values()].map(d=>({...d.snapshot(),connected:d.connected&&!gatewayError,active:performanceActive(d,gateway?.workers?.find(w=>w.id===d.id))}))),
     fleet_power:powerTools?{enabled:isCapabilityEnabled('fleet_power'),control:true}:null,
     fleet_machines:powerWorkers().map(id=>({id,machine:machineGroup(id),scripts:['status','start','stop']})),
-    devices: [...devices.values()].map(d => ({...d.snapshot(),rolling_rates:fleetSpeed.workerRates(d.id),activity:activity.get(d.id),activity_markers:activity.getMarkers(d.id),hardware:hardware.snapshot(d.id),endpoint_metrics:endpointTelemetry.snapshot(d.id)})), events, attribution:attribution.snapshot(), notes: 'Engine-log rates are measurements from configured log collectors; OpenAI endpoint rates have separately labeled scopes. Cache counts cover observed prompt starts, not lifetime requests. Raw prompts and responses are excluded.' });
+    hardware_clock_ceiling_mhz:(()=>{const ceiling=hardware.config.clock_ceiling_mhz;return Number.isFinite(ceiling)?ceiling:null;})(),
+    hardware_machines:physicalMachines.map(id=>({id,hardware:hardware.snapshot(id)})),
+    devices: [...devices.values()].map(d => ({...d.snapshot(),rolling_rates:fleetSpeed.workerRates(d.id),activity:activity.get(d.id),activity_markers:activity.getMarkers(d.id),hardware:hardware.snapshot(d.id),endpoint_metrics:(()=>{const value=endpointTelemetry.snapshot(d.id);if(!value)return null;const {request_rows,...display}=value;return display;})()})), events, attribution:attribution.snapshot(), notes: 'Engine-log rates are measurements from configured log collectors; OpenAI endpoint rates have separately labeled scopes. Cache counts cover observed prompt starts, not lifetime requests. Raw prompts and responses are excluded.' });
   };
   const isTesting=()=>continuityEnabled(config)&&testingSuspended(testingModeFile(config));
   const isCapabilityEnabled=key=>gateway?.genie_capabilities?.[key]!==false;
@@ -533,7 +545,7 @@ export async function runDashboard(configPath, port) {
     media:async()=>({...await workerControl(config.control_socket,'/media-jobs'),standard_setup:null}),
     nativeMedia,
     mediaFile:(req,res,route)=>proxyMediaFile(config,req,res,route),
-    act:async(action,input)=>{if(action==='power'){if(input?.mode==='check')return powerTools.tool({...input,action:'power'});if(input?.power_action==='status'){void powerTools.tool({action:'power',worker:input.worker,power_action:'status',action_id:input.action_id}).catch(()=>{});return {started:true,worker:input.worker,power_action:'status'};}const check=await powerTools.tool({action:'power',mode:'check',worker:input.worker,power_action:input.power_action,action_id:input.action_id});void powerTools.tool({action:'power',worker:input.worker,power_action:input.power_action,action_id:input.action_id}).catch(()=>{});return {started:true,...check};}if(action==='media-video-submit')return submitVideoFromDashboard(config,input);if(action==='media-inspect')return createMediaResources(config,{isEnabled:()=>true}).inspect(input.worker_id,input.member);if(action==='media-setup')return workerControl(config.control_socket,'/genie-media-setup',input,{channel:'dashboard'});const value=await workerControl(config.control_socket,({'media-eligibility':'/media-host-eligibility','job-priority':'/set-job-priority',concurrency:'/set-worker-concurrency','direct-reserve':'/set-direct-reserve',add:'/add-worker',endpoint:'/edit-endpoint',test:'/check-endpoint',remove:'/remove-worker',drain:'/drain-workers',resume:'/resume-workers',lock:'/maintenance-lock',unlock:'/release-maintenance-lock',fallbacks:'/set-ssh-fallbacks',context:'/set-context-limit','conversation-turns':'/set-conversation-turns','queue-timeout':'/set-queue-timeout',protection:'/set-protection',relocate:'/relocate-queued',recover:'/recover-worker','genie-capability':'/genie-capability','genie-thinking':'/set-genie-thinking','recovery-policy':'/recovery-policy','recovery-handback-policy':'/recovery-handback-policy','recovery-recheck':'/recovery-recheck'})[action],input,{channel:'dashboard'});if(action==='genie-capability'&&gateway)gateway.genie_capabilities=value;return value;},
+    act:async(action,input)=>{if(action==='power'){if(input?.mode==='check')return powerTools.tool({...input,action:'power'});if(input?.power_action==='status'){void powerTools.tool({action:'power',worker:input.worker,power_action:'status',action_id:input.action_id}).catch(()=>{});return {started:true,worker:input.worker,power_action:'status'};}const check=await powerTools.tool({action:'power',mode:'check',worker:input.worker,power_action:input.power_action,action_id:input.action_id});void powerTools.tool({action:'power',worker:input.worker,power_action:input.power_action,action_id:input.action_id}).catch(()=>{});return {started:true,...check};}if(action==='media-video-submit')return submitVideoFromDashboard(config,input);if(action==='media-inspect')return createMediaResources(config,{isEnabled:()=>true}).inspect(input.worker_id,input.member);if(action==='media-setup')return workerControl(config.control_socket,'/genie-media-setup',input,{channel:'dashboard'});const value=await workerControl(config.control_socket,({'media-eligibility':'/media-host-eligibility','job-priority':'/set-job-priority',concurrency:'/set-worker-concurrency','execution-capacity':'/set-execution-capacity','direct-reserve':'/set-direct-reserve',add:'/add-worker',endpoint:'/edit-endpoint',test:'/check-endpoint',remove:'/remove-worker',drain:'/drain-workers',resume:'/resume-workers',lock:'/maintenance-lock',unlock:'/release-maintenance-lock',fallbacks:'/set-ssh-fallbacks',context:'/set-context-limit','conversation-turns':'/set-conversation-turns','queue-timeout':'/set-queue-timeout','routing-margin':'/set-routing-margin',protection:'/set-protection',relocate:'/relocate-queued',recover:'/recover-worker','genie-capability':'/genie-capability','genie-thinking':'/set-genie-thinking','recovery-policy':'/recovery-policy','recovery-handback-policy':'/recovery-handback-policy','recovery-recheck':'/recovery-recheck'})[action],input,{channel:'dashboard'});if(action==='genie-capability'&&gateway)gateway.genie_capabilities=value;return value;},
   } : null, requestHistory:()=>({...requestHistory.snapshot(),fleet_speed:fleetSpeed.snapshot(Date.now(),gateway?.workers?.map(worker=>worker.id)??[])}), currentJobs:config.control_socket?{
     read:()=>workerControl(config.control_socket,'/current-jobs',undefined,{channel:'dashboard'}),
   }:null, testing:continuityEnabled(config)?{

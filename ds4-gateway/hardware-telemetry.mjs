@@ -86,22 +86,36 @@ export function parseNvidiaLinux(line,time=Date.now()){
 }
 
 export function hardwareTelemetryConfig(raw={}){
-  if(raw==null||raw===false)return {enabled:false,interval_ms:10000,workers:new Map()};
+  if(raw==null||raw===false)return {enabled:false,interval_ms:10000,clock_ceiling_mhz:null,workers:new Map()};
   if(typeof raw!=='object'||Array.isArray(raw))throw new Error('hardware_telemetry must be an object or false');
-  if(raw.enabled!==true)return {enabled:false,interval_ms:10000,workers:new Map()};
-  if(Object.keys(raw).some(key=>!['enabled','interval_ms','workers'].includes(key)))throw new Error('Unsupported hardware_telemetry setting');
+  if(raw.enabled!==true)return {enabled:false,interval_ms:10000,clock_ceiling_mhz:null,workers:new Map()};
+  if(Object.keys(raw).some(key=>!['enabled','interval_ms','clock_ceiling_mhz','workers'].includes(key)))throw new Error('Unsupported hardware_telemetry setting');
   const interval=raw.interval_ms??10000;
   if(!Number.isInteger(interval)||interval%1000||interval<10000||interval>60000)throw new Error('hardware_telemetry.interval_ms must be whole seconds from 10000–60000');
+  // An operator-declared reference for the intended SM clock ceiling. It is only
+  // ever compared against a measured clock for display; it never caps or commands
+  // a GPU, and it is absent unless the operator sets it.
+  const ceiling=raw.clock_ceiling_mhz??null;
+  if(ceiling!==null&&(!Number.isInteger(ceiling)||ceiling<100||ceiling>100000))throw new Error('hardware_telemetry.clock_ceiling_mhz must be an integer 100–100000');
   if(!raw.workers||typeof raw.workers!=='object'||Array.isArray(raw.workers))throw new Error('hardware_telemetry.workers must be an object');
   const workers=new Map();
   for(const [id,value] of Object.entries(raw.workers)){
     if(!ID.test(id)||!value||typeof value!=='object'||Array.isArray(value)||!ADAPTERS.has(value.adapter))throw new Error('Invalid hardware telemetry worker');
-    const allowed=value.adapter==='jsonl-file'?['adapter','path']:['adapter'];
+    const allowed=value.adapter==='jsonl-file'?['adapter','path']:['adapter','ssh'];
     if(Object.keys(value).some(key=>!allowed.includes(key)))throw new Error('Unsupported hardware telemetry worker setting');
+    if(value.ssh!==undefined&&(typeof value.ssh!=='string'||!SSH.test(value.ssh)||value.ssh.startsWith('-')))throw new Error('Invalid hardware telemetry SSH alias');
     if(value.adapter==='jsonl-file'&&(typeof value.path!=='string'||!path.isAbsolute(value.path)||value.path.length>4096||value.path.includes('\0')))throw new Error('jsonl-file hardware telemetry requires an absolute local path');
     workers.set(id,Object.freeze({...value}));
   }
-  return {enabled:true,interval_ms:interval,workers};
+  return {enabled:true,interval_ms:interval,clock_ceiling_mhz:ceiling,workers};
+}
+
+// Physical machines are observed as independent read-only sensors. These are the
+// hardware_telemetry entries that carry their own SSH alias, which is what lets a
+// machine that serves no route by itself still report temperature and clock.
+export function physicalMachineIds(raw={}){
+  const config=hardwareTelemetryConfig(raw);
+  return [...config.workers].filter(([,value])=>!!value.ssh).map(([id])=>id);
 }
 
 export class MacSource{
@@ -164,16 +178,21 @@ export class HardwareTelemetry{
     this.save(row);
   }
   sync(definitions=[],workers=[]){if(!this.config.enabled)return;const active=new Set(workers.map(worker=>worker.id)),nodes=new Map(definitions.map(node=>[node.id,node]));
-    for(const [id,config] of this.config.workers){const signature=['nvidia-linux','macos-local'].includes(config.adapter)?`${config.adapter}:${nodes.get(id)?.ssh??''}`:`${config.adapter}:${config.path}`;const existing=this.sources.get(id);
-      if(!active.has(id)){existing?.source.close();existing?.thermal?.close();this.sources.delete(id);this.status(id,'waiting','worker_not_registered');continue;}
+    for(const [id,config] of this.config.workers){const ssh=config.ssh??nodes.get(id)?.ssh;const signature=['nvidia-linux','macos-local'].includes(config.adapter)?`${config.adapter}:${ssh??''}`:`${config.adapter}:${config.path}`;const existing=this.sources.get(id);
+      // A worker registered in the gateway is observed when it exposes an SSH
+      // alias. A machine that is NOT a gateway worker is observed only when its
+      // hardware_telemetry entry carries its own alias, so physical machines that
+      // serve no route directly (idle ring members, the other half of a pair) can
+      // still report temperature and clock read-only.
+      if(!active.has(id)&&!ssh){existing?.source.close();existing?.thermal?.close();this.sources.delete(id);this.status(id,'waiting','worker_not_registered');continue;}
       if(existing?.signature===signature)continue;existing?.source.close();existing?.thermal?.close();this.sources.delete(id);
       if(config.adapter==='nvidia-linux'){
-        const ssh=nodes.get(id)?.ssh;if(!SSH.test(ssh??'')||ssh.startsWith('-')){this.status(id,'disconnected','management_transport_unavailable');continue;}
+        if(!SSH.test(ssh??'')||ssh.startsWith('-')){this.status(id,'disconnected','management_transport_unavailable');continue;}
         const source=new NvidiaSource(ssh,this.config.interval_ms,sample=>this.accept(id,sample),(state,reason)=>this.status(id,state,reason),this.options);
         const thermal=new NvidiaSource(ssh,60000,sample=>this.accept(id,sample),(state,reason)=>{const value=this.states.get(id);if(value){value.temperature_state=state;value.temperature_reason=reason;}},{...this.options,command:nvidiaThermalCommand,parse:parseNvidiaThermal});
         this.sources.set(id,{signature,source,thermal,adapter:config.adapter});source.start();thermal.start();
       }else if(config.adapter==='macos-local'){
-        if(nodes.get(id)?.ssh){this.status(id,'disconnected','local_adapter_remote_worker');continue;}
+        if(ssh){this.status(id,'disconnected','local_adapter_remote_worker');continue;}
         this.sources.set(id,{signature,source:new MacSource(sample=>this.accept(id,sample),(state,reason)=>this.status(id,state,reason)),adapter:config.adapter});
       }
       else this.sources.set(id,{signature,source:new FileSource(config.path,sample=>this.accept(id,sample)),adapter:config.adapter});

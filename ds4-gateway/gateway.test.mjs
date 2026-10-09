@@ -35,8 +35,9 @@ async function backend(id) {
       b.modelHeaders.push(req.headers);
       b.modelUrls.push(req.url);
       if(b.blockHealthWhileActive&&b.active){res.on('close',()=>{});return;}
-      return res.end(JSON.stringify({ data: [{ id: b.health ? 'deepseek-v4-flash' : 'wrong-model', context_length: b.context_length, top_provider:{context_length:b.context_length,max_completion_tokens:b.context_length} }] }));
+      return res.end(JSON.stringify({ data: [{ id: b.health ? b.model??'deepseek-v4-flash' : 'wrong-model', context_length: b.context_length, top_provider:{context_length:b.context_length,max_completion_tokens:b.context_length} }] }));
     }
+    if (['/metrics','/api/status','/admin/api/activity'].includes(req.url)) {res.writeHead(404);return res.end('Not found');}
     const chunks = [];
     req.on('data', c => { chunks.push(c); b.receivedBytes += c.length; });
     req.on('end', () => {
@@ -166,11 +167,11 @@ test('remote workers accept bounded verified SSH alias fallbacks, never options 
 async function rig(t, count = 2, overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds4-gateway-test-'));
   const backends = await Promise.all(Array.from({ length: count }, (_, i) => backend(`spark${i + 1}`)));
-  const {visionTranscode,tunnelFactory,workerConcurrency,...configOverrides}=overrides;
+  const {visionTranscode,tunnelFactory,routingFetcher,workerConcurrency,...configOverrides}=overrides;
   const config = { host: '127.0.0.1', port: 0, api_key: 'none', model: 'deepseek-v4-flash', context_length: 153600,
     conversation_turns:1, state_file: path.join(dir, 'affinity.json'), health_interval_ms: 100000, nodes: backends.map((b,i) => ({ id: b.id, url: b.url, ...(workerConcurrency?{max_concurrent_requests:Array.isArray(workerConcurrency)?workerConcurrency[i]:workerConcurrency}:{}) })), ...configOverrides };
   if (config.control_socket === true) config.control_socket = path.join(dir, 'control.sock');
-  const gatewayOptions={visionTranscode,tunnelFactory};
+  const gatewayOptions={visionTranscode,tunnelFactory,routingFetcher};
   let gatewayInstance=createGateway(config,gatewayOptions);
   const r = { config, backends, gatewayInstance, gateway: gatewayInstance, get nodes(){ return (r.gatewayInstance??gatewayInstance).nodes; } };
   r.address = await r.gateway.start();
@@ -902,7 +903,7 @@ test('Responses output limits are censored, but explicit failed responses count 
   await until(()=>r.gateway.stats().dataset.finished===3);
   assert.equal(r.gateway.stats().dataset.truncated,3);assert.equal(r.gateway.stats().workers[0].quarantine,null);
   const failed='data: {"type":"response.failed","response":{"status":"failed","error":{"message":"generation failed"}}}\n\n';
-  for(let i=0;i<3;i++)await r.request(JSON.stringify({fixture_sse:failed}),'a',{path:'/v1/responses'});
+  for(let i=0;i<20;i++)await r.request(JSON.stringify({fixture_sse:failed}),'a',{path:'/v1/responses'});
   assert.equal(r.gateway.stats().workers[0].quarantine.reason,'repeated_inference_failures');
 });
 
@@ -998,9 +999,51 @@ test('ordinary 4xx does not quarantine; success resets repeated operational fail
   await r.request('{"http_error":true}','a');await r.request('{"http_error":true}','a');
   assert.equal(r.gateway.stats().workers[0].quarantine,null);
   await r.request('{}','a');assert.equal(r.gateway.stats().workers[0].inference_failures,0);
-  for(let i=0;i<3;i++)await r.request('{"http_error":true}','a');
+  for(let i=0;i<20;i++)await r.request('{"http_error":true}','a');
   assert.equal(r.gateway.stats().workers[0].quarantine.reason,'repeated_inference_failures');
   await delay(80);assert.equal(r.gateway.stats().workers[0].is_healthy,false);
+});
+
+test('a severed ssh tunnel is transport evidence, not engine evidence, and never advances the quarantine counter',async t=>{
+  const r=await rig(t,1,{health_interval_ms:100000});
+  const node=r.nodes[0];
+  // Identity the tunnel would have if this worker were reached over ssh.
+  node.managementPath={...node.managementPath,transport:'ssh_tunnel',state:'ssh_process_active',reason:null};
+  await until(()=>r.gateway.stats().workers[0].is_healthy===true);
+  // One outage: the ssh supervisor declares the link dead, then every in-flight
+  // request fails against it within the same moment.
+  node.managementPath={...node.managementPath,transport:'ssh_tunnel',state:'retrying',reason:'adapter_unreachable'};
+  // Deliberately more requests than QUARANTINE_FAILURE_THRESHOLD: under the old
+  // counting rule this single outage would quarantine the worker on its own.
+  for(let i=0;i<25;i++)await r.request(JSON.stringify({disconnect:true}),`outage-${i}`).catch(()=>{});
+  const worker=r.gateway.stats().workers[0];
+  assert.equal(worker.inference_failures,0,'a severed tunnel is not engine evidence');
+  assert.equal(worker.quarantine,null,'one outage must not quarantine a healthy worker');
+  assert.ok(worker.transport_failures>=1,'transport losses stay separately observable');
+  assert.equal(worker.last_failure_class,'transport');
+});
+
+test('a live tunnel still counts engine failures and reaches quarantine at the threshold',async t=>{
+  const r=await rig(t,1,{health_interval_ms:100000});
+  const node=r.nodes[0];
+  node.managementPath={...node.managementPath,transport:'ssh_tunnel',state:'ssh_process_active',reason:null};
+  await until(()=>r.gateway.stats().workers[0].is_healthy===true);
+  for(let i=0;i<20;i++)await r.request('{"http_error":true}','engine');
+  const worker=r.gateway.stats().workers[0];
+  assert.equal(worker.quarantine.reason,'repeated_inference_failures','a healthy tunnel leaves engine failures as engine evidence');
+});
+
+test('a response the engine itself emitted still counts as engine evidence even while the tunnel is down',async t=>{
+  const r=await rig(t,1,{health_interval_ms:100000});
+  const node=r.nodes[0];
+  node.managementPath={...node.managementPath,transport:'ssh_tunnel',state:'ssh_process_active',reason:null};
+  await until(()=>r.gateway.stats().workers[0].is_healthy===true);
+  node.managementPath={...node.managementPath,transport:'ssh_tunnel',state:'retrying',reason:'adapter_unreachable'};
+  // The engine produced this envelope, so a simultaneous bad link must not
+  // launder a genuine engine fault into an excused transport failure.
+  const failed='data: {"type":"response.failed","response":{"status":"failed","error":{"message":"generation failed"}}}\n\n';
+  for(let i=0;i<20;i++)await r.request(JSON.stringify({fixture_sse:failed}),'a',{path:'/v1/responses'});
+  assert.equal(r.gateway.stats().workers[0].quarantine.reason,'repeated_inference_failures');
 });
 
 test('recovery requires real generation; failed verification retains quarantine and healthy recovery clears it durably',async t=>{
@@ -2666,4 +2709,318 @@ test('aliased rewrites reach the backend exactly once (no phantom request)',asyn
   await delay(80);
   assert.equal(upstreamRequests,1);
   assert.equal(r.backends[0].records.at(-1).payload.model,'deepseek-v4-flash');
+});
+
+// Regression: multi-slot admission must not reuse the historical-only ordering
+// that was sufficient when flexible work could select only fully idle workers.
+const fixtureGenieHeaders={
+  native:{'x-stargate-genie-key':'fixture-genie-key'},
+  legacy:{'x-dsg-observer':'gate-genie','x-dsg-review-flexible':'1'},
+};
+function biasFixtureHistory(r,id='spark2'){
+  for(let i=0;i<8;i++)r.gateway.store.set(createHash('sha256').update('placement-history-'+i).digest('hex'),id);
+}
+function releasePlacementFixture(r){
+  r.gateway.drainNodes(r.gateway.nodes.map(n=>n.id),false);
+  for(const b of r.backends){b.releases?.splice(0).forEach(release=>release());b.heldStreams?.splice(0).forEach(release=>release());}
+}
+
+test('flexible Genie compares partial occupancy before historical assignments on both entry paths',async t=>{
+  for(const [entry,headers]of Object.entries(fixtureGenieHeaders))await t.test(entry,async t=>{
+    const r=await rig(t,2,{workerConcurrency:4,genie_priority_key:'fixture-genie-key',model_routes:{one:['spark1']}});
+    biasFixtureHistory(r);const holds=[];
+    try{
+      for(let i=0;i<2;i++)holds.push(r.request(JSON.stringify({wait_for_release:true,label:'held-'+i}),null,{headers:{'x-dsg-model':'one'}}));
+      await until(()=>r.backends[0].active===2);
+      const before=structuredClone(r.gateway.store.data);
+      const body=JSON.stringify({model:'deepseek-v4-flash',messages:[{role:'user',content:'unchanged prompt'}],reasoning_effort:'max',max_tokens:153600});
+      for(let i=0;i<3;i++){
+        const reply=await r.request(body,null,{headers});
+        assert.equal(reply.status,200);assert.equal(reply.headers['x-ds4-node'],'spark2');
+        assert.equal(r.backends[1].records.at(-1).body.toString(),body);
+      }
+      assert.deepEqual(r.gateway.store.data,before,'keyless placement must not manufacture affinity or mutate capacities');
+      assert.equal(r.backends[0].active,2);assert.equal(r.backends[0].aborts,0);
+      assert.equal(r.gateway.stats().placement_policy,'live_load_v1');
+      assert.equal(r.gateway.stats().capacity_basis,'configured_gateway_admissions');
+    }finally{releasePlacementFixture(r);await Promise.all(holds);}
+  });
+});
+
+test('flexible Genie normalizes live work by unequal registered capacities',async t=>{
+  const r=await rig(t,2,{workerConcurrency:[2,4],genie_priority_key:'fixture-genie-key',model_routes:{one:['spark1'],two:['spark2']}});
+  biasFixtureHistory(r);const holds=[];
+  try{
+    for(const route of ['one','two'])holds.push(r.request('{"wait_for_release":true}',null,{headers:{'x-dsg-model':route}}));
+    await until(()=>r.backends.every(b=>b.active===1));
+    const reply=await r.request('{}',null,{headers:fixtureGenieHeaders.native});
+    assert.equal(reply.headers['x-ds4-node'],'spark2','1/4 takes precedence over 1/2 despite more historical assignments');
+    assert.deepEqual(r.gateway.stats().workers.map(w=>w.max_concurrent_requests),[2,4]);
+  }finally{releasePlacementFixture(r);await Promise.all(holds);}
+});
+
+test('waiting flexible Genie reevaluates live load after workers resume together',async t=>{
+  const r=await rig(t,2,{workerConcurrency:4,genie_priority_key:'fixture-genie-key',model_routes:{one:['spark1'],two:['spark2']}});
+  biasFixtureHistory(r);const holds=[],pending=[];
+  try{
+    for(const route of ['one','two'])for(let i=0;i<4;i++)holds.push(r.request('{"wait_for_release":true}',null,{headers:{'x-dsg-model':route}}));
+    await until(()=>r.backends.every(b=>b.active===4));
+    r.gateway.drainNodes(['spark1','spark2'],true);
+    for(const [entry,headers]of Object.entries(fixtureGenieHeaders))pending.push(r.request(JSON.stringify({label:entry}),null,{headers}));
+    await until(()=>r.gateway.stats().continuity.waiting===2);
+    r.backends[0].releases.splice(0,2).forEach(release=>release());r.backends[1].releases.splice(0).forEach(release=>release());
+    await until(()=>r.backends[0].active===2&&r.backends[1].active===0);
+    r.gateway.drainNodes(['spark1','spark2'],false);
+    const replies=await Promise.all(pending);assert.ok(replies.every(reply=>reply.status===200&&reply.headers['x-ds4-node']==='spark2'));
+    assert.equal(r.backends[0].records.length,4);assert.equal(r.backends[0].aborts,0);assert.equal(r.gateway.stats().queued,0);
+  }finally{releasePlacementFixture(r);await Promise.all([...holds,...pending]);}
+});
+
+test('simultaneous flexible arrivals reserve distinct slots and never exceed approved capacity',async t=>{
+  const r=await rig(t,2,{workerConcurrency:[2,4],genie_priority_key:'fixture-genie-key'});
+  biasFixtureHistory(r);const holds=[];
+  try{
+    for(let i=0;i<6;i++)holds.push(r.request(JSON.stringify({wait_for_release:true,label:i}),null,{headers:fixtureGenieHeaders.native}));
+    await until(()=>r.gateway.stats().active===6);
+    assert.deepEqual(r.backends.map(b=>b.active),[2,4]);assert.deepEqual(r.backends.map(b=>b.peak),[2,4]);
+    assert.equal(new Set(r.backends.flatMap(b=>b.records.map(row=>row.payload.label))).size,6);
+    assert.deepEqual(r.gateway.store.data.sessions,Object.fromEntries(Object.entries(r.gateway.store.data.sessions).filter(([,v])=>v.node==='spark2')));
+  }finally{releasePlacementFixture(r);assert.ok((await Promise.all(holds)).every(reply=>reply.status===200));}
+  assert.ok(r.backends.every(b=>b.aborts===0));
+});
+
+test('flexible Genie honors direct-use preference with reserved fallback and expiry',async t=>{
+  const r=await rig(t,2,{workerConcurrency:4,genie_priority_key:'fixture-genie-key'});biasFixtureHistory(r);
+  r.gateway.store.save({...r.gateway.store.data,direct_reserve_enabled:true});
+  const [one,two]=r.gateway.nodes;one.directReservedUntil=Date.now()+60000;
+  for(const headers of Object.values(fixtureGenieHeaders))assert.equal((await r.request('{}',null,{headers})).headers['x-ds4-node'],'spark2');
+  two.directReservedUntil=Date.now()+60000;
+  assert.equal((await r.request('{}',null,{headers:fixtureGenieHeaders.native})).headers['x-ds4-node'],'spark1','all-reserved fallback remains available');
+  one.directReservedUntil=Date.now()-1;
+  assert.equal((await r.request('{}',null,{headers:fixtureGenieHeaders.native})).headers['x-ds4-node'],'spark1','an expired reservation is not sticky');
+});
+
+test('flexible placement preserves explicit routes even while a different worker is idle',async t=>{
+  const r=await rig(t,2,{workerConcurrency:2,genie_priority_key:'fixture-genie-key',model_routes:{only:['spark1']}});
+  const holds=[],pending=[];
+  try{
+    for(let i=0;i<2;i++)holds.push(r.request('{"wait_for_release":true}',null,{headers:{'x-dsg-model':'only'}}));
+    await until(()=>r.backends[0].active===2);
+    pending.push(r.request('{"label":"restricted"}',null,{headers:{...fixtureGenieHeaders.native,'x-dsg-model':'only'}}));
+    await until(()=>r.gateway.stats().continuity.waiting===1);
+    assert.equal(r.backends[1].records.length,0);r.backends[0].releases.shift()();
+    assert.equal((await pending[0]).headers['x-ds4-node'],'spark1');
+  }finally{releasePlacementFixture(r);await Promise.all([...holds,...pending]);}
+});
+
+test('legacy flexible ranking does not steal an equal-priority conversation turn reservation',async t=>{
+  const r=await rig(t,2,{genie_priority_key:'fixture-genie-key',conversation_turns:3,conversation_turn_idle_ms:2000});biasFixtureHistory(r);
+  const first=await r.request('{}','retained-conversation');assert.equal(first.headers['x-ds4-node'],'spark1');
+  const allocation=r.gateway.nodes[0].slots[0].turnAllocation;assert.ok(allocation?.until>performance.now());
+  const flexible=await r.request('{}',null,{headers:fixtureGenieHeaders.legacy});
+  assert.equal(flexible.headers['x-ds4-node'],'spark2');assert.equal(r.gateway.nodes[0].slots[0].turnAllocation,allocation);
+  assert.equal((await r.request('{}','retained-conversation')).headers['x-ds4-node'],'spark1');
+});
+
+test('placement survives a discovered model replacement and gateway restart without changing capacity or keyed homes',async t=>{
+  const r=await rig(t,2,{model:'PoolModel',model_agnostic:true,workerConcurrency:[2,4],genie_priority_key:'fixture-genie-key'});
+  const before=await r.request('{"model":"PoolModel"}','retained-home');assert.equal(before.status,200);
+  const homes=structuredClone(r.gateway.store.data.sessions);
+  for(const b of r.backends)b.model='future-model-v2';
+  await r.restart();
+  assert.deepEqual(r.gateway.store.data.sessions,homes);assert.deepEqual(r.gateway.stats().workers.map(w=>w.max_concurrent_requests),[2,4]);
+  assert.ok(r.gateway.stats().workers.every(w=>w.served_model==='future-model-v2'));
+  const reply=await r.request('{"model":"PoolModel","reasoning_effort":"max","max_tokens":153600}',null,{headers:fixtureGenieHeaders.native});
+  assert.equal(reply.status,200);const record=r.backends.flatMap(b=>b.records).findLast(row=>row.payload.model==='future-model-v2');
+  assert.equal(record.payload.reasoning_effort,'max');assert.equal(record.payload.max_tokens,153600);
+  assert.equal((await r.request('{"model":"PoolModel"}','retained-home')).headers['x-ds4-node'],before.headers['x-ds4-node']);
+});
+
+test('routing observer is opt-in and leaves exact request forwarding unchanged',async t=>{
+ const disabled=await rig(t,1);
+ const status=JSON.parse((await disabled.request('',null,{method:'GET',path:'/gateway/status'})).body);
+ assert.equal(status.routing_time.mode,'off');
+ assert.equal(fs.existsSync(path.join(path.dirname(disabled.config.state_file),'routing-estimates.json')),false);
+ const r=await rig(t,1,{routing_time_observe:true});
+ const response={choices:[{index:0,finish_reason:'stop',message:{content:'OK'}}],usage:{prompt_tokens:100,completion_tokens:20}};
+ const body=JSON.stringify({messages:[{role:'user',content:'PRIVATE observer input'}],fixture_json:JSON.stringify(response)});
+ for(let i=0;i<5;i++)assert.equal((await r.request(body,`observe-${i}`)).status,200);
+ assert.equal(r.backends[0].records.at(-1).body.toString(),body);
+ const observed=JSON.parse((await r.request('',null,{method:'GET',path:'/gateway/status'})).body);
+ assert.equal(observed.routing_time.mode,'observation_only');assert.equal(observed.routing_time.fit.sampleCount,5);assert.equal(observed.routing_time.errors,0);
+ await r.restart();
+ const restarted=JSON.parse((await r.request('',null,{method:'GET',path:'/gateway/status'})).body);
+ assert.equal(restarted.routing_time.fit.sampleCount,5);
+ assert.doesNotMatch(fs.readFileSync(path.join(path.dirname(r.config.state_file),'routing-estimates.json'),'utf8'),/PRIVATE|fixture_json|messages/);
+});
+
+test('switching margin persists with stale-edit protection and backup, without activating time routing',async t=>{
+ const r=await rig(t,1,{control_socket:true});
+ await r.request('{}','establish-state');
+ const before=fs.readFileSync(r.config.state_file,'utf8');
+ const original=await workerControl(r.config.control_socket,'/workers');assert.equal(original.routing_switching_margin_seconds,30);
+ const updated=await workerControl(r.config.control_socket,'/set-routing-margin',{margin_seconds:45,expected_margin_seconds:30});
+ assert.equal(updated.routing_switching_margin_seconds,45);assert.equal(updated.routing_time_mode,'off');
+ for(const input of [{margin_seconds:50,expected_margin_seconds:30},{margin_seconds:-1,expected_margin_seconds:45},{margin_seconds:'60',expected_margin_seconds:45}]){
+  await assert.rejects(workerControl(r.config.control_socket,'/set-routing-margin',input));
+ }
+ const filename=fs.readdirSync(path.dirname(r.config.state_file)).find(file=>file.includes('.routing-margin-'));
+ assert.equal(fs.readFileSync(path.join(path.dirname(r.config.state_file),filename),'utf8'),before);
+ const after=JSON.parse(fs.readFileSync(r.config.state_file,'utf8'));delete after.routing_switching_margin_seconds;
+ assert.deepEqual(after,JSON.parse(before));
+ await r.restart();assert.equal((await workerControl(r.config.control_socket,'/workers')).routing_switching_margin_seconds,45);
+});
+
+test('enabled observer preserves queued bytes beyond its inspection budget and releases cancellation once',async t=>{
+ const r=await rig(t,1,{routing_time_observe:true,control_socket:true});
+ const active=r.request(JSON.stringify({wait_for_release:true}),'first');await until(()=>r.backends[0].releases?.length===1);
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(THINKING_CAPTURE_BYTES+100)}]});
+ const queued=r.request(body,'second');await until(()=>r.nodes[0].queue.length===1);
+ assert.equal(r.backends[0].records.length,1);r.backends[0].releases[0]();await active;
+ assert.equal((await queued).status,200);assert.equal(r.backends[0].records.at(-1).body.toString(),body);
+ const holding=r.request(JSON.stringify({wait_for_release:true}),'third');await until(()=>r.backends[0].releases.length===2);
+ const req=http.request({host:'127.0.0.1',port:r.address.port,path:'/v1/chat/completions',method:'POST',headers:{authorization:'Bearer none','content-type':'application/json','x-session-affinity':'cancel-me'}});
+ req.on('error',()=>{});req.end(JSON.stringify({messages:[{role:'user',content:'cancel'}]}));await until(()=>r.nodes[0].queue.length===1);
+ req.destroy();await until(()=>r.nodes[0].queue.length===0);r.backends[0].releases[1]();await holding;
+ await until(()=>!r.nodes[0].active);assert.equal(r.backends[0].records.length,3);
+ const state=await workerControl(r.config.control_socket,'/workers');assert.equal(state.workers[0].load,0);assert.equal(state.workers[0].queued,0);
+});
+
+test('native capacity observation reports a mismatch without lowering gateway admissions',async t=>{
+ let calls=0;
+ const r=await rig(t,1,{routing_time_observe:true,control_socket:true,workerConcurrency:4,routingFetcher:async()=>{
+  calls++;return new Response('tensorfold:requests_running 1\ntensorfold:requests_waiting 2\ntensorfold:generation_tokens_total 100\ntensorfold_health:completion_tokens_total 100\ntensorfold_health:streams{state="max"} 1\n');
+ }});
+ r.nodes[0].backend='openai';
+ await until(()=>calls>0,4000);
+ let state=await workerControl(r.config.control_socket,'/workers');
+ for(let i=0;i<20&&state.workers[0].execution_capacity.engine_execution===null;i++){await delay(10);state=await workerControl(r.config.control_socket,'/workers');}
+ assert.equal(state.workers[0].max_concurrent_requests,4);
+ const capacity=state.workers[0].execution_capacity;
+ for(const [key,value]of Object.entries({gateway_admissions:4,engine_execution:1,source:'tensorfold_streams_max',running:1,waiting:2,mismatch:true,effective_dispatch:4}))assert.equal(capacity[key],value);
+ assert.equal(typeof capacity.manual_identity,'string');
+});
+
+test('observer learns Genie usage without exposing its captured request as a jobs preview',async t=>{
+ const r=await rig(t,1,{routing_time_observe:true,control_socket:true,genie_priority_key:'fixture-genie-key'});
+ const active=r.request(JSON.stringify({wait_for_release:true}),'active');await until(()=>r.backends[0].releases?.length===1);
+ const body=JSON.stringify({messages:[{role:'user',content:'PRIVATE GENIE REQUEST'}],fixture_json:JSON.stringify({choices:[{index:0,finish_reason:'tool_calls',message:{tool_calls:[{id:'call',type:'function',function:{name:'status',arguments:'{}'}}]}}],usage:{prompt_tokens:20,completion_tokens:10}})});
+ const pending=r.request(body,undefined,{headers:{'x-stargate-genie-key':'fixture-genie-key'}});
+ await until(()=>r.gateway.currentJobsStatus().jobs.some(j=>j.priority_policy==='genie'));
+ await delay(30);
+ const jobs=await workerControl(r.config.control_socket,'/current-jobs');
+ assert.doesNotMatch(JSON.stringify(jobs),/PRIVATE GENIE REQUEST/);assert.ok(jobs.jobs.some(j=>j.priority_policy==='genie'));
+ r.backends[0].releases[0]();await active;assert.equal((await pending).status,200);
+ assert.equal(r.backends[0].records.at(-1).body.toString(),body);
+ await r.restart();
+ const saved=JSON.parse(fs.readFileSync(path.join(path.dirname(r.config.state_file),'routing-estimates.json'),'utf8'));
+ assert.ok(saved.outputs.some(row=>row.outputTokens===10&&row.finishReason==='tool_calls'));
+});
+
+import {routingIdentity} from './routing-observations.mjs';
+function seedRouting(r,rates=[{prefill:1,decode:10},{prefill:1000,decode:100}]){
+ const monitor=r.gateway.routingObservations;monitor.outputs=Array.from({length:5},()=>({outputTokens:100,outcome:'complete',finishReason:'stop'}));
+ monitor.samples=r.nodes.flatMap((node,index)=>['prefill','decode'].map(phase=>({workerId:node.id,model:r.config.model,
+  identity:routingIdentity(node,r.config.model),requestId:'known-measurement',phase,tokens:rates[index][phase],seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true})));
+}
+
+test('active time routing chooses the faster worker before forwarding a complete small upload',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true});seedRouting(r);
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}]});
+ const result=await r.request(body,'new-session');assert.equal(result.status,200);assert.equal(result.headers['x-ds4-node'],'spark2');
+ assert.equal(r.backends[0].records.length,0);assert.equal(r.backends[1].records[0].body.toString(),body);
+ assert.equal(r.gateway.stats().placement_policy,'completion_time_v1');
+ assert.equal(r.gateway.store.get(createHash('sha256').update('new-session').digest('hex')).node,'spark2');
+});
+
+test('active time routing honors the switching margin and keeps same-session work together',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true});
+ const key=createHash('sha256').update('established').digest('hex');r.gateway.store.set(key,'spark1');
+ seedRouting(r,[{prefill:1000,decode:10},{prefill:1000,decode:100}]);
+ const result=await r.request(JSON.stringify({messages:[{role:'user',content:'small'}]}),'established');
+ assert.equal(result.headers['x-ds4-node'],'spark1','nine-second improvement is below the margin');
+ const active=r.request(JSON.stringify({wait_for_release:true}),'established');await until(()=>r.backends[0].releases?.length===1);
+ seedRouting(r);
+ const next=r.request(JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}]}),'established');await until(()=>r.nodes[0].queue.length===1);
+ await delay(50);assert.equal(r.backends[1].records.length,0);
+ r.backends[0].releases[0]();await active;await next;
+ assert.equal(r.backends[0].aborts,0);assert.equal(r.gateway.currentJobsStatus().jobs.length,0);
+});
+
+test('active time routing cannot be bypassed by the old automatic wait threshold or Genie offers',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,automatic_affinity_rebalance_min_wait_ms:0});
+ const active=r.request(JSON.stringify({wait_for_release:true}),'old-home');await until(()=>r.backends[0].releases?.length===1);
+ const next=r.request('{}','old-home');await until(()=>r.nodes[0].queue.length===1);
+ await delay(1100);assert.equal(r.backends[1].records.length,0);assert.deepEqual(r.gateway.registry().queued_relocation.offers,[]);
+ r.backends[0].releases[0]();await Promise.all([active,next]);assert.equal(r.backends[0].aborts,0);
+});
+
+test('failed durable time-based handover keeps the original queue and forwards once',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true});seedRouting(r);
+ const key=createHash('sha256').update('durable').digest('hex');r.gateway.store.set(key,'spark1');
+ const save=r.gateway.store.set.bind(r.gateway.store);r.gateway.store.set=(k,node)=>{if(node==='spark2')throw Error('simulated fsync failure');return save(k,node);};
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}]});
+ const result=await r.request(body,'durable');assert.equal(result.status,200);assert.equal(result.headers['x-ds4-node'],'spark1');
+ assert.equal(r.gateway.store.get(key).node,'spark1');assert.equal(r.backends[0].records.length,1);assert.equal(r.backends[1].records.length,0);
+ assert.equal(r.gateway.currentJobsStatus().jobs.length,0);
+});
+
+test('active time routing books four close arrivals once across partially occupied workers',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,workerConcurrency:2});
+ seedRouting(r,[{prefill:1000,decode:100},{prefill:1000,decode:100}]);
+ const calls=[1,2,3,4].map(i=>r.request(JSON.stringify({messages:[{role:'user',content:'x'.repeat(1000)}],label:i,wait_for_release:true}),`burst-${i}`));
+ await until(()=>r.backends.reduce((sum,b)=>sum+(b.releases?.length??0),0)===4);
+ assert.deepEqual(r.backends.map(b=>b.active),[2,2]);assert.ok(r.backends.every(b=>b.peak<=2));
+ assert.equal(new Set(r.backends.flatMap(b=>b.records.map(row=>row.payload.label))).size,4);
+ for(const b of r.backends)for(const release of b.releases)release();await Promise.all(calls);
+ assert.equal(r.gateway.currentJobsStatus().jobs.length,0);assert.equal(r.nodes.reduce((sum,n)=>sum+n.queue.length,0),0);
+});
+
+test('active time routing moves an unrelated queued request into partial capacity without replaying active streams',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,workerConcurrency:[1,2],automatic_affinity_rebalance_min_wait_ms:false});
+ const key=name=>createHash('sha256').update(name).digest('hex');
+ for(const [name,worker]of [['on-a','spark1'],['on-b','spark2'],['move-me','spark1']])r.gateway.store.set(key(name),worker);
+ seedRouting(r,[{prefill:1000,decode:100},{prefill:1000,decode:100}]);
+ const payload=JSON.stringify({messages:[{role:'user',content:'held'}],wait_for_release:true});
+ const a=r.request(payload,'on-a'),b=r.request(payload,'on-b');await until(()=>r.backends.every(b=>b.releases?.length===1));
+ seedRouting(r);
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}],stream:true,fixture_hold_stream:true});
+ const moving=r.request(body,'move-me');await until(()=>r.backends[1].heldStreams?.length===1);
+ assert.equal(r.backends[0].records.length,1);assert.equal(r.backends[0].active,1);assert.equal(r.backends[1].active,2);
+ assert.equal(r.backends[1].records.at(-1).body.toString(),body);assert.equal(r.gateway.store.get(key('move-me')).node,'spark2');
+ const current=r.gateway.currentJobsStatus().jobs.find(j=>j.chat===key('move-me'));
+ assert.equal(current.routing_decision.action,'move');assert.ok(current.routing_decision.savingSeconds>30);
+ r.backends[1].heldStreams[0]();for(const server of r.backends)server.releases[0]();await Promise.all([a,b,moving]);
+ assert.ok(r.backends.every(b=>b.aborts===0));assert.equal(r.gateway.currentJobsStatus().jobs.length,0);
+});
+
+test('manual execution capacity survives restart and limits future dispatch without interrupting four active requests',async t=>{
+ const r=await rig(t,1,{routing_time_enabled:true,control_socket:true,workerConcurrency:4});
+ const calls=[1,2,3,4].map(i=>r.request(JSON.stringify({wait_for_release:true}),`manual-${i}`));
+ await until(()=>r.backends[0].releases?.length===4);
+ const current=(await workerControl(r.config.control_socket,'/workers')).workers[0].execution_capacity;
+ await workerControl(r.config.control_socket,'/set-execution-capacity',{id:'spark1',capacity:1,expected_capacity:null,expected_identity:current.manual_identity});
+ const state=r.gateway.registry().workers[0];assert.equal(state.max_concurrent_requests,4);assert.equal(state.execution_capacity.effective_dispatch,1);assert.equal(state.load,4);
+ const queued=r.request('{}','fifth');await until(()=>r.nodes[0].queue.length===1);await delay(30);assert.equal(r.backends[0].records.length,4);
+ for(const release of r.backends[0].releases.slice(0,3))release();await until(()=>r.backends[0].active===1);await delay(30);assert.equal(r.backends[0].records.length,4);
+ r.backends[0].releases[3]();await Promise.all([...calls,queued]);assert.equal(r.backends[0].aborts,0);assert.equal(r.backends[0].records.length,5);
+ await assert.rejects(workerControl(r.config.control_socket,'/set-execution-capacity',{id:'spark1',capacity:2,expected_capacity:null,expected_identity:current.manual_identity}),/changed/);
+ await r.restart();assert.equal(r.gateway.registry().workers[0].execution_capacity.manual_execution,1);assert.equal(r.gateway.registry().workers[0].execution_capacity.effective_dispatch,1);
+ assert.ok(fs.readdirSync(path.dirname(r.config.state_file)).some(name=>name.includes('.execution-capacity-')));
+});
+
+test('unavailable prompt estimates still forward oversized active-routing uploads unchanged',async t=>{
+ const r=await rig(t,1,{routing_time_enabled:true});
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(THINKING_CAPTURE_BYTES+1000)}]});
+ const result=await r.request(body,'large');assert.equal(result.status,200);assert.equal(r.backends[0].records[0].body.toString(),body);
+ assert.equal(r.gateway.stats().routing_time.errors,0);
+});
+
+test('a handover write error after rename restores durable ownership before forwarding on the original worker',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true});seedRouting(r);
+ const key=createHash('sha256').update('post-rename').digest('hex');r.gateway.store.set(key,'spark1');
+ const save=r.gateway.store.set.bind(r.gateway.store);r.gateway.store.set=(k,node)=>{save(k,node);if(node==='spark2')throw Error('simulated directory fsync failure after rename');};
+ const response=await r.request(JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}]}),'post-rename');
+ assert.equal(response.headers['x-ds4-node'],'spark1');assert.equal(r.backends[1].records.length,0);
+ assert.equal(JSON.parse(fs.readFileSync(r.config.state_file,'utf8')).sessions[key].node,'spark1');assert.equal(r.gateway.store.get(key).node,'spark1');
 });
