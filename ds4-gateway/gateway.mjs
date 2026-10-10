@@ -4,6 +4,7 @@ import {createPairEnrollment,restorePairEnrollments} from './recovery-pair-enrol
 import {requestAuthorized} from './request-auth.mjs';
 import {createMediaHosts} from './media-hosts.mjs';
 import {createMediaSetup} from './media-setup.mjs';
+import { ReasoningLoopObserver } from './reasoning-loop.mjs';
 import {genieCapabilityKeys,validateGenieCapabilities,genieCapabilities} from './fleet-feature-config.mjs';
 import {createMediaExecution} from './media-execution.mjs';
 import {sparkServiceBinding,validateServiceAddition,applyServiceAddition,restoreSparkServices} from './spark-services.mjs';
@@ -188,7 +189,7 @@ export class UsageObserver {
   skipping = false; limited = false; failed = false; decoder = new StringDecoder('utf8');
   eventBoundary = true; closed = false; afterCR = false;
   singleChoiceFinish=false; reasonEofAmbiguous=false; reasonEventDataLines=0;
-  constructor(route='/v1/chat/completions'){this.route=route;}
+  constructor(route='/v1/chat/completions',{loopObserver=null}={}){this.route=route;this.loopObserver=loopObserver;}
   accept(chunk) {
     if(this.closed)return;
     // Bound transient decoding even if accept receives one enormous chunk.
@@ -243,6 +244,9 @@ export class UsageObserver {
       const delta=parsed.choices?.[0]?.delta;
       const progress=(text,phase)=>{if(typeof text==='string'&&text.length){this.semanticCharacters+=text.length;this.lastSemanticAt=performance.now();this.firstSemanticAt??=this.lastSemanticAt;this.phase=phase;if(phase==='thinking')this.thinkingCharacters+=text.length;else if(phase==='answering')this.answerCharacters+=text.length;else if(phase==='tool_output')this.toolCharacters+=text.length;}};
       if(delta) {
+        // Loop detection reads reasoning text in flight and retains only line
+        // hashes; the text itself is never stored or reported.
+        if(this.loopObserver)this.observeReasoning(delta.reasoning_content??delta.reasoning??delta.reasoning_text);
         const shape=outputShape(delta);
         this.outputPresent ||= shape.output_present;
         this.shapeComplete &&= shape.observation_complete;
@@ -285,8 +289,22 @@ export class UsageObserver {
       if(u)this.usage={prompt_tokens:count(u.prompt_tokens),completion_tokens:count(u.completion_tokens),cached_tokens:count(u.prompt_tokens_details?.cached_tokens)};
     } catch { this.reasonEofAmbiguous=true; /* A telemetry failure must not affect inference. */ }
   }
-  finishState({cleanEOF=true}={}) {
-    if(!this.closed){
+  // Reasoning text arrives as partial deltas; a line is only complete when a
+  // newline appears. Buffer the partial tail (bounded) and feed whole lines.
+  observeReasoning(text) {
+    if (typeof text !== 'string' || !text.length) return;
+    if (this.loopTail === undefined) this.loopTail = '';
+    this.loopTail += text;
+    if (this.loopTail.length > 65536) this.loopTail = this.loopTail.slice(-8192);
+    let index;
+    while ((index = this.loopTail.indexOf('\n')) !== -1) {
+      const line = this.loopTail.slice(0, index);
+      this.loopTail = this.loopTail.slice(index + 1);
+      this.loopObserver.acceptLine(line);
+      if (this.loopObserver.detected) return;
+    }
+  }
+  finishState({cleanEOF=true}={}) {    if(!this.closed){
       const tail=this.decoder.end();this.closed=true;
       if(tail&&!this.skipping){
         if(this.pending.length+tail.length>1048576){this.pending='';this.skipping=true;this.limited=true;}
@@ -1002,7 +1020,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     headers.host = target.host;
     headers['x-request-id'] = job.id;
     delete headers.expect;
-    const observer = new UsageObserver(req.url);
+    const loopObserver = new ReasoningLoopObserver(config.reasoning_loop);
+    const observer = new UsageObserver(req.url,{loopObserver});
     job.thinking = new RequestedThinkingObserver(req.headers['content-encoding'],(body,thinking)=>{
       job.requestStream=typeof body?.stream==='boolean'?body.stream:null;
       job.requestedUsage=typeof body?.stream_options?.include_usage==='boolean'?body.stream_options.include_usage:null;
@@ -1082,6 +1101,28 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       schedule(node);
       if(shadow.enabled||routingObservations.enabled)setImmediate(evaluateWaiting);
     };
+    // A caught reasoning loop ends the turn. The engine is still emitting, so
+    // the gateway stops reading it and closes the client stream with a
+    // well-formed terminal sequence: an SSE comment naming the reason (ignored
+    // by every compliant client, visible in raw logs) followed by a normal
+    // finish chunk and [DONE]. The client sees a clean stop, not a torn stream,
+    // and the reason is recorded on the turn for the Fleet and Evidence views.
+    const stopReasoningLoop=loop=>{
+      if(settled||res.destroyed||res.headersSent===false)return;
+      const reason=`reasoning_loop_${loop.kind}`;
+      const upstreamResponse=job.upstreamResponse,upstreamRequest=job.upstream;
+      try{
+        res.write(`: dsg-stop ${reason} repeats=${loop.repeats} period=${loop.period} lines=${loop.lines}\n\n`);
+        res.write(`data: ${JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }catch{}
+      // Settle first: destroying the upstream emits `aborted`, which would
+      // otherwise claim this turn as an upstream failure and lose the reason.
+      log('reasoning_loop_stopped',{request_id:job.id,node:node.id,kind:loop.kind,repeats:loop.repeats,period:loop.period,lines:loop.lines});
+      finish('reasoning_loop',reason,'terminal');
+      upstreamResponse?.destroy();upstreamRequest?.destroy();
+    };
     const responseHeaders=up=>{
       const outHeaders = forwardHeaders(up.headers);
       outHeaders['x-ds4-node'] = node.id;
@@ -1112,6 +1153,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(jsonUsage)jsonUsage.accept(chunk);
       if(isSSE||up.statusCode>=400)faults?.accept(chunk);
       if(isSSE&&!responseEncoded)observer.accept(chunk);
+      // Never cut a turn the engine already finished: a loop seen after a
+      // terminal reason is history, not an in-flight loop.
+      if(isSSE&&!responseEncoded&&loopObserver.detected&&!settled&&!observer.done&&!observer.finish_reason)stopReasoningLoop(loopObserver.detected);
     };
     const sendBuffered=(up,body)=>{
       // A settle path (upstream error, deadline, client abort) may already have

@@ -398,6 +398,99 @@ test('archive state survives a gateway restart and keeps sessions',async t=>{
   assert.equal(s.workers.find(w=>w.id==='spark1').drained,true,'drain is preserved through archival');
 });
 
+test('a reasoning loop stops the turn with a visible, well-formed terminal stream',async t=>{
+  const r=await rig(t,1,{dataset_enabled:true});
+  const b=r.backends[0];
+  // The backend loops "OK." in reasoning forever; the gateway must stop reading it.
+  const line=(text)=>`data: ${JSON.stringify({choices:[{index:0,delta:{reasoning_content:text}}]})}\n\n`;
+  b.looping=true;
+  const original=b.server.listeners('request')[0];
+  b.server.removeAllListeners('request');
+  b.server.on('request',(req,res)=>{
+    let body='';req.on('data',c=>body+=c);req.on('end',()=>{
+      b.records.push({url:req.url,body:Buffer.from(body)});
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      let sent=0;
+      const pump=()=>{
+        while(sent<400){
+          sent++;
+          if(!res.write(line('OK.\n'))){res.once('drain',pump);return;}
+        }
+      };
+      res.on('close',()=>{b.closedByGateway=true;});
+      pump();
+    });
+  });
+  const response=await r.request(JSON.stringify({messages:[{role:'user',content:'loop please'}],stream:true}),'loop-session',{path:'/v1/chat/completions'});
+  assert.equal(response.status,200);
+  // The client sees a clean stop, not a torn stream: a named reason, a finish
+  // chunk and [DONE], in that order.
+  assert.match(response.body,/^: dsg-stop reasoning_loop_repeat repeats=20 period=1/m);
+  assert.match(response.body,/"finish_reason":"stop"/);
+  assert.match(response.body,/data: \[DONE\]/);
+  await until(()=>b.closedByGateway===true);
+  assert.ok(b.closedByGateway,'the gateway stopped reading the looping upstream');
+  await until(()=>r.gateway.stats().dataset.finished===1);
+  const dir=path.join(path.dirname(r.config.state_file),'requests');
+  const rows=fs.readdirSync(dir).flatMap(f=>fs.readFileSync(path.join(dir,f),'utf8').trim().split('\n').map(JSON.parse));
+  const finished=rows.find(row=>row.kind==='finish'&&row.request_id===response.headers['x-request-id']);
+  assert.equal(finished?.outcome,'reasoning_loop');
+  // A caught loop is a gateway decision, never engine evidence: it must not
+  // count toward quarantine or mark the worker unhealthy.
+  const worker=r.gateway.stats().workers.find(w=>w.id==='spark1');
+  assert.equal(worker.inference_failures,0,'a loop cut is not an inference failure');
+  assert.equal(worker.quarantine,null,'a loop cut must not quarantine the engine');
+});
+
+test('a healthy stream is never cut, even when reasoning is long',async t=>{
+  const r=await rig(t,1,{dataset_enabled:true});
+  const b=r.backends[0];
+  const line=(text)=>`data: ${JSON.stringify({choices:[{index:0,delta:{reasoning_content:text}}]})}\n\n`;
+  const original=b.server.listeners('request')[0];
+  b.server.removeAllListeners('request');
+  b.server.on('request',(req,res)=>{
+    let body='';req.on('data',c=>body+=c);req.on('end',()=>{
+      b.records.push({url:req.url,body:Buffer.from(body)});
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      // Sixty varied reasoning lines: long, never a loop.
+      for(let i=0;i<60;i++)res.write(line(`Step ${i}: inspecting the ${i}-th part of the configuration and its dependencies.\n`));
+      res.end('data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    });
+  });
+  const response=await r.request(JSON.stringify({messages:[{role:'user',content:'think hard'}],stream:true}),'healthy-session',{path:'/v1/chat/completions'});
+  assert.equal(response.status,200);
+  assert.doesNotMatch(response.body,/: dsg-stop/,'a varied stream is never cut');
+  assert.equal(b.closedByGateway,undefined);
+  await until(()=>r.gateway.stats().dataset.finished===1);
+  const dir=path.join(path.dirname(r.config.state_file),'requests');
+  const rows=fs.readdirSync(dir).flatMap(f=>fs.readFileSync(path.join(dir,f),'utf8').trim().split('\n').map(JSON.parse));
+  assert.equal(rows.find(row=>row.kind==='finish').outcome,'complete');
+});
+
+test('a loop arriving after the turn already finished is never cut',async t=>{
+  const r=await rig(t,1,{dataset_enabled:true});
+  const b=r.backends[0];
+  const line=(text)=>`data: ${JSON.stringify({choices:[{index:0,delta:{reasoning_content:text}}]})}\n\n`;
+  b.server.removeAllListeners('request');
+  b.server.on('request',(req,res)=>{
+    let body='';req.on('data',c=>body+=c);req.on('end',()=>{
+      b.records.push({url:req.url,body:Buffer.from(body)});
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      // The engine finishes, then keeps emitting into reasoning (history).
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+      for(let i=0;i<40;i++)res.write(line('OK.\n'));
+      res.end();
+    });
+  });
+  const response=await r.request(JSON.stringify({messages:[{role:'user',content:'finished then noisy'}],stream:true}),'post-finish-session',{path:'/v1/chat/completions'});
+  assert.equal(response.status,200);
+  assert.doesNotMatch(response.body,/: dsg-stop/,'a finished turn is never retroactively cut');
+  await until(()=>r.gateway.stats().dataset.finished===1);
+  const dir=path.join(path.dirname(r.config.state_file),'requests');
+  const rows=fs.readdirSync(dir).flatMap(f=>fs.readFileSync(path.join(dir,f),'utf8').trim().split('\n').map(JSON.parse));
+  assert.equal(rows.find(row=>row.kind==='finish'&&row.request_id===response.headers['x-request-id']).outcome,'complete');
+});
+
 test('scoped agent ingress preserves admitted work, ownership and receipts across gateway restart',async t=>{
   const r=await rig(t,1,{control_socket:true}),ctl=(route,body)=>workerControl(r.config.control_socket,route,body);
   const grant=await ctl('/grant-agent',{agent_id:'tester',workers:['spark1']}),credential={control_socket:r.config.control_socket,token:grant.token};

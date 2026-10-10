@@ -31,7 +31,7 @@ export function evidence(kind, raw) {
   if (['new','existing','none','reassigned'].includes(raw.affinity)) row.affinity=raw.affinity;
   if (['genie','unclassified'].includes(raw.traffic_class)) row.traffic_class=raw.traffic_class;
   if (typeof raw.session==='string' && /^[a-f0-9]{64}$/.test(raw.session)) row.session=raw.session;
-  if (['complete','client_cancelled','upstream_error','upstream_stream_error','upstream_aborted','upstream_http_error','upstream_engine_error','incomplete_sse','sse_observation_limited','connection_closed','timeout'].includes(raw.outcome)) row.outcome=raw.outcome;
+  if (['complete','client_cancelled','upstream_error','upstream_stream_error','upstream_aborted','upstream_http_error','upstream_engine_error','incomplete_sse','sse_observation_limited','connection_closed','timeout','reasoning_loop'].includes(raw.outcome)) row.outcome=raw.outcome;
   if (raw.usage) row.usage=Object.fromEntries(['prompt_tokens','completion_tokens','cached_tokens'].map(k=>[k,number(raw.usage[k])]));
   if(kind==='finish')row.finish_reason=['stop','length','tool_calls','function_call','content_filter'].includes(raw.finish_reason)?raw.finish_reason:null;
   if(kind==='finish'){
@@ -74,7 +74,7 @@ export class Dataset {
     this.directory=directory; this.enabled=enabled; this.maxBytes=maxBytes; this.maxPending=maxPending;
     this.run=randomUUID(); this.queue=[]; this.writing=null; this.closed=false;
     this.state={enabled,run_id:this.run,written:0,dropped:0,bytes:0,last_write:null,error:null,
-      schema:1,raw_text:false,retention:'No automatic deletion',finished:0,missing_usage:0,truncated:0,failed_or_cancelled:0,observation_limited:0};
+      schema:1,raw_text:false,retention:'No automatic deletion',finished:0,missing_usage:0,truncated:0,failed_or_cancelled:0,observation_limited:0,reasoning_loops:0};
     this.ready=enabled ? this.initialize() : Promise.resolve();
   }
   async initialize() {
@@ -111,6 +111,7 @@ export class Dataset {
             this.state.finished++;if(row.usage?.prompt_tokens==null||row.usage?.completion_tokens==null)this.state.missing_usage++;
             if(row.finish_reason==='length')this.state.truncated++;
             if(row.outcome==='sse_observation_limited')this.state.observation_limited++;
+            else if(row.outcome==='reasoning_loop')this.state.reasoning_loops=(this.state.reasoning_loops??0)+1;
             else if(row.outcome!=='complete')this.state.failed_or_cancelled++;
           }}
         } catch {this.state.error='Dataset write failed; inference unchanged';this.state.dropped+=lines.length;}
