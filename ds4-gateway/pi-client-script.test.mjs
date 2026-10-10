@@ -142,3 +142,25 @@ test('the served script parses under a real PowerShell', {skip: !pwsh && 'set DS
   execFileSync(pwsh, ['-NoProfile', '-File', path.join(here, 'parse-check.ps1'), '-ScriptPath', servedPath],
     {stdio: 'pipe', encoding: 'utf8'});
 });
+
+test('the report states the platform it actually ran on', () => {
+  // A hardcoded 'Windows' label made a macOS test run report itself as
+  // 'Windows 27.2.0' on the dashboard, which would have hidden a wrong-host
+  // install behind a confident-looking value.
+  for (const marker of ['$IsWindows', '$IsLinux', '$IsMacOS']) {
+    assert.ok(template.includes(marker), `the report must branch on ${marker}`);
+  }
+  assert.ok(!/\$clientOs = 'Windows'\n/.test(template), 'the OS must not be hardcoded to Windows');
+  assert.ok(!template.includes("if (-not $clientOs) { $clientOs = 'Windows' }"), 'the OS fallback must not be Windows');
+});
+
+test('the served script path is /v1/client/pi/install.ps1', async () => {
+  // The paste text shipped a /client/pi/install.ps1 URL, which 404s. Pin the
+  // route the gateway actually serves. Confirmed live: 200 on /v1/..., 404
+  // without it.
+  const {readFileSync: rd} = await import('node:fs');
+  const gateway = rd(path.join(here, 'gateway.mjs'), 'utf8');
+  const route = gateway.match(/const PI_CLIENT_SCRIPT_ROUTE = '([^']+)'/);
+  assert.ok(route, 'the gateway must define PI_CLIENT_SCRIPT_ROUTE');
+  assert.equal(route[1], '/v1/client/pi/install.ps1');
+});
