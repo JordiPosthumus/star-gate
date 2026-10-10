@@ -53,6 +53,32 @@ test('dashboard folds connection and diagnostics into its single identity header
   assert.doesNotMatch(header,/control room|class="brand"/);
 });
 
+test('the load-balancing speed table shows each lane at each concurrency, not one pooled number',()=>{
+  const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
+  // The panel writes into DOM nodes; a minimal stub list is enough to capture
+  // what renderRoutingMath produced.
+  const nodes=new Map();
+  const context=vm.createContext({document:{getElementById:id=>{
+    if(!nodes.has(id))nodes.set(id,{id,innerHTML:'',textContent:'',hidden:false});
+    return nodes.get(id);
+  }}});
+  vm.runInContext(source,context);
+  const status={gateway:{routing_time:{
+    enabled:true,mode:'active',evaluations:42,errors:0,speedSamples:9,unverifiedSavedSpeedSamples:2260,outputSamples:237,
+    fit:{mu:6.2,sigma:1.1,sampleCount:237},margin_seconds:30,last:null,
+    speed:[{workerId:'ring2',phase:'decode',samples:6,engineAggregate:4,cleanWindow:2,pooledRate:true,tokensPerSecond:68,
+      byConcurrency:[{value:1,count:6,tokensPerSecond:68},{value:2,count:4,tokensPerSecond:53}]}]}}};
+  vm.runInContext(`renderRoutingMath(${JSON.stringify(status)},1000)`,context);
+  const html=nodes.get('lb-speeds').innerHTML;
+  // The point of the table: a per-concurrency rate, so the load curve is visible.
+  assert.match(html,/concurrency 1/,'each concurrency level gets its own line');
+  assert.match(html,/concurrency 2/);
+  assert.match(html,/68 t\/s/,'the level rate is rendered, not just a count');
+  assert.match(html,/53 t\/s/);
+  assert.match(html,/pooled/,'the pooled figure is labelled as pooled, not presented as the lane rate');
+  assert.doesNotMatch(html,/\bundefined\b|\bNaN\b|\[object Object\]/);
+});
+
 test('rate charts compress missing intervals to idle-coloured separators without joining measured runs',()=>{
   const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
   const context=vm.createContext({});vm.runInContext(source,context);

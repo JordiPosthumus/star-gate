@@ -560,13 +560,27 @@ function renderRoutingMath(s,now){
       stat('Parked speed samples',fmt(parked),'Saved rows kept but withheld: a model name alone does not prove the engine behind an endpoint survived.'),
     ].join('')}</ul>`,true);
 
-  // 3. Per-worker measured speeds: the numbers the estimator actually fits.
+  // 3. Per-worker measured speeds, one row per server/phase so a lane's numbers
+  // sit together. The estimator works per CONCURRENCY, so the concurrency levels
+  // are the honest shape of the data: each is its own line with its own rate.
+  // Showing a single pooled "measured" number (as this table used to) hid the
+  // whole point — whether a box gets slower as it fills up, which is exactly the
+  // tradeoff placement is deciding on. Seconds/1k is derived here for reading
+  // only; it is not a stored measurement.
   const speeds=Array.isArray(rt.speed)?rt.speed:[];
-  const speedRows=speeds.map(row=>`<tr><td>${esc(row.workerId)}</td><td>${esc(row.phase)}</td><td>${rate(row.tokensPerSecond)}</td><td>${fmt(row.samples)}</td><td>${fmt(row.engineAggregate)}</td><td>${fmt(row.cleanWindow)}</td><td class="muted">${esc((row.concurrency??[]).map(c=>`${fmt(c.value)}×${fmt(c.count)}`).join(' · ')||'—')}</td></tr>`).join('');
+  const cur=(row)=>Array.isArray(row.byConcurrency)?row.byConcurrency:[];
+  const speedRows=speeds.map(row=>{
+    const levels=cur(row);
+    const detail=levels.length?levels.map(level=>{
+      const tps=Number.isFinite(level.tokensPerSecond)?level.tokensPerSecond:null;
+      return `<tr class="routing-math-sub"><td class="routing-math-sub-label">concurrency ${fmt(level.value)}</td><td>${rate(tps)}</td><td>${secs(tps?1000/tps:null)}</td><td class="muted">${fmt(level.count)} ${level.count===1?'row':'rows'}</td><td class="muted">${tps===null?'—':`×${fmt(Math.round(tps/(Number.isFinite(row.tokensPerSecond)?row.tokensPerSecond:1)*100)/100)} vs pooled`}</td></tr>`;
+    }).join(''):'<tr class="routing-math-sub"><td class="routing-math-sub-label muted" colspan="5">No measurement at any concurrency on this lane yet.</td></tr>';
+    return `<tr class="routing-math-group"><td><b>${esc(row.workerId)}</b></td><td>${esc(row.phase)}</td><td class="muted">${rate(row.tokensPerSecond)}</td><td class="muted">${secs(row.tokensPerSecond?1000/row.tokensPerSecond:null)}</td><td class="muted">pooled · ${fmt(row.samples)} rows</td></tr>${detail}`;
+  }).join('');
   const liveRows=Array.isArray(g?.routing_capacity)?g.routing_capacity.map(row=>`<tr><td>${esc(row.id)}</td><td>${row.connected?'<span class="routing-math-ok">connected</span>':'<span class="routing-math-no">unavailable</span>'}</td><td>${esc(row.source??'—')}</td><td>${esc(row.live_rate_scope??'—')}</td><td>${esc(row.phase??'—')}</td><td>${row.running===null?'—':fmt(row.running)}</td><td>${row.waiting===null?'—':fmt(row.waiting)}</td><td class="muted">${esc(row.error??'')}</td></tr>`).join(''):'';
-  $('lb-speeds').innerHTML=panel('Measured speed — what each server has actually given the estimator',
-    `${speedRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Phase</th><th scope="col">Measured</th><th scope="col">Rows</th><th scope="col">Engine</th><th scope="col">Clean</th><th scope="col">Concurrency seen</th></tr></thead><tbody>${speedRows}</tbody></table>
-<p class="routing-math-line">Engine rows are the mean work per completed request taken from the engine's own counters, bucketed at the concurrency observed across the interval. Clean rows are single-request windows where one request ran alone. A mean over mixed concurrency is a real engine measurement, but not a constant-concurrency one.</p>`
+  $('lb-speeds').innerHTML=panel('Measured speed — how fast each server goes, at each concurrency',
+    `${speedRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Rate</th><th scope="col">Per 1k</th><th scope="col">Rows</th><th scope="col">Note</th></tr></thead><tbody>${speedRows}</tbody></table>
+<p class="routing-math-line">One line per <b>concurrency level</b>, because that is the unit the estimator compares on: a server asked to run two requests at once can be far slower per request than the same server running one. “Per 1k” is 1000 tokens ÷ that rate — reading only, not a stored measurement. The pooled row is the mean across every level and is <b>not</b> comparable between servers measured at different loads; the per-level lines are. A lane that only ever ran one request shows only concurrency 1, which is honest, not missing data.</p>`
       :'<p class="routing-math-line muted">No measured speed row is in use yet. vLLM lanes report through their request histograms; other engines report per-request rates.</p>'}
 ${liveRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Endpoint</th><th scope="col">Live</th><th scope="col">Source</th><th scope="col">Rate scope</th><th scope="col">Phase</th><th scope="col">Running</th><th scope="col">Waiting</th><th scope="col">Error</th></tr></thead><tbody>${liveRows}</tbody></table>
 <p class="routing-math-line">Live endpoint readings are separate from the fitted rows above. Poll-interval throughput includes queueing and is not the same quantity as per-request engine work.</p>`:''}`,true);

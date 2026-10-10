@@ -196,5 +196,11 @@
 .routing-math-counters span{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
 .routing-math-counters b{font-size:12px;color:var(--text);font-weight:500}
 .routing-math-table{margin-top:10px}
+/* One group row per server/phase, then one sub-row per concurrency level: the
+   estimator compares lanes at a concurrency, so the level is its own line. */
+.routing-math-group td{border-top:1px solid var(--line);padding-top:7px}
+.routing-math-group:first-child td{border-top:0}
+.routing-math-sub td{padding-top:2px;padding-bottom:2px;font-size:10.5px}
+.routing-math-sub-label{padding-left:14px!important;color:var(--muted)}
 .routing-math-ok{color:var(--accent)}
 .routing-math-no{color:var(--muted)}
