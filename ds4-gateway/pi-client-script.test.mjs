@@ -122,3 +122,23 @@ test('the template stays inside the PowerShell 5.1 syntax subset', () => {
   assert.ok(!template.includes('??'), 'no PS7 null-coalescing operator');
   assert.ok(!/\$[A-Za-z_][\w:]*\s*\?[^.]/.test(template), 'no ternary expression');
 });
+
+// --- real-parser gate -------------------------------------------------------
+// The tests above assert text. Text assertions cannot tell a valid scriptblock
+// from an unclosed one, and this script has to run on a machine we do not own.
+// So when a real PowerShell is available we parse the EXACT bytes we serve and
+// fail on any parser error. Skipped (not passed) when pwsh is absent, so this
+// never claims coverage it did not get.
+const pwsh = process.env.DSG_PWSH || null;
+
+test('the served script parses under a real PowerShell', {skip: !pwsh && 'set DSG_PWSH to a pwsh binary to enable'}, async () => {
+  const {execFileSync} = await import('node:child_process');
+  const {renderPiClientScript} = await import('./pi-client-config.mjs');
+  const served = renderPiClientScript(template, {baseUrl: 'http://pi-host.invalid:30000/v1', fallbackBaseUrls: [], apiKey: 'none'});
+  const scratch = await import('node:fs').then(fs => fs.mkdtempSync('/tmp/pi-parse-'));
+  const servedPath = scratch + '/served.ps1';
+  (await import('node:fs')).writeFileSync(servedPath, served);
+  // Exit 0 means every token parsed; anything else prints the parser errors.
+  execFileSync(pwsh, ['-NoProfile', '-File', path.join(here, 'parse-check.ps1'), '-ScriptPath', servedPath],
+    {stdio: 'pipe', encoding: 'utf8'});
+});

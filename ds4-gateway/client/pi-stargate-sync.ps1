@@ -470,13 +470,29 @@ $reportBase = $script:WorkingBase
 if (-not $reportBase) { $reportBase = [string]$StargateBaseUrl }
 $reportBase = Sanitize-Text $reportBase 256
 
-$clientOs = 'Windows'
-try { $clientOs = 'Windows ' + [System.Environment]::OSVersion.Version.ToString() } catch {}
+$clientOs = 'unknown'
+try {
+  # Report the platform we actually ran on. This script is normally invoked on
+  # Windows, but it is also run here for testing, and a hardcoded 'Windows' label
+  # made a macOS run report itself as Windows <macOS version> on the dashboard.
+  $osFamily = $null
+  if ($PSVersionTable.PSVersion.Major -ge 6) {
+    if ($IsWindows) { $osFamily = 'Windows' }
+    elseif ($IsLinux) { $osFamily = 'Linux' }
+    elseif ($IsMacOS) { $osFamily = 'macOS' }
+  } elseif ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    $osFamily = 'Windows'
+  } else {
+    $osFamily = 'non-Windows'
+  }
+  if (-not $osFamily) { $osFamily = 'unknown' }
+  $clientOs = $osFamily + ' ' + [System.Environment]::OSVersion.Version.ToString()
+} catch { $clientOs = 'unknown' }
 $clientPowerShell = 'unknown'
 try { $clientPowerShell = $PSVersionTable.PSVersion.ToString() } catch {}
 $clientOs = Sanitize-Text $clientOs 64
 $clientPowerShell = Sanitize-Text $clientPowerShell 64
-if (-not $clientOs) { $clientOs = 'Windows' }
+if (-not $clientOs) { $clientOs = 'unknown' }
 if (-not $clientPowerShell) { $clientPowerShell = 'unknown' }
 
 $report = [ordered]@{
