@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "provider": "dsg-pool",
+  "api": "openai-completions",
+  "display_name": "(DSG) Pool",
+  "model": {
+    "reasoning": true,
+    "input": ["text", "image"],
+    "maxTokens": 262144,
+    "thinkingLevelMap": {
+      "off": null,
+      "minimal": null,
+      "low": "low",
+      "medium": null,
+      "high": "high",
+      "xhigh": "max",
+      "max": "max"
+    },
+    "samplingParams": { "temperature": 1.0, "top_p": 0.95, "min_p": 0.0, "top_k": 20 },
+    "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+  },
+  "compat": {
+    "supportsStore": false,
+    "supportsDeveloperRole": false,
+    "supportsReasoningEffort": true,
+    "supportsUsageInStreaming": true,
+    "supportsStrictMode": false,
+    "maxTokensField": "max_tokens",
+    "thinkingFormat": "chat-template",
+    "requiresReasoningContentOnAssistantMessages": true,
+    "sendSessionAffinityHeaders": true,
+    "sessionAffinityFormat": "openai-nosession",
+    "chatTemplateKwargs": {
+      "enable_thinking": { "$var": "thinking.enabled" },
+      "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+    },
+    "serverOutputBudget": true
+  }
+}

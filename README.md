@@ -411,6 +411,14 @@ It includes a copyable handoff, new-Spark preparation, paused live registration,
 telemetry, real inference/cache acceptance and rollback without disturbing the
 existing fleet.
 
+**Adding a Windows PC running Pi:** turn on **Settings → Share on LAN**, then run
+the one-time PowerShell command shown under **Pi setup for a Windows PC** on that
+machine. It writes the `dsg-pool` provider into Pi's `models.json` and can be
+re-run to re-sync; the gateway serves both the bundle and the script, and shows
+what each client reported. See [client config sync](docs/client-config-sync.md).
+This route advertises the constant home-LAN key `none`; if your install requires
+a real client key, configure the client by hand instead.
+
 **Setting up with your own agent:** give any local agent that can run shell
 commands the following handoff. Replace the bracketed details with your own
 checkout and existing DS4 endpoints; no particular agent framework is required.

@@ -923,6 +923,21 @@ function deterministicHealthAlerts(snapshot) {
   }
   return alerts;
 }
+function renderPiClientSync(client){
+  const panel=$('pi-client-sync');if(!panel)return;
+  const reports=client?.reports??[];
+  // Reports are an observation aid, never a control surface. Silence is not an
+  // instruction and a failed report never authorizes a fleet change.
+  $('pi-client-sync-status').textContent=reports.length?`${fmt(reports.length)} report${reports.length===1?'':'s'}${client?.malformed_lines?` · ${fmt(client.malformed_lines)} unreadable`:''}`:'No client reports';
+  const items=$('pi-client-sync-items');
+  if(!reports.length){items.innerHTML='<li class="muted">No client reports.</li>';return;}
+  items.innerHTML=reports.slice(0,24).map(report=>{
+    const client_os=report.client?.os??'unknown client';
+    const version=report.client?.pi_version?` · Pi ${esc(report.client.pi_version)}`:'';
+    const message=report.error_message??(report.steps??[]).find(step=>!step.ok)?.detail??null;
+    return `<li data-activity="${report.ok?'idle':'unknown'}" data-level="${report.ok?'current':'attention'}"><time>${esc(age(Date.parse(report.at),Date.now()))}</time><strong>${esc(client_os)}${version} · ${esc(report.stage.replaceAll('_',' '))}</strong><span>${report.ok?'succeeded':'failed'}${report.error_code?` · ${esc(report.error_code)}`:''}${message?` · ${esc(message)}`:''}${report.duration_ms!=null?` · ${fmt(report.duration_ms)}ms`:''}</span></li>`;
+  }).join('');
+}
 function renderAgentWatch(watch){
   const panel=$('agent-watch'),runs=watch?.runs??[];panel.hidden=!watch;
   if(!watch)return;
@@ -984,6 +999,7 @@ function render(s) {
   const g = s.gateway, now = s.time, stale = !!s.gateway_error;
   requestEvents=s.events??[];
   renderAgentWatch(g?.client_watch);
+  renderPiClientSync(g?.pi_client);
   const rejected=g?.continuity?.recent_rejections??[];
   $('patient-wait-status').hidden=stale||!g?.continuity?.waiting;
   $('patient-wait-status').textContent=`Star Gate is holding ${fmt(g?.continuity?.waiting)} undispatched requests for recovery/readiness · oldest wait ${fmt(g?.continuity?.oldest_wait_seconds)}s · ${Object.entries(g?.continuity?.waiting_reasons??{}).map(([reason,n])=>`${fmt(n)} ${reason.replaceAll('_',' ')}`).join(' · ')}. They resume automatically when eligible; pauses remain respected.`;
@@ -1045,6 +1061,9 @@ function renderLanSharing(value){
   $('lan-sharing-key').value=value.api_key??'';
   $('lan-sharing-fallback').hidden=!value.hostname_url;
   $('lan-sharing-ip').value=value.ip_urls?.[0]??'';
+  // The Pi client script is relative to the /v1 base URL (script_url in the bundle).
+  const command=$('lan-sharing-pi-command');
+  if(command)command.value=value.urls?.[0]?`powershell -c "irm ${value.urls[0]}/client/pi/install.ps1 | iex"`:'No LAN address available';
 }
 async function loadLanSharing(){
   if(lanSharingBusy||document.hidden||$('view-settings').hidden)return;
@@ -1394,7 +1413,7 @@ function setupWorkspaceTabs(){
 }
 poll();
 $('lan-sharing-toggle')?.addEventListener('click',()=>void toggleLanSharing());
-for(const id of ['lan-sharing-url','lan-sharing-key','lan-sharing-ip'])$(id)?.addEventListener('click',event=>event.currentTarget.select());
+for(const id of ['lan-sharing-url','lan-sharing-key','lan-sharing-ip','lan-sharing-pi-command'])$(id)?.addEventListener('click',event=>event.currentTarget.select());
 new MutationObserver(()=>{void loadLanSharing();void loadTesting();}).observe($('view-settings'),{attributes:true,attributeFilter:['hidden']});
 document.addEventListener('visibilitychange',()=>{void loadLanSharing();void loadTesting();});
 void loadLanSharing();setInterval(()=>{if(!document.hidden)void loadLanSharing();},5000);

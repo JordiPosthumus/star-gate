@@ -595,6 +595,62 @@ test('Agent Watch warns only when a live client reports waiting but no request r
     const quiet=news({...base,diagnosis,fresh:diagnosis!=='heartbeat_stale_unknown'});assert.equal(quiet.level,'unknown');assert.doesNotMatch(quiet.items[0].text,/no matching request/);
   }
   const html=fs.readFileSync(new URL('./ui/index.html',import.meta.url),'utf8'),css=fs.readFileSync(new URL('./ui/brand.css',import.meta.url),'utf8');assert.match(html,/id="agent-watch"/);assert.match(html,/No prompts, task text, tool names, arguments or output/);assert.match(css,/\.agent-watch/);
+  // Client sync reports reuse the Agent Watch disclosure and its privacy promise.
+  assert.match(html,/id="pi-client-sync"/);assert.match(html,/Pi setup reports/);
+  assert.match(html,/id="pi-client-sync-items"/);assert.match(html,/No prompts, task text or credentials/);
+});
+
+test('the client sync panel renders reports from the status snapshot with escaping',()=>{
+  const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
+  const context=vm.createContext({});
+  vm.runInContext(`var store={};var document={getElementById:id=>(store[id]??={value:'',textContent:'',innerHTML:'',hidden:false,disabled:false,dataset:{},setAttribute(){},addEventListener(){},select(){}})};`,context);
+  vm.runInContext(source,context);
+  // A report carrying HTML must be escaped, never injected as markup.
+  const client={schema:1,malformed_lines:0,reports:[{report_id:'r1',at:new Date().toISOString(),stage:'merge',ok:false,error_code:'E1',error_message:'<img src=x onerror=alert(1)>',client:{os:'Windows 11',powershell:'5.1',pi_version:'0.85.1'},base_url:'http://host:30000/v1',duration_ms:12,steps:[]}]};
+  const markup=vm.runInContext(`(function(){renderPiClientSync(${JSON.stringify(client)});return store['pi-client-sync-items'].innerHTML;})()`,context);
+  assert.match(markup,/merge/);assert.match(markup,/E1/);assert.match(markup,/Windows 11/);
+  assert.ok(!markup.includes('<img'),'report free text must never be injected as markup');
+  assert.match(markup,/&lt;img/);
+  const status=vm.runInContext(`(function(){renderPiClientSync(${JSON.stringify(client)});return store['pi-client-sync-status'].textContent;})()`,context);
+  assert.match(status,/1 report/);
+  const empty=vm.runInContext(`(function(){renderPiClientSync(undefined);return store['pi-client-sync-items'].innerHTML;})()`,context);
+  assert.match(empty,/No client reports/);
+});
+
+test('the dashboard projects a sanitized pi_client and advertises the Windows setup command',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dsg-pi-client-project-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  // A hostile status payload: unknown fields and a credential-shaped field.
+  const status={version:1,model:'deepseek-v4-flash',context_length:153600,workers:[{id:'spark1',is_healthy:true,load:0}],total:1,healthy:1,available:1,
+    pi_client_version:1,pi_client:{schema:1,malformed_lines:0,retention_bytes:999999,secret:'LEAK',reports:[{report_id:'r1',at:'2026-01-01T00:00:00.000Z',stage:'fetch',ok:true,error_code:null,error_message:null,client:{os:'Windows 11',powershell:'5.1',pi_version:null},base_url:'http://host:30000/v1',duration_ms:5,steps:[],extra:'DROP'}]}};
+  const backend=http.createServer((req,res)=>res.end(JSON.stringify(status)));
+  backend.listen(0,'127.0.0.1');await once(backend,'listening');t.after(()=>{backend.closeAllConnections();backend.close();});
+  const config=path.join(dir,'config.json');fs.writeFileSync(config,JSON.stringify({port:backend.address().port,api_key:'test',state_file:path.join(dir,'state.json'),nodes:[{id:'spark1'}]}));
+  const app=await runDashboard(config,0);t.after(app.close);
+  const wait=async fn=>{const end=Date.now()+3500;while(!fn()){if(Date.now()>end)throw new Error('Dashboard did not refresh');await delay(20);}};
+  await wait(()=>app.snapshot().gateway?.pi_client?.reports?.length===1);
+  const projected=app.snapshot().gateway.pi_client;
+  assert.equal(app.snapshot().gateway.pi_client_version,1);
+  assert.equal(projected.reports[0].client.os,'Windows 11');
+  // Unknown and credential-shaped fields must not survive the projection.
+  const serialized=JSON.stringify(projected);
+  for(const leak of ['LEAK','secret','DROP','extra','retention_bytes'])assert.ok(!serialized.includes(leak),`projection must not retain ${leak}`);
+  // The command field the LAN panel fills in must exist in the served page.
+  const url=`http://127.0.0.1:${app.server.address().port}`;
+  const html=await(await fetch(url)).text();
+  assert.match(html,/id="lan-sharing-pi-command"/);assert.match(html,/Pi setup for a Windows PC/);
+});
+
+test('the LAN panel builds the Windows one-liner from the shared address',()=>{
+  const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
+  const context=vm.createContext({});
+  vm.runInContext(`var store={};var document={getElementById:id=>(store[id]??={value:'',textContent:'',innerHTML:'',hidden:false,disabled:false,dataset:{},setAttribute(){},addEventListener(){},select(){}})};`,context);
+  vm.runInContext(source,context);
+  vm.runInContext(`renderLanSharing({available:true,enabled:true,csrf_token:'t',api_key:'none',urls:['http://pi-host.invalid:30000/v1'],ip_urls:['http://192.0.2.5:30000/v1'],hostname_url:'http://pi-host.invalid:30000/v1'})`,context);
+  // The script URL is relative to the /v1 base, so there is no doubled /v1.
+  assert.equal(vm.runInContext(`store['lan-sharing-pi-command'].value`,context),'powershell -c "irm http://pi-host.invalid:30000/v1/client/pi/install.ps1 | iex"');
+  vm.runInContext(`renderLanSharing({available:true,enabled:true,csrf_token:'t',api_key:'none',urls:[]})`,context);
+  assert.equal(vm.runInContext(`store['lan-sharing-pi-command'].value`,context),'No LAN address available');
 });
 test('enabled unavailable capacity is deterministic, while deliberate pauses and holds are not faults',()=>{
   const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];

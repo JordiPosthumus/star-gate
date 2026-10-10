@@ -37,3 +37,9 @@ State lives in `runtime/lan-sharing.json`. Writes validate existing state,
 keep a timestamped backup, and use an fsynced temporary file plus atomic rename.
 An unreadable state is not overwritten. The initial feature deployment requires
 one idle front-door reload; subsequent toggles require no service restart.
+
+Sharing on LAN also exposes the Pi client setup routes, so a Windows PC can join
+the pool with one command. The address shown in the panel is the base URL those
+routes are built from. See [client config sync](client-config-sync.md); the
+served bundle advertises the constant home-LAN key `none`, never the gateway's
+real `api_key`.

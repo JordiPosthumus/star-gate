@@ -22,6 +22,7 @@ import {MODEL_ROUTE_HEADER,modelRoutes,routeSelection,allowsWorker} from './mode
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
@@ -68,6 +69,11 @@ const AMBIGUOUS_FAILURE_OUTCOMES = new Set(['upstream_error','upstream_stream_er
 const TRANSPORT_DEAD_STATES = new Set(['ssh_error','retrying']);
 import {dsgReport,invalidHttp} from './report.mjs';
 import {ClientWatch,CLIENT_WATCH_HEADER,CLIENT_WATCH_ROUTE,validClientWatchId} from './client-watch.mjs';
+import {
+  buildPiClientBundle,renderPiClientScript,mergePiClientTemplate,piClientProviderObject,PI_CLIENT_KEY,
+} from './pi-client-config.mjs';
+import {PiClientReports,piClientForDisplay} from './pi-client-reports.mjs';
+import {lanAddresses,lanSharingDetails} from './lan-sharing.mjs';
 import {JPEG_REJECTION_INSPECTION_BYTES,VisionProtection,visionGuidance,visionRejectionKind} from './vision-protection.mjs';
 import {observeJobPreview,clearJobPreview} from './current-jobs.mjs';
 import net from 'node:net';
@@ -75,6 +81,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const validContext = value => Number.isSafeInteger(value) && value > 0;
+// Read once per process; these are committed assets, not per-request state.
+const piClientDefaultsFile=JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),'pi-client-defaults.json'),'utf8'));
+// The Windows sync script is a committed template the core injects defaults
+// into. Read lazily and cached: the gateway must start and serve traffic even
+// if the asset is missing, and the compile check must not depend on it.
+let piClientScriptCache;
+function piClientScriptTemplate(){
+  if(piClientScriptCache===undefined){
+    // Cache only a successful read: the asset may legitimately land while the
+    // gateway is already running, and a miss must not be sticky.
+    try{piClientScriptCache=fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),'client','pi-stargate-sync.ps1'),'utf8');}
+    catch(e){return undefined;}
+  }
+  return piClientScriptCache;
+}
 const validOperatorAction=action=>action&&typeof action==='object'&&/^[a-f0-9-]{36}$/.test(action.id)&&['pause','resume'].includes(action.action)&&Array.isArray(action.workers)&&action.workers.length>0&&action.workers.length<=128&&action.workers.every(id=>typeof id==='string'&&/^[a-zA-Z0-9][\w-]{0,63}$/.test(id))&&typeof action.control_channel==='string'&&/^[a-z][a-z0-9_]{0,31}$/.test(action.control_channel)&&typeof action.time==='string'&&Number.isFinite(Date.parse(action.time));
 export const workerRegistrationTimeout=(config,node)=>config.registration_timeout_ms??Math.max(15000,sshTargets(node).length*15000);
 const log = (event, fields = {}) => process.stdout.write(JSON.stringify({ time: new Date().toISOString(), event, ...fields }) + '\n');
@@ -468,6 +489,24 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   // an exact Content-Length; larger uploads keep streaming chunked.
   const rewriteBufferBytes=Number.isSafeInteger(config.rewrite_buffer_bytes)&&config.rewrite_buffer_bytes>0?config.rewrite_buffer_bytes:268435456;
   const accepted = new Set(['POST /v1/chat/completions', 'POST /v1/completions', 'POST /v1/responses', 'POST /v1/messages', 'GET /v1/models']);
+  // Pi client config: committed defaults, optional private override, and the
+  // bounded durable report store beside the affinity state. Reverse-proxied
+  // routes to the Door, so they are NOT added to the inference allowlist.
+  const PI_CLIENT_BUNDLE_ROUTE = '/v1/client/pi';
+  const PI_CLIENT_SCRIPT_ROUTE = '/v1/client/pi/install.ps1';
+  const PI_CLIENT_REPORT_ROUTE = '/v1/client/pi/report';
+  const piClientTemplate=mergePiClientTemplate(piClientDefaultsFile,config.pi_client);
+  const piClientReports=new PiClientReports({
+    file:path.join(path.dirname(config.state_file),'client-reports.jsonl'),
+    redactHosts:[config.host,...lanAddresses(config).map(url=>new URL(url).hostname)].filter(host=>typeof host==='string'&&host.length>0)});
+  // Advertise the address clients actually reach: the Door's bind host and port,
+  // never the core's private port.
+  const piClientBaseUrls=()=>{
+    const urls=lanAddresses(config);
+    const details=lanSharingDetails({urls},config.port);
+    const ordered=details.urls?.length?details.urls:[`http://127.0.0.1:${config.port}/v1`];
+    return {baseUrl:ordered[0],fallbackBaseUrls:ordered.slice(1)};
+  };
   const lastOperatorAction=id=>Object.hasOwn(store.data.operator_action_heads??{},id)?store.data.operator_action_heads[id]:[...(store.data.operator_actions??[])].reverse().find(action=>action.workers.includes(id))??null;
   const oldestQueued=queue=>queue.reduce((oldest,job)=>!oldest||job.createdMono<oldest.createdMono?job:oldest,null);
 
@@ -478,7 +517,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const mediaSetup=mediaJobs?createMediaSetup(serviceConfig,store,{directory:path.join(path.dirname(config.state_file),'media-setup'),workers:()=>nodes.map(definition),binding:(id,c)=>{const n=nodes.find(n=>n.id===id);return !!n&&recovery.binding(n,c);},isEnabled:()=>!draining&&capabilityStatus().media,isInspectionEnabled:()=>capabilityStatus().inspection,isAllowed:mediaHosts.allowed}):null;
   const rebalanceEnabled=()=>capabilityStatus().rebalance;
   const allocationStatus=slot=>slot.turnAllocation?{turns_used:slot.turnAllocation.used,remaining:Math.max(0,conversationTurns()-slot.turnAllocation.used),waiting_for_next_turn:!slot.active&&slot.turnAllocation.until>performance.now(),idle_remaining_ms:Math.max(0,Math.ceil(slot.turnAllocation.until-performance.now()))}:null;
-  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
+  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), pi_client_version:1,pi_client:piClientForDisplay(piClientReports.snapshot()), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
     genie_admission_version:1,genie_flexible_assignment:true,placement_policy:timeRouting?'completion_time_v1':'live_load_v1',capacity_basis:'configured_gateway_admissions',continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
       relocation:{completed:relocation.completed,rejected:relocation.rejected,offers:relocationOffers().length,genie_enabled:rebalanceEnabled(),genie_offers:genieRelocationOffers(),diagnostics:relocationDiagnostics(),last:relocation.last},
       waiting:waiting.length,oldest_wait_seconds:waiting.length?Math.max(0,(performance.now()-oldestQueued(waiting).createdMono)/1000):null,
@@ -1373,6 +1412,38 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       req.on('data',chunk=>{if(finished)return;bytes+=chunk.length;if(bytes>2048){finished=true;clearTimeout(timer);error(res,413,'client_watch_too_large','Client Watch heartbeat exceeds 2 KiB');req.resume();return;}body+=chunk;});
       req.on('error',()=>{finished=true;clearTimeout(timer);});req.on('aborted',()=>{finished=true;clearTimeout(timer);});
       req.on('end',()=>{if(finished)return;finished=true;clearTimeout(timer);try{return json(res,200,{schema:1,...clientWatch.heartbeat(JSON.parse(body))});}catch{return error(res,400,'invalid_client_watch','Invalid Client Watch heartbeat');}});
+      return;
+    }
+    if(route===`GET ${PI_CLIENT_BUNDLE_ROUTE}`){
+      req.resume();
+      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls();
+      try{
+        return json(res,200,buildPiClientBundle({baseUrl,fallbackBaseUrls,poolModel:config.model,contextWindow:contextLimit(),template:piClientTemplate,generatedAt:new Date().toISOString()}));
+      }catch(e){return error(res,503,'pi_client_bundle_unavailable',dsgReport('Client bundle could not be built.'));}
+    }
+    if(route===`GET ${PI_CLIENT_SCRIPT_ROUTE}`){
+      req.resume();
+      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls();
+      const template=piClientScriptTemplate();
+      if(!template)return error(res,503,'pi_client_script_unavailable',dsgReport('Client script is not installed on this gateway.'));
+      let script;
+      try{script=renderPiClientScript(template,{baseUrl,fallbackBaseUrls,apiKey:PI_CLIENT_KEY});}
+      catch(e){return error(res,503,'pi_client_script_unavailable',dsgReport('Client script could not be rendered.'));}
+      res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','content-disposition':'inline; filename="pi-stargate-sync.ps1"'});
+      return res.end(script);
+    }
+    if(route===`POST ${PI_CLIENT_REPORT_ROUTE}`){
+      if(!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type']??'')){req.resume();return error(res,415,'pi_client_report_media_type','Client report requires JSON');}
+      const declared=Number(req.headers['content-length']);if(Number.isFinite(declared)&&declared>8192){req.resume();return error(res,413,'pi_client_report_too_large','Client report exceeds 8 KiB');}
+      let body='',bytes=0,finished=false;
+      const timer=setTimeout(()=>{if(finished)return;finished=true;error(res,408,'pi_client_report_timeout','Client report was incomplete');req.destroy();},5000);timer.unref();
+      req.on('data',chunk=>{if(finished)return;bytes+=chunk.length;if(bytes>8192){finished=true;clearTimeout(timer);error(res,413,'pi_client_report_too_large','Client report exceeds 8 KiB');req.resume();return;}body+=chunk;});
+      req.on('error',()=>{finished=true;clearTimeout(timer);});req.on('aborted',()=>{finished=true;clearTimeout(timer);});
+      req.on('end',()=>{if(finished)return;finished=true;clearTimeout(timer);
+        let parsed;try{parsed=JSON.parse(body);}catch{return error(res,400,'invalid_pi_client_report','Invalid client report');}
+        try{return json(res,200,{schema:1,...piClientReports.record(parsed)});}
+        catch(e){return error(res,e&&e.code==='invalid'?400:503,e&&e.code==='invalid'?'invalid_pi_client_report':'pi_client_report_unavailable',e&&e.code==='invalid'?'Invalid client report':'Client report could not be stored');}
+      });
       return;
     }
     if (!accepted.has(route)) { req.resume(); return error(res, 404, 'unsupported_route', 'Endpoint is not on the inference allowlist'); }

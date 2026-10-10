@@ -96,6 +96,13 @@ Changing or losing that key invalidates cross-scan pseudonyms but never changes 
 DS4 cache. Remote SSH inventory is not silently inferred from a worker's management
 route and remains future explicitly enrolled work.
 
+An optional private Pi client template override lives under the
+`pi_client` key. It is merged over the committed
+`ds4-gateway/pi-client-defaults.json`; the served bundle and the rendered
+Windows script both come from that merged template. The served API key is always
+the constant `none`, never this config's `api_key`. See
+[client config sync](client-config-sync.md).
+
 ## macOS login services
 
 For normal use, prefer the [start/stop scripts](#start-and-stop-scripts-macos)
