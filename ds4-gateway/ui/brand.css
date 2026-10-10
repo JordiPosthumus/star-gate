@@ -205,3 +205,10 @@ button:disabled{opacity:.4;cursor:default}input:focus-visible,select:focus-visib
 @media(max-width:650px){.devices .device{min-height:0}}
 
 .device-footer:empty+.device-details{margin-top:auto}
+
+/* Fleet card archive control: sits beside the pause/play toggle in the card
+   header. Kept text-only and small so the compact card face stays uncluttered. */
+.device-header-actions{gap:6px}
+.device-archive{padding:5px 9px;font-size:10.5px;line-height:1;color:var(--muted);background:#1d211e;border-color:var(--line)}
+.device-archive:hover{border-color:var(--accent);color:var(--text)}
+.device-archive:disabled{cursor:not-allowed;opacity:.45}
