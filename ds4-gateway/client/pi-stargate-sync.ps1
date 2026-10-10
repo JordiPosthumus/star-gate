@@ -282,8 +282,10 @@ try {
     # Step 4 — back up the existing profile (timestamp is filename-safe).
     # -----------------------------------------------------------------------
     $script:Stage = 'merge'
+    # One UTC stamp for every backup this run takes, computed unconditionally so
+    # the settings backup below cannot end up with an empty timestamp.
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'")
     if (Test-Path -LiteralPath $modelsPath) {
-      $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'")
       $backupPath = $modelsPath + '.' + $stamp + '.bak'
       try {
         Copy-Item -LiteralPath $modelsPath -Destination $backupPath -Force
@@ -298,6 +300,30 @@ try {
     # -----------------------------------------------------------------------
     $existingDocument['providers'][$bundle.provider] = $providerObject
     Add-ReportStep 'merge' $true ('replaced providers[' + (Sanitize-Text ([string]$bundle.provider) 64) + ']')
+
+    # -----------------------------------------------------------------------
+    # Step 5b — optional purge. Removes the other providers so a machine pinned
+    # to the pool keeps no dead endpoints. Off unless the bundle asks for it;
+    # `all` keeps only the synced provider. This runs AFTER the backup, so the
+    # removals are recoverable from models.json.<stamp>.bak.
+    # -----------------------------------------------------------------------
+    $purge = $bundle.purgeProviders
+    if ($null -ne $purge) {
+      $purgeAll = ($purge -is [string]) -and ([string]$purge -eq 'all')
+      if ($purgeAll -or (@($purge).Count -gt 0)) {
+        $removed = New-Object System.Collections.ArrayList
+        foreach ($providerName in @($existingDocument['providers'].Keys)) {
+          $name = [string]$providerName
+          if ($name -eq [string]$bundle.provider) { continue }
+          if ($purgeAll -or (@($purge) -contains $name)) {
+            $existingDocument['providers'].Remove($name) | Out-Null
+            [void]$removed.Add($name)
+          }
+        }
+        $removedText = if ($removed.Count -gt 0) { ($removed.ToArray() -join ', ') } else { 'none' }
+        Add-ReportStep 'merge' $true ('purged ' + $removed.Count + ' provider(s): ' + (Sanitize-Text $removedText 256))
+      }
+    }
 
     # -----------------------------------------------------------------------
     # Step 6 — serialize and write atomically. ConvertTo-Json MUST carry
@@ -343,6 +369,62 @@ try {
       Stop-Sync 'validate' 'chat_template_kwargs' 'compat.chatTemplateKwargs is not an object after write'
     }
     Add-ReportStep 'validate' $true 'nested provider structure verified'
+
+    # -----------------------------------------------------------------------
+    # Step 7b — adopt the served defaults (default provider/model/thinking
+    # level) in settings.json, so the pool is what pi starts with. Deliberately
+    # AFTER models.json is written and verified: pointing pi's default at a
+    # provider that failed to land would leave it unable to start. Only written
+    # when the bundle says apply, and only these three keys are ever touched.
+    # -----------------------------------------------------------------------
+    $adopt = $bundle.defaults
+    if ($null -ne $adopt -and $adopt.apply -eq $true) {
+      $settingsPath = Join-Path $agentDirectory 'settings.json'
+      $settings = [ordered]@{}
+      if (Test-Path -LiteralPath $settingsPath) {
+        try {
+          $settingsRaw = Get-Content -LiteralPath $settingsPath -Raw
+          if (-not [string]::IsNullOrWhiteSpace($settingsRaw)) {
+            $settings = ConvertTo-OrderedMap ($settingsRaw | ConvertFrom-Json)
+          }
+        } catch {
+          Stop-Sync 'validate' 'existing_settings_json' 'The existing settings.json is not valid JSON'
+        }
+        if ($settings -isnot [System.Collections.IDictionary]) {
+          Stop-Sync 'validate' 'existing_settings_shape' 'The existing settings.json is not a JSON object'
+        }
+        # Same UTC stamp as the models.json backup, so one run's backups pair up.
+        try {
+          Copy-Item -LiteralPath $settingsPath -Destination ($settingsPath + '.' + $stamp + '.bak') -Force
+        } catch {
+          Stop-Sync 'validate' 'settings_backup_failed' ('Could not write the settings backup: ' + $_.Exception.Message)
+        }
+      }
+      $settings['defaultProvider'] = [string]$adopt.model.defaultProvider
+      $settings['defaultModel'] = [string]$adopt.model.defaultModel
+      $level = $adopt.model.defaultThinkingLevel
+      if ($null -eq $level) { [void]$settings.Remove('defaultThinkingLevel') }
+      else { $settings['defaultThinkingLevel'] = [string]$level }
+      $settingsTemporary = Join-Path $agentDirectory ('settings.json.' + [guid]::NewGuid().ToString('N') + '.tmp')
+      try {
+        [System.IO.File]::WriteAllText($settingsTemporary, (ConvertTo-Json -InputObject $settings -Depth 100), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $settingsTemporary -Destination $settingsPath -Force
+      } catch {
+        if (Test-Path -LiteralPath $settingsTemporary) { Remove-Item -LiteralPath $settingsTemporary -Force -ErrorAction SilentlyContinue }
+        Stop-Sync 'write' 'settings_write_failed' ('Could not write settings.json: ' + $_.Exception.Message)
+      }
+      # Validate by re-reading: a silent key drop here would leave pi on its old
+      # model with no error anywhere.
+      $settingsBack = ConvertTo-OrderedMap ((Get-Content -LiteralPath $settingsPath -Raw) | ConvertFrom-Json)
+      if ([string]$settingsBack['defaultModel'] -ne [string]$adopt.model.defaultModel) {
+        Stop-Sync 'validate' 'default_model' 'settings.json defaultModel did not persist'
+      }
+      if ($settingsBack.Contains('defaultProvider') -and ([string]$settingsBack['defaultProvider'] -ne [string]$adopt.model.defaultProvider)) {
+        Stop-Sync 'validate' 'default_provider' 'settings.json defaultProvider did not persist'
+      }
+      Add-ReportStep 'validate' $true ('default model set to ' + (Sanitize-Text ([string]$adopt.model.defaultModel) 64) +
+        ' on ' + (Sanitize-Text ([string]$adopt.model.defaultProvider) 64) + ', thinking ' + (Sanitize-Text ([string]$level) 32))
+    }
   }
 
   # -------------------------------------------------------------------------

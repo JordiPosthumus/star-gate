@@ -94,6 +94,29 @@ test('safety marker: post-write validation checks the nested structure', () => {
   assert.match(template, /-is \[string\]/, 'validation must assert chatTemplateKwargs is not a string');
 });
 
+test('the template adopts the served defaults only after the provider is verified', () => {
+  // Pointing pi's default at a provider that failed to land would leave it
+  // unable to start, so the settings write must follow the models.json verify.
+  const verify = template.indexOf('nested provider structure verified');
+  const adopt = template.indexOf("$settings['defaultModel']");
+  assert.ok(verify !== -1 && adopt !== -1, 'both the verify step and the adopt step must exist');
+  assert.ok(adopt > verify, 'settings.json must be written after models.json is verified');
+  for (const key of ["defaultProvider", "defaultModel", "defaultThinkingLevel"]) {
+    assert.ok(template.includes(key), `the adopt step must set ${key}`);
+  }
+  // The purge must run after the backup, or the removals are unrecoverable.
+  const backup = template.indexOf("$backupPath");
+  const purge = template.indexOf("Step 5b");
+  assert.ok(backup !== -1 && purge !== -1 && purge > backup, 'the purge must follow the backup');
+  assert.ok(!/\$\$stamp/.test(template), 'the backup stamp must not be double-escaped');
+});
+
+test('a purge only ever removes providers, and keeps the synced one', () => {
+  assert.ok(template.includes('purgeProviders'), 'the template must read the purge list');
+  assert.match(template, /providers'\]\.Remove\(/, 'the purge must remove entries from providers');
+  assert.match(template, /-eq \[string\]\$bundle\.provider\) \{ continue \}/, 'the purge must never remove the synced provider itself');
+});
+
 test('the template stays inside the PowerShell 5.1 syntax subset', () => {
   // No PS7-only null-coalescing; the plan also bans ternary operators.
   assert.ok(!template.includes('??'), 'no PS7 null-coalescing operator');

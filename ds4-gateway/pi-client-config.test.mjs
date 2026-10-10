@@ -213,3 +213,71 @@ test('a missing or malformed template block is refused', () => {
   assert.throws(() => build({template: {...template(), compat: null}}), /compat/i);
   assert.throws(() => build({template: {...template(), model: null}}), /model/i);
 });
+
+// --- served client defaults: default model + thinking level -----------------
+// The pool must be what the client starts on. Until now the bundle only said how
+// to CONNECT; the default model and thinking level live in the client's
+// settings.json, so without these the client would join the pool but keep
+// starting on whatever model it had before.
+
+test('the bundle makes the pool the default model and carries a thinking level', () => {
+  const bundle = build();
+  assert.equal(bundle.defaults.apply, true);
+  assert.equal(bundle.defaults.model.defaultProvider, PI_CLIENT_PROVIDER);
+  assert.equal(bundle.defaults.model.defaultModel, 'PoolModel');
+  assert.equal(bundle.defaults.model.defaultThinkingLevel, 'high');
+});
+
+test('an operator can pin a different thinking level without a code change', () => {
+  const bundle = build({template: mergePiClientTemplate(template(), {defaults: {model: {defaultThinkingLevel: 'low'}}})});
+  assert.equal(bundle.defaults.model.defaultThinkingLevel, 'low');
+});
+
+test('a thinking level Pi cannot map is refused rather than served', () => {
+  // Serving an unknown level would leave the client unable to resolve a
+  // thinking setting at startup.
+  assert.throws(() => build({template: mergePiClientTemplate(template(), {defaults: {model: {defaultThinkingLevel: 'turbo'}}})}),
+    /Unknown default thinking level/);
+});
+
+test('a null thinking level is honoured as "no default", not as a missing value', () => {
+  const bundle = build({template: mergePiClientTemplate(template(), {defaults: {model: {defaultThinkingLevel: null}}})});
+  assert.equal(bundle.defaults.model.defaultThinkingLevel, null);
+});
+
+test('changing the served defaults changes the revision so clients re-sync', () => {
+  const before = build();
+  const after = build({template: mergePiClientTemplate(template(), {defaults: {model: {defaultThinkingLevel: 'max'}}})});
+  assert.notEqual(before.revision, after.revision);
+  assert.notEqual(piClientRevision(before), piClientRevision(after));
+});
+
+test('purge defaults to nothing, so a routine sync is never destructive', () => {
+  const bundle = build();
+  assert.deepEqual(bundle.purgeProviders, []);
+});
+
+test("purge 'all' keeps only the synced provider, without naming the others", () => {
+  // Roster-independent: a hardcoded list of every other provider would rot as
+  // the fleet changes, and would silently miss one.
+  const bundle = build({template: mergePiClientTemplate(template(), {purgeProviders: 'all'})});
+  assert.equal(bundle.purgeProviders, 'all');
+});
+
+test('an explicit purge list is carried through as given', () => {
+  const bundle = build({template: mergePiClientTemplate(template(), {purgeProviders: ['m3-lane', 'old-spark']})});
+  assert.deepEqual(bundle.purgeProviders, ['m3-lane', 'old-spark']);
+});
+
+test('a purge list is copied, so a caller cannot mutate the served bundle', () => {
+  const source = ['a-lane'];
+  const bundle = build({template: mergePiClientTemplate(template(), {purgeProviders: source})});
+  source.push('b-lane');
+  assert.deepEqual(bundle.purgeProviders, ['a-lane']);
+});
+
+test('purge changes the revision', () => {
+  const before = build();
+  const after = build({template: mergePiClientTemplate(template(), {purgeProviders: 'all'})});
+  assert.notEqual(before.revision, after.revision);
+});

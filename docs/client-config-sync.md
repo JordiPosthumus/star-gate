@@ -52,17 +52,60 @@ live base URL, the fallback URLs and the constant key. Body behaviour, in order:
 5. Merge **only** `providers[dsg-pool]`. Every other provider is preserved and
    semantically unchanged. (The file is re-serialized, so do not expect
    byte-identical formatting; a re-parse deep-compare is the right check.)
-6. Write atomically (temp file, then move over the target).
-7. Validate the written file, then check whether `pi` is present and report its
-   version.
-8. Report each stage to `/v1/client/pi/report`.
+6. Optionally **purge** other providers — see "Pinning a client to the pool".
+7. Write atomically (temp file, then move over the target).
+8. Validate the written file.
+9. Optionally **adopt the served defaults** — default provider, default model and
+   default thinking level in `settings.json`. This runs only after `models.json`
+   is written and verified, so `pi` is never pointed at a provider that failed to
+   land. `settings.json` is backed up to `settings.json.<stamp>.bak` first, and
+   only `defaultProvider`, `defaultModel` and `defaultThinkingLevel` are ever
+   touched — every other setting (packages, extensions, subagent config) is
+   preserved.
+10. Check whether `pi` is present and report its version.
+11. Report each stage to `/v1/client/pi/report`.
 
-`-Check` parses and validates without writing. `-Test` runs the whole flow
-against the live gateway without touching `models.json`.
+`-Check` parses and validates without writing. `-Test` additionally runs a live
+`pi -p` probe through the pool.
 
 The script must run on Windows PowerShell 5.1 as well as PowerShell 7. Every
 `ConvertTo-Json` call passes `-Depth 100`, because the default depth of 2
 silently truncates the nested model structure.
+
+## Pinning a client to the pool
+
+Two bundle fields change what the client ends up running, and both are
+**off unless configured**. They are set per-install in `config.local.json`, under
+`pi_client` (which shallow-merges over `ds4-gateway/pi-client-defaults.json`):
+
+```json
+"pi_client": {
+  "purgeProviders": "all",
+  "defaults": {"model": {"defaultThinkingLevel": "high"}}
+}
+```
+
+- `purgeProviders` — `[]` (default) removes nothing. `"all"` keeps **only** the
+  synced provider and deletes every other entry under `providers`. A named array
+  removes just those. It is roster-independent on purpose: a hardcoded list of
+  every other provider would rot as the fleet changes and silently miss one. The
+  removals happen after the backup, so they are recoverable.
+- `defaults.model.defaultThinkingLevel` — `off | minimal | low | medium | high |
+  xhigh | max`, defaulting to `high` when the key is absent. Set it to `null` to
+  serve no default level at all, in which case the script **removes** the key and
+  the client keeps its own setting. Any other value is refused at build time with
+  `Unknown default thinking level`, rather than handed to a client that could not
+  map it.
+- `defaults.model.defaultProvider` / `defaultModel` default to the synced
+  provider and the pool label; override only to point at something else.
+
+`defaults.apply` is set by the builder, not the operator. Set it to `false` only
+to serve a bundle with no default-model section at all, in which case step 9 is
+skipped.
+
+Because `defaults` and `purgeProviders` are part of the bundle's semantic
+fields, changing either changes `revision` — an already-synced client will see a
+different revision and know a re-sync will do something.
 
 ## Running it
 
