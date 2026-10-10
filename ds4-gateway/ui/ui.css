@@ -187,3 +187,14 @@
 /* Archived services toggle: presentation only, sits under the servers heading. */
 #archive-toggle{margin:0 0 6px}
 #archive-toggle[hidden]{display:none}
+
+/* Load-balancing math: read-only explanation of the routing rule and values. */
+.routing-math-rule{margin:10px 0 0;font-size:11px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.routing-math-line{margin:6px 0 0;font-size:10.5px;color:var(--muted)}
+.routing-math-counters{list-style:none;display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0;padding:0}
+.routing-math-counters li{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--panel)}
+.routing-math-counters span{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+.routing-math-counters b{font-size:12px;color:var(--text);font-weight:500}
+.routing-math-table{margin-top:10px}
+.routing-math-ok{color:var(--accent)}
+.routing-math-no{color:var(--muted)}

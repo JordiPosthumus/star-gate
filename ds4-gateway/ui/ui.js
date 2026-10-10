@@ -495,6 +495,46 @@ function renderArchiveToggle(count){
   button.textContent=showArchived?'Hide archived services':`Show ${count} archived service${count===1?'':'s'}`;
   button.setAttribute('aria-pressed',String(showArchived));
 }
+// Load-balancing math: what the gateway records and the rule it applies.
+// Read-only display of values the core already publishes; it never changes routing.
+function renderRoutingMath(s,now){
+  const container=$('routing-math');if(!container)return;
+  const rt=s?.gateway?.routing_time;
+  const wasOpen=container.querySelector('details')?.open??false;
+  if(!rt){
+    container.innerHTML='<details class="catalogue"><summary>Load-balancing math</summary><p class="muted">Routing observations are unavailable in this snapshot.</p></details>';
+    return;
+  }
+  const num=value=>Number.isFinite(value)?fmt(Math.round(value*100)/100):'—';
+  const secs=value=>Number.isFinite(value)?`${fmt(Math.round(value*10)/10)}s`:'—';
+  const fit=rt.fit;
+  const last=rt.last;
+  const margin=Number.isFinite(rt.margin_seconds)?rt.margin_seconds:null;
+  const counters=[
+    ['Evaluations',fmt(rt.evaluations)],
+    ['Errors',fmt(rt.errors)],
+    ['Output-length samples',fmt(rt.outputSamples)],
+    ['Verified speed samples',fmt(rt.speedSamples)],
+    ['Margin',margin===null?'—':`${fmt(margin)}s`],
+    ['Mode',rt.mode==='active'?'active':rt.enabled?'observation only':'off'],
+  ];
+  const fitLine=fit&&Number.isFinite(fit.mu)
+    ? `Fitted output length: mean ${num(fit.mu)} · sigma ${num(fit.sigma)} · ${fmt(fit.sampleCount)} samples`
+    : 'Fitted output length: not enough samples yet';
+  const rule=`Move a queued request only when the other server finishes earlier by more than the margin: T_other + ${margin===null?'margin':fmt(margin)+'s'} &lt; T_current.`;
+  const decision=last
+    ? `<p class="routing-math-line"><b>Last decision</b> ${esc(last.action??'—')} · ${esc(String(last.reason??'—').replace(/_/g,' '))} · ${esc(last.source??'—')} → ${esc(last.destination??'—')}${Number.isFinite(last.savingSeconds)?` · predicted saving ${secs(last.savingSeconds)}`:' · no predicted saving'}${Number.isFinite(last.marginSeconds)?` · margin ${fmt(last.marginSeconds)}s`:''}</p>`
+    : '<p class="routing-math-line muted">No routing decision recorded yet.</p>';
+  const candidates=Array.isArray(last?.candidates)?last.candidates:[];
+  const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${esc(String(c.reason??'—').replace(/_/g,' '))}</td></tr>`).join('');
+  container.innerHTML=`<details class="catalogue"${wasOpen?' open':''}><summary>Load-balancing math — the numbers behind routing</summary>
+<p class="routing-math-rule">${rule}</p>
+<p class="routing-math-line">${fitLine}</p>
+${decision}
+<ul class="routing-math-counters">${counters.map(([label,value])=>`<li><span>${esc(label)}</span><b>${esc(value)}</b></li>`).join('')}</ul>
+${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th></tr></thead><tbody>${rows}</tbody></table>`:''}
+</details>`;
+}
 function renderDevices(devices,workers,now,stale,scales,controls) {
   const viewport={x:window.scrollX,y:window.scrollY};
   const container=$('devices'),existing=new Map([...container.querySelectorAll('.device')].map(el=>[el.dataset.workerId,el]));
@@ -931,6 +971,7 @@ function render(s) {
   // The list includes script-only entries that are not routing workers at all.
   archivedWorkers=s.archived_workers??[];
   renderArchiveToggle(archivedWorkers.length);
+  renderRoutingMath(s,now);
   $('capacity-note').title=stale?'Live gateway status is unavailable.':!g?.total?'No model servers are registered. Open Settings to add your first endpoint.':schedulingExplanation(g,visibleWorkers,cap).trim();
   if(s.fleet_power?.control&&workerControlsReady&&!fleetPowerPolling){fleetPowerPolling=true;void fetch('/api/workers/power',{headers:{}}).then(r=>r.ok?r.json():null).then(p=>{fleetPower=p&&p.enabled!==undefined?p:null;renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,lastDevicesSpec.now,lastDevicesSpec.stale,lastDevicesSpec.scales,lastDevicesSpec.controls);}).catch(()=>{}).finally(()=>{fleetPowerPolling=false;});}
   lastDevicesSpec={devices:s.devices.map(d=>({...d,cache_continuity:s.cache_continuity,performance_history:s.performance_lights})),workers:visibleWorkers,now,stale,scales,controls:workerControlsVisible};
