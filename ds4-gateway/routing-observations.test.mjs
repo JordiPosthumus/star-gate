@@ -29,6 +29,42 @@ test('request metadata keeps hashes and estimated text length, with no invented 
   assert.notEqual(routingIdentity({id:'a',url:'one'},'glm'),routingIdentity({id:'a',url:'two'},'glm'));
 });
 
+// Every accepted inference route must yield a finite input size. Two of the four
+// live routes (messages, responses) name their input differently; before this
+// was covered they produced no size at all, which is precisely the
+// 'input_size_unavailable' that left the fast lanes unscoreable while a slow
+// measured lane won placement.
+test('every accepted inference route yields an estimable input size',()=>{
+  const text='a'.repeat(400);
+  const cases=[
+    ['/v1/chat/completions',{messages:[{role:'user',content:text}]}],
+    ['/v1/completions',{prompt:text}],
+    ['/v1/responses',{input:text}],
+    ['/v1/messages',{messages:[{role:'user',content:text}]}],
+    ['/v1/messages',{system:text,messages:[{role:'user',content:'hi'}]}],
+  ];
+  for(const [route,body] of cases){
+    const meta=routingRequestMetadata(body,route);
+    assert.ok(meta,`${route} must produce metadata`);
+    assert.equal(meta.inputEvidence,'estimated_bytes',`${route} must record an input evidence tier`);
+    assert.ok(Number.isSafeInteger(meta.inputTokens)&&meta.inputTokens>0,`${route} must yield input tokens, got ${meta.inputTokens}`);
+  }
+});
+
+test('the output allowance is read from whichever route names it',()=>{
+  // Responses API calls it max_output_tokens; chat/completions use max_tokens.
+  assert.equal(routingRequestMetadata({input:'x',max_output_tokens:64},'/v1/responses').outputLimit,64);
+  assert.equal(routingRequestMetadata({messages:[],max_tokens:32},'/v1/messages').outputLimit,32);
+});
+
+test('a route that carries no readable text still abstains rather than guessing',()=>{
+  // An unrecognised route must not be sized from an absent field.
+  assert.equal(routingRequestMetadata({messages:[]},'/v1/embeddings'),null);
+  const empty=routingRequestMetadata({},'/v1/messages');
+  assert.equal(empty.inputTokens,null);
+  assert.equal(empty.inputEvidence,'unavailable');
+});
+
 test('disabled observer creates no files or history',async t=>{
   const filename=fixture(t),monitor=new RoutingObservations({filename});
   complete(monitor);monitor.observeNative(worker,native(1000,20),[job]);await monitor.close();

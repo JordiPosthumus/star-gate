@@ -21,19 +21,39 @@ export const routingIdentity = (node, model, profile = null) => hash({worker: no
   backend: node.backend, model, context: node.contextLength ?? node.context_length,
   capacity: node.max_concurrent_requests, aliases: node.effectiveModelAliases ?? node.model_aliases, profile});
 
+// The text a route carries as request input, so the estimator can size it. Each
+// accepted inference route names its input differently; a route we cannot read
+// yields null and leaves the estimate unavailable FOR THAT REQUEST ONLY, which is
+// strictly better than manufacturing a size. Sizing everything as chat/completions
+// would have silently produced a token count of `undefined -> null` on two of the
+// four live routes, and `null` is exactly the `input_size_unavailable` that kept
+// the fast lanes unscoreable.
+function requestInputText(body, route) {
+  if (route === '/v1/chat/completions') return body.messages;
+  if (route === '/v1/completions') return body.prompt;
+  // Responses API: `input` is a string or an array of items.
+  if (route === '/v1/responses') return body.input;
+  // Messages API: `system` is a separate top-level field, not a message turn.
+  if (route === '/v1/messages') return body.system === undefined ? body.messages
+    : {system: body.system, messages: body.messages};
+  return null;
+}
+
 export function routingRequestMetadata(body, route) {
   if (!body || typeof body !== 'object' || Array.isArray(body)
-    || !['/v1/chat/completions', '/v1/completions'].includes(route)) return null;
-  const input = body.messages ?? body.prompt;
+    || !['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses'].includes(route)) return null;
+  const input = requestInputText(body, route);
+  const routable = input !== undefined && input !== null;
   // Image/audio token accounting needs a native adapter; encoded bytes are not
   // text tokens. This abstention changes only an estimate, never forwarding.
   const text = JSON.stringify({input, tools: body.tools});
   const multimodal = /"(?:image_url|input_audio|input_image|video_url)"/.test(text);
-  const limits = ['max_completion_tokens', 'max_tokens'].filter(key => Object.hasOwn(body, key)).map(key => body[key]);
+  const limits = ['max_completion_tokens', 'max_tokens', 'max_output_tokens']
+    .filter(key => Object.hasOwn(body, key)).map(key => body[key]);
   const outputLimit = limits.length && limits.every(value => count(value) && value === limits[0]) ? limits[0] : null;
   const settings = Object.fromEntries(Object.entries(body).filter(([key]) => !['messages', 'prompt', 'stream', 'stream_options'].includes(key)));
-  return {inputTokens: input !== undefined && !multimodal ? Math.ceil(Buffer.byteLength(text) / 4) : null,
-    inputEvidence: input !== undefined && !multimodal ? 'estimated_bytes' : 'unavailable', outputLimit,
+  return {inputTokens: routable && !multimodal ? Math.ceil(Buffer.byteLength(text) / 4) : null,
+    inputEvidence: routable && !multimodal ? 'estimated_bytes' : 'unavailable', outputLimit,
     singleChoice: body.n === undefined || body.n === 1,
     template: hash({route, settings}),
     messages: Array.isArray(body.messages) && body.messages.length <= 512 ? body.messages.map(message => hash(message)) : null};
