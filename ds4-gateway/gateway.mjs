@@ -501,10 +501,30 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     redactHosts:[config.host,...lanAddresses(config).map(url=>new URL(url).hostname)].filter(host=>typeof host==='string'&&host.length>0)});
   // Advertise the address clients actually reach: the Door's bind host and port,
   // never the core's private port.
-  const piClientBaseUrls=()=>{
+  //
+  // The Host header the caller used OUTRANKS any advertised list. The Mac's
+  // Bonjour name (.local) is advertised first because it survives DHCP changes,
+  // but a Windows client without Bonjour cannot resolve it at all — so a client
+  // that reached us by LAN IP would be handed a .local base URL it can never
+  // use, and would only discover that when its first inference failed. Echoing
+  // the name the client itself resolved keeps the written config reachable by
+  // construction. Only a hostname or IP is accepted, never a URL or encoded
+  // characters, so the header cannot inject structure into the client config.
+  const clientReachableHost=req=>{
+    const raw=req.headers.host;
+    if(typeof raw!=='string'||raw.length>255)return null;
+    const host=raw.trim();
+    if(!/^[a-zA-Z0-9](?:[a-zA-Z0-9.\-]{0,251}[a-zA-Z0-9])?(?::\d{1,5})?$/.test(host))return null;
+    return host;
+  };
+  const piClientBaseUrls=req=>{
     const urls=lanAddresses(config);
     const details=lanSharingDetails({urls},config.port);
-    const ordered=details.urls?.length?details.urls:[`http://127.0.0.1:${config.port}/v1`];
+    const advertised=details.urls?.length?details.urls:[`http://127.0.0.1:${config.port}/v1`];
+    const reached=clientReachableHost(req);
+    // Demote, never drop: the advertised list stays as fallbacks, so a client
+    // that later moves between networks still has the known-good addresses.
+    const ordered=reached?[`http://${reached}/v1`,...advertised.filter(url=>url!==`http://${reached}/v1`)]:advertised;
     return {baseUrl:ordered[0],fallbackBaseUrls:ordered.slice(1)};
   };
   const lastOperatorAction=id=>Object.hasOwn(store.data.operator_action_heads??{},id)?store.data.operator_action_heads[id]:[...(store.data.operator_actions??[])].reverse().find(action=>action.workers.includes(id))??null;
@@ -1416,14 +1436,14 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     }
     if(route===`GET ${PI_CLIENT_BUNDLE_ROUTE}`){
       req.resume();
-      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls();
+      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls(req);
       try{
         return json(res,200,buildPiClientBundle({baseUrl,fallbackBaseUrls,poolModel:config.model,contextWindow:contextLimit(),template:piClientTemplate,generatedAt:new Date().toISOString()}));
       }catch(e){return error(res,503,'pi_client_bundle_unavailable',dsgReport('Client bundle could not be built.'));}
     }
     if(route===`GET ${PI_CLIENT_SCRIPT_ROUTE}`){
       req.resume();
-      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls();
+      const {baseUrl,fallbackBaseUrls}=piClientBaseUrls(req);
       const template=piClientScriptTemplate();
       if(!template)return error(res,503,'pi_client_script_unavailable',dsgReport('Client script is not installed on this gateway.'));
       let script;

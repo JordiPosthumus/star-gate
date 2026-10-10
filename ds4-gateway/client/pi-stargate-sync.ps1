@@ -215,10 +215,22 @@ try {
   $script:Revision = Sanitize-Text ([string]$bundle.revision) 64
   Add-ReportStep 'parse' $true ('bundle revision ' + $script:Revision)
 
+  # The bundle's base_url is authoritative (the gateway echoes the address this
+  # client actually reached, so it is reachable by construction). If it still
+  # differs from the address we just fetched from, prefer the one that is PROVEN
+  # to work: the fetch that got us here succeeded, so $script:WorkingBase
+  # answered. Writing a base_url we never reached is exactly the fault that made
+  # a Windows client sync 'successfully' and then fail on its first inference.
+  $bundleBaseUrl = [string]$bundle.base_url
+  if ($script:WorkingBase -and ($bundleBaseUrl.TrimEnd('/') -ne $script:WorkingBase.TrimEnd('/'))) {
+    Add-ReportStep 'parse' $true ('base_url ' + (Sanitize-Text $bundleBaseUrl 256) + ' is unreached here; using the address that answered')
+    $bundleBaseUrl = [string]$script:WorkingBase
+  }
+
   # The provider object shape is pinned by plan 3.2b: baseUrl, api, apiKey,
   # models[] (always an array), and compat at the PROVIDER level.
   $providerObject = [ordered]@{
-    baseUrl = [string]$bundle.base_url
+    baseUrl = $bundleBaseUrl
     api = [string]$bundle.api
     apiKey = [string]$bundle.api_key
     models = @(

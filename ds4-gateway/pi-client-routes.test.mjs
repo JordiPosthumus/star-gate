@@ -188,3 +188,60 @@ test('client reports never enter scheduling, the journal or a worker request', a
   // The default dashboard route is the only place it surfaces.
   assert.equal(r.gateway.stats().pi_client.reports.length, 1);
 });
+
+// --- the base URL the client is told to use --------------------------------
+// A Windows client with no Bonjour cannot resolve the Mac's .local name, so a
+// client that reached the gateway by LAN IP must not be handed a .local base
+// URL: it would sync "successfully" and then fail on its first inference, which
+// is exactly what happened to the first real Windows client.
+// 203.0.113.0/24 is TEST-NET-3, reserved for documentation, so no real fleet
+// address is ever committed here.
+
+test('a client that reached us by IP is given that IP, not the Bonjour name', async t => {
+  const r = await rig(t);
+  const res = await r.request({path: '/v1/client/pi', headers: {host: '203.0.113.7:30000'}});
+  assert.equal(res.status, 200);
+  const bundle = JSON.parse(res.body);
+  assert.equal(bundle.base_url, 'http://203.0.113.7:30000/v1');
+  assert.match(res.headers['content-type'], /application\/json/);
+});
+
+test('the advertised list survives as fallbacks, so a move between networks still works', async t => {
+  const r = await rig(t);
+  const bundle = JSON.parse((await r.request({path: '/v1/client/pi', headers: {host: '203.0.113.7:30000'}})).body);
+  for (const url of bundle.fallback_base_urls ?? []) {
+    assert.match(url, /^http:\/\/[^/]+:\d+\/v1$/);
+    assert.notEqual(url, bundle.base_url, 'a fallback must differ from the primary');
+  }
+  assert.match(bundle.base_url, /^http:\/\/203\.0\.113\.7:30000\/v1$/);
+});
+
+test('a hostname Host header is honoured as given', async t => {
+  const r = await rig(t);
+  const bundle = JSON.parse((await r.request({path: '/v1/client/pi', headers: {host: 'pi-host.invalid:30000'}})).body);
+  assert.equal(bundle.base_url, 'http://pi-host.invalid:30000/v1');
+});
+
+test('a malformed Host header is refused and the advertised address is used', async t => {
+  // The header must never inject structure into the written client config.
+  for (const host of ['http://evil.invalid', 'a b', "x'@y", 'a/../b', '']) {
+    const r = await rig(t);
+    const bundle = JSON.parse((await r.request({path: '/v1/client/pi', headers: {host}})).body);
+    assert.equal(bundle.base_url.indexOf(host) === -1 || host === '', true, `Host ${JSON.stringify(host)} leaked into base_url`);
+    assert.match(bundle.base_url, /^http:\/\/[^/]+:\d+\/v1$/);
+  }
+});
+
+test('the served script preamble carries the reached address too', async t => {
+  const r = await rig(t);
+  const res = await r.request({path: '/v1/client/pi/install.ps1', headers: {host: '203.0.113.9:30000'}});
+  assert.equal(res.status, 200);
+  assert.match(res.body, /\$StargateBaseUrl = 'http:\/\/203\.0\.113\.9:30000\/v1'/);
+});
+
+test('without a Host header the advertised address is still used', async t => {
+  const r = await rig(t);
+  const res = await r.request({path: '/v1/client/pi', headers: {host: ''}});
+  assert.equal(res.status, 200);
+  assert.match(JSON.parse(res.body).base_url, /^http:\/\/[^/]+:\d+\/v1$/);
+});
