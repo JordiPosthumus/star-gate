@@ -47,7 +47,10 @@ live base URL, the fallback URLs and the constant key. Body behaviour, in order:
 
 1. Read the existing `%USERPROFILE%\.pi\agent\models.json` if it exists.
 2. Back it up to `models.json.<yyyyMMddTHHmmssZ>.bak`.
-3. Fetch the bundle — preferred host first, then each fallback URL.
+3. Fetch the bundle — preferred host first, then each fallback URL. The gateway
+   echoes the address this client actually reached as the primary `base_url`,
+   with the advertised LAN addresses kept as fallbacks, so the written config is
+   reachable from wherever the client fetched it.
 4. Parse and validate the nested structure before writing anything.
 5. Merge **only** `providers[dsg-pool]`. Every other provider is preserved and
    semantically unchanged. (The file is re-serialized, so do not expect
@@ -100,6 +103,26 @@ PI_CODING_AGENT_DIR=/tmp/pi-agent-dir /path/to/pwsh -NoProfile \
 
 `-Check` parses and diffs without writing; it writes nothing and creates no
 backup.
+
+## Reaching the gateway from another machine
+
+`base_url` in the served bundle is the address the requesting client actually
+reached, taken from the `Host` header, with the advertised LAN addresses kept as
+fallbacks. This matters because the Mac advertises its Bonjour name
+(`<Name>.local`) first by design: it survives DHCP changes. **A Windows client
+with no Bonjour installed cannot resolve `.local` at all**, so a client that
+reached the gateway by LAN IP used to be handed a base URL it could never use —
+it synced "successfully" and then failed on its first inference.
+
+With the echo in place, fetching the script by `http://<ip>:30000/v1/...` writes
+`http://<ip>:30000/v1` into the client. The advertised list is demoted to
+fallbacks, never dropped, so a machine that later moves between networks still
+has the known-good addresses. The header is accepted only as a hostname or IP,
+so it cannot inject structure into the written config.
+
+The sync script does not trust the bundle's `base_url` blindly either: if it
+differs from the address the fetch actually succeeded on, the script keeps the
+address that answered and reports the substitution.
 
 ## Pinning a client to the pool
 
