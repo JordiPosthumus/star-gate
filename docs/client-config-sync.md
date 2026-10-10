@@ -72,6 +72,35 @@ The script must run on Windows PowerShell 5.1 as well as PowerShell 7. Every
 `ConvertTo-Json` call passes `-Depth 100`, because the default depth of 2
 silently truncates the nested model structure.
 
+## Checking the script without a Windows machine
+
+`ds4-gateway/pi-client-script.test.mjs` asserts the script's text, but text
+assertions cannot tell a valid scriptblock from an unclosed one, and this is the
+one deliverable that has to run on a machine we do not own. A real PowerShell
+parser closes that gap:
+
+```sh
+# any pwsh binary: local install, Homebrew, or a downloaded release tarball
+DSG_PWSH=/path/to/pwsh node --test ds4-gateway/pi-client-script.test.mjs
+```
+
+With `DSG_PWSH` set, the suite renders the exact bytes the gateway serves, parses
+them with `ds4-gateway/parse-check.ps1`, and fails on any parser error. Without
+it the test is **skipped, never passed** — so it cannot quietly claim coverage it
+did not get.
+
+To exercise the whole flow on a non-Windows box (parse, merge, purge, backup,
+settings adoption, the `pi -p` probe), point the script at a throwaway agent
+directory and a local PowerShell:
+
+```sh
+PI_CODING_AGENT_DIR=/tmp/pi-agent-dir /path/to/pwsh -NoProfile \
+  -File <served install.ps1> -Test
+```
+
+`-Check` parses and diffs without writing; it writes nothing and creates no
+backup.
+
 ## Pinning a client to the pool
 
 Two bundle fields change what the client ends up running, and both are
