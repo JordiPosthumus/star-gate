@@ -61,7 +61,7 @@ export function completionEstimate({job, worker, service, sessionReadySeconds = 
       if (!item) continue;
       const concurrency = 1 + intervals.filter(interval => interval.start <= time && interval.end > time).length;
       const estimate = service(item, concurrency);
-      if (!nonnegative(estimate?.seconds)) return unknown('service_estimate_unavailable');
+      if (!nonnegative(estimate?.seconds)) return unknown(estimate?.unavailableReason ?? 'service_estimate_unavailable');
       const end = time + estimate.seconds;
       if (!nonnegative(end)) return unknown('completion_estimate_unavailable');
       bookings.push({requestId: item.id, slot, start: time, end, concurrency});

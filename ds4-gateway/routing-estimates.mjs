@@ -118,6 +118,18 @@ function ownRows(worker, phase, samples) {
 
 // Samples are chronological. The owner of history persists them; this function
 // neither changes history nor turns aggregate throughput into a measured row.
+//
+// Evidence tiers, weakest last:
+//   observed  a real measurement at this concurrency on this lane
+//   seeded    this lane's own measurement extrapolated to an unmeasured
+//             concurrency with the approved 10%-per-level default guess
+//   borrowed  no measurement on this lane at all; a same-model peer's rate
+//             extrapolated with the same approved guess
+//   unavailable  nothing to guess from
+// The 0.9-per-level factor is an APPROVED DEFAULT, not a claim: it is the
+// fallback for having no better information, and every tier above carries its
+// label so a consumer can prefer measured rows and the panel can say which
+// number is a guess. It must not outrank real data for the same lane/phase.
 export function phaseSpeed({worker, fleet, samples, phase, concurrency}) {
   if (!['prefill', 'decode'].includes(phase) || !Number.isSafeInteger(concurrency) || concurrency < 1)
     throw new Error('Specify a phase and positive execution concurrency.');
@@ -141,6 +153,16 @@ export function phaseSpeed({worker, fleet, samples, phase, concurrency}) {
   const rate = solo * 0.9 ** (concurrency - 1);
   return {tokensPerSecond: positive(rate) ? rate : null, evidence: 'borrowed', concurrency,
     donorScope: sameModel.length ? 'same_model' : 'fleet', donorCount: selected.length};
+}
+
+// How much a speed row can be trusted, so a caller can prefer a measurement over
+// a guess. Higher is better; 'unavailable' is 0.
+export const SPEED_EVIDENCE_RANK = {observed: 3, seeded: 2, borrowed: 1, unavailable: 0};
+export const speedEvidenceRank = evidence => SPEED_EVIDENCE_RANK[evidence] ?? 0;
+
+// The concurrency levels this lane has actually been measured at for a phase.
+export function measuredConcurrency({worker, samples, phase}) {
+  return [...ownRows(worker, phase, samples).keys()].sort((a, b) => a - b);
 }
 
 export function inputEstimate(job, worker) {
@@ -167,10 +189,17 @@ function workEstimate({job, worker, fleet, samples, concurrency, outputModel, sp
     : input.tokens === null ? null : Math.max(0, input.tokens - (progress?.computedInputTokens ?? 0));
   const prefillSeconds = secondsFor(remainingInput, prefill.tokensPerSecond);
   const decodeSeconds = secondsFor(output.tokens, decode.tokensPerSecond);
-  const seconds = prefillSeconds === null || decodeSeconds === null || !nonnegative(restorationSeconds)
+  const restorationInvalid = !nonnegative(restorationSeconds);
+  const seconds = prefillSeconds === null || decodeSeconds === null || restorationInvalid
     ? null : prefillSeconds + decodeSeconds + restorationSeconds;
+  // Name the missing input so the decision panel can explain a candidate that
+  // has no estimate, instead of a bare 'unavailable'.
+  const unavailableReason = seconds !== null ? null
+    : restorationInvalid ? 'restoration_invalid'
+    : prefillSeconds === null ? (prefill.evidence === 'unavailable' ? 'prefill_speed_unavailable' : 'input_size_unavailable')
+    : 'decode_speed_unavailable';
   return {seconds: nonnegative(seconds) ? seconds : null, concurrency, input, output, prefill, decode,
-    remainingInputTokens: remainingInput, prefillSeconds, decodeSeconds, restorationSeconds};
+    remainingInputTokens: remainingInput, prefillSeconds, decodeSeconds, restorationSeconds, unavailableReason};
 }
 
 export const serviceEstimate = options => workEstimate(options);

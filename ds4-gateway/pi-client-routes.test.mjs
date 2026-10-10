@@ -72,29 +72,30 @@ test('the bundle is deterministic apart from generated_at', async t => {
   assert.ok(Date.parse(second.generated_at) >= Date.parse(first.generated_at));
 });
 
-test('GET /v1/client/pi/install.ps1 serves the rendered script as text', async t => {
+test('GET /v1/client/pi/install.ps1 serves the committed script as text', async t => {
   const r = await rig(t);
-  // The asset is NOT committed yet (delivered by the Pi agent); the route must
-  // still answer a typed 503 rather than crash the gateway.
-  const missing = await r.request({path: '/v1/client/pi/install.ps1'});
-  assert.equal(missing.status, 503);
-  assert.equal(JSON.parse(missing.body).error.code, 'pi_client_script_unavailable');
+  // The committed asset ships with the repo; the route serves it rendered with
+  // the live base URL and never as JSON.
+  const res = await r.request({path: '/v1/client/pi/install.ps1'});
+  assert.equal(res.status, 200);
+  assert.match(res.headers['content-type'], /text\/plain/);
+  assert.match(res.headers['content-disposition'], /pi-stargate-sync\.ps1/);
+  // No credential material may be rendered into the script.
+  assert.match(res.body, /\$StargateApiKey\s*= 'none'/);
+  assert.ok(!/Bearer [A-Za-z0-9._~+/=-]{8,}/.test(res.body), 'no real bearer token in the rendered script');
 });
 
 test('the script route renders a template injected with the live base URL', async t => {
   const r = await rig(t);
-  const asset = path.join(path.dirname(new URL(import.meta.url).pathname), 'client', 'pi-stargate-sync.ps1');
-  fs.mkdirSync(path.dirname(asset), {recursive: true});
-  const created = !fs.existsSync(asset);
-  if (created) fs.writeFileSync(asset, '# test template body\nWrite-Output $StargateBaseUrl\n');
-  t.after(() => { if (created) fs.rmSync(asset, {force: true}); });
   const res = await r.request({path: '/v1/client/pi/install.ps1'});
   assert.equal(res.status, 200);
   assert.match(res.headers['content-type'], /text\/plain/);
   assert.match(res.headers['content-disposition'], /pi-stargate-sync\.ps1/);
   assert.match(res.body, /\$StargateBaseUrl = 'http:\/\/[^']+\/v1'/);
   assert.match(res.body, /\$StargateApiKey\s*= 'none'/);
-  assert.match(res.body, /# test template body/, 'the committed body must be preserved');
+  // The committed body must survive the preamble injection intact.
+  assert.match(res.body, /# --- committed body follows ---/);
+  assert.match(res.body, /function Send-Report/, 'the committed body must be preserved');
 });
 
 test('POST /v1/client/pi/report accepts a valid report and exposes it in stats', async t => {

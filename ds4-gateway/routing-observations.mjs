@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
-import {fitOutputLengths, remainingServiceEstimate, serviceEstimate} from './routing-estimates.mjs';
+import {fitOutputLengths, phaseSpeed, remainingServiceEstimate, serviceEstimate} from './routing-estimates.mjs';
 import {chooseRoute} from './routing-plan.mjs';
 
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -69,21 +69,37 @@ export class RoutingObservations {
   // engine) from single clean request windows, and reports the concurrency the
   // rows were measured at so a stale or empty lane is visible rather than implied.
   // Parked history is deliberately excluded: it is not evidence the estimator uses.
+  //
+  // `tokensPerSecond` is the pooled rate across ALL concurrency levels and is
+  // therefore only comparable between lanes measured at a similar mix. The
+  // per-concurrency rows are the honest curve; `tokensPerSecond` is kept for
+  // continuity and labelled as pooled so it is never read as a single-lane rate.
   speedSummary() {
     const byWorker = new Map();
     for (const sample of this.samples) {
       if (!sample || !['prefill', 'decode'].includes(sample.phase)) continue;
       const key = `${sample.workerId}\u0000${sample.phase}`;
       const row = byWorker.get(key) ?? {workerId: sample.workerId, phase: sample.phase, samples: 0,
-        engineAggregate: 0, cleanWindow: 0, concurrency: new Map(), tokens: 0, seconds: 0};
+        engineAggregate: 0, cleanWindow: 0, concurrency: new Map(), rate: new Map(), tokens: 0, seconds: 0};
       row.samples++; if (sample.engineAggregate === true) row.engineAggregate++; else row.cleanWindow++;
       row.concurrency.set(sample.concurrency, (row.concurrency.get(sample.concurrency) ?? 0) + 1);
+      // Same last-10 window and median the estimator itself uses, so the display
+      // shows what placement is actually working from.
+      const rates = row.rate.get(sample.concurrency) ?? [];
+      rates.push(sample.tokens / sample.seconds);
+      row.rate.set(sample.concurrency, rates.slice(-10));
       row.tokens += sample.tokens; row.seconds += sample.seconds;
       byWorker.set(key, row);
     }
+    const median = values => {
+      const sorted = [...values].sort((a, b) => a - b), n = sorted.length;
+      return n % 2 ? sorted[(n - 1) / 2] : (sorted[n - 1 >> 1] + sorted[n >> 1]) / 2;
+    };
     return [...byWorker.values()].map(row => ({workerId: row.workerId, phase: row.phase, samples: row.samples,
       engineAggregate: row.engineAggregate, cleanWindow: row.cleanWindow,
       tokensPerSecond: row.seconds > 0 ? row.tokens / row.seconds : null,
+      pooledRate: true,
+      byConcurrency: [...row.rate.entries()].sort((a, b) => a[0] - b[0]).map(([value, rates]) => ({value, count: row.concurrency.get(value), tokensPerSecond: median(rates)})),
       concurrency: [...row.concurrency.entries()].sort((a, b) => a[0] - b[0]).map(([value, count]) => ({value, count}))}))
       .sort((a, b) => a.workerId.localeCompare(b.workerId) || a.phase.localeCompare(b.phase));
   }
@@ -127,15 +143,43 @@ export class RoutingObservations {
         else if(serial.requestId!==job.id)serial.invalid=true;
         if(concurrency!==1)serial.invalid=true;
       }
-      if(job.routingProgressBasis || !job.dispatched || !job.routingInput)return;
-      const estimate=serviceEstimate({job:this.request(job,fleet),worker,fleet,samples:this.samples,concurrency,
+      // Record a dispatch basis on the job itself for EVERY request, not only
+      // when a full estimate resolves. A request whose lane had no per-concurrency
+      // measurement yet still has a known dispatch instant, known remaining input
+      // and a default speed guess; without a basis the request contributes NO
+      // progress, its lane reads 'running_progress_unavailable' for its whole
+      // lifetime, and a lane that is merely slower-but-measured wins placement
+      // against a faster lane that cannot be scored at all. The basis is an
+      // estimate captured once at dispatch (never a retrospective slowdown) and is
+      // labelled 'estimated' wherever it is consumed.
+      if (job.routingProgressBasis || !job.dispatched || !job.routingInput) return;
+      const request = this.request(job, fleet);
+      const estimate=serviceEstimate({job:request,worker,fleet,samples:this.samples,concurrency,
         outputModel:{fit:fitOutputLengths(this.outputs)}});
-      if(!count(estimate.input.tokens)||!(estimate.prefill.tokensPerSecond>0)||!(estimate.decode.tokensPerSecond>0))return;
+      const inputTokens = count(estimate.input.tokens) ? estimate.input.tokens
+        : count(request.inputTokens) ? request.inputTokens : null;
+      const prefill = estimate.prefill.tokensPerSecond > 0 ? estimate.prefill.tokensPerSecond
+        : this.basisSpeed(worker, fleet, 'prefill', concurrency);
+      const decode = estimate.decode.tokensPerSecond > 0 ? estimate.decode.tokensPerSecond
+        : this.basisSpeed(worker, fleet, 'decode', concurrency);
+      if (!count(inputTokens) || !(prefill > 0) || !(decode > 0)) return;
       // This is an estimate captured once at dispatch, never a retrospective
-      // slowdown of existing work when considering a new candidate.
-      job.routingProgressBasis={at:job.dispatched,identity:worker.identity,inputTokens:estimate.input.tokens,
-        prefill:estimate.prefill.tokensPerSecond,decode:estimate.decode.tokensPerSecond,concurrency};
+      // slowdown of existing work when considering a new candidate. `evidence`
+      // records whether BOTH phase speeds were this lane's own measurement
+      // ('observed') or whether either came from the approved default guess
+      // ('estimated'), so the panel can label the guess rather than present it
+      // as a measurement.
+      const measured = estimate.input.tokens !== null && count(estimate.input.tokens)
+        && estimate.prefill.evidence === 'observed' && estimate.decode.evidence === 'observed';
+      job.routingProgressBasis={at:job.dispatched,identity:worker.identity,inputTokens,prefill,decode,concurrency,
+        evidence: measured ? 'observed' : 'estimated'};
     });
+  }
+  // The approved 0.9-per-level default guess, resolved through the same tiered
+  // phaseSpeed the estimator uses, so a basis can be built for a lane whose
+  // exact concurrency has no row without inventing a separate arithmetic path.
+  basisSpeed(worker, fleet, phase, concurrency) {
+    return phaseSpeed({worker, fleet, samples: this.samples, phase, concurrency}).tokensPerSecond ?? null;
   }
   observeNative(worker, value, jobs) {
     this.attempt(() => {
@@ -157,22 +201,37 @@ export class RoutingObservations {
       this.observeSerial(worker,value,jobs,changed);
       this.observeEnginePhases(worker,value,before,changed);
       if (changed || !value?.connected || !fresh(value.activity_at, this.now()) || !Array.isArray(value.request_rows)) return;
-      const rows = value.request_rows.filter(row => ['prefill', 'decode'].includes(row.phase));
+      // Engine rows carry a phase that can be prefill/decode for measurable work,
+      // or waiting/preparing for requests that have not produced output yet.
+      // Every row is a real engine request, so EVERY row counts toward the
+      // engine-vs-gateway agreement check; only prefill/decode rows yield tokens.
+      // Filtering the count as well (the old behaviour) made any lane with a
+      // queued or cache-restoring request unmeasurable for the whole interval —
+      // an oMLX lane preparing a request could then never contribute a sample,
+      // which is why its throughput never reached the estimator.
+      const all = value.request_rows.filter(row => row && typeof row.id === 'string');
+      const rows = all.filter(row => ['prefill', 'decode'].includes(row.phase));
       const prior = before?.value;
+      const priorAll = prior?.request_rows?.filter(row => row && typeof row.id === 'string') ?? null;
       // A measurement interval must represent the same known gateway requests,
       // with no engine queue, completion, observed membership or phase change.
       if (!prior?.connected || before.identity !== worker.identity || !fresh(prior.activity_at, this.now())
         ||before.workRevision!==worker.workRevision
         || value.waiting !== 0 || prior.waiting !== 0 || !count(value.requests) || value.requests !== prior.requests
         || !count(value.running) || value.running < 1 || value.running !== jobs.length
-        || value.running !== prior.running || rows.length !== value.running || new Set(rows.map(row => row.id)).size !== rows.length
+        || value.running !== prior.running || !priorAll || priorAll.length !== prior.running
+        || all.length !== value.running || new Set(all.map(row => row.id)).size !== all.length
         || before.jobIds !== jobs.map(job => job.id).sort().join(',')) return;
+      // The same requests must be present at both ends, in the same phase, so a
+      // delta is attributable to work (not to a request entering or leaving).
+      const priorPhases = new Map(priorAll.map(row => [row.id, row.phase]));
+      if (all.some(row => priorPhases.get(row.id) !== row.phase)) return;
       const seconds = (value.activity_at - prior.activity_at) / 1000;
       if (!(seconds > 0 && seconds <= 5)) return;
       const known = new Set(jobs.map(job => job.id));
       if (rows.some(row => !known.has(row.id) || row.model !== worker.model)) return;
       for (const row of rows) {
-        const old = prior.request_rows?.find(candidate => candidate.id === row.id && candidate.phase === row.phase && candidate.model === row.model);
+        const old = priorAll.find(candidate => candidate.id === row.id && candidate.phase === row.phase && candidate.model === row.model);
         const field = row.phase === 'prefill' ? 'computedTokens' : 'generatedTokens';
         if (!old || !count(old[field]) || old[field] <= 0 || !count(row[field]) || row[field] <= old[field]) continue;
         this.samples.push({workerId: worker.id, identity: worker.identity, model: worker.model, requestId: row.id,
@@ -263,8 +322,20 @@ export class RoutingObservations {
         running: worker.running.map(active => {
           const request = this.request(active, workers), row = worker.native?.request_rows?.find(row => row.id === active.id && row.model === worker.model);
           const current = worker.native?.connected && fresh(worker.native?.activity_at, this.now());
-          let progress = current && row && ['prefill', 'decode'].includes(row.phase) ? {evidence: 'observed', phase: row.phase,
-            generatedTokens: row.phase === 'prefill' ? 0 : row.generatedTokens, computedInputTokens: row.computedTokens} : null;
+          // Engine row present: a prefill/decode row is a real observation; a row
+          // in any other phase (waiting/preparing/cache-restore) means the engine
+          // holds the request but has produced no measured work yet. Treat that as
+          // a request at the start of prefill — conservative, because it assumes
+          // nothing is done, and labelled 'estimated' — instead of leaving progress
+          // null. A null progress made the whole lane's remaining time unavailable,
+          // so one queued request on a fast lane scored its every running request
+          // as 'running_progress_unavailable' and the lane lost placements it
+          // should have won. Finite-but-labelled beats unscoreable.
+          let progress = null;
+          if (current && row) progress = ['prefill', 'decode'].includes(row.phase)
+            ? {evidence: 'observed', phase: row.phase, generatedTokens: row.phase === 'prefill' ? 0 : row.generatedTokens,
+              computedInputTokens: row.computedTokens}
+            : {evidence: 'estimated', phase: 'prefill', generatedTokens: 0, computedInputTokens: 0};
           if (row?.phase === 'prefill' && count(row.totalTokens)) request.inputTokens = row.totalTokens;
           // Native prefill progress is already uncached work; do not subtract
           // an historical reusable prefix a second time.
@@ -289,7 +360,10 @@ export class RoutingObservations {
         && (worker.native.running > worker.running.length || worker.native.waiting > 0)) worker.running.push({remainingSeconds: null});
       const decision = chooseRoute({job: this.request(job, workers), workers: normalized, currentWorkerId,
         samples: this.samples, outputModel, marginSeconds, eligibility});
-      const summary = {mode: 'observation_only', at: this.now(), action: decision.action, reason: decision.reason,
+      // The mode of THIS comparison, not a fixed label: the panel showed
+      // 'observation_only' while the live policy was 'active', which reads as a
+      // contradiction to anyone watching the routing decision.
+      const summary = {mode: this.state.mode, at: this.now(), action: decision.action, reason: decision.reason,
         source: currentWorkerId, destination: decision.workerId, marginSeconds,
         savingSeconds: decision.savingSeconds ?? null,
         candidates: decision.candidates.map(row => ({workerId: row.workerId, eligible: row.eligible,

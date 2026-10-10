@@ -240,3 +240,75 @@ test('the UI speed summary reports measured work per phase and never counts park
  parked.samples=[];parked.restoredSamples=[{workerId:'m3',phase:'decode',tokens:999,seconds:1,concurrency:1,engineAggregate:true}];
  assert.deepEqual(parked.snapshot().speed,[]);
 });
+test('a lane holding a preparing request is still measurable',()=>{
+ // Regression: the preparing/waiting rows used to be filtered BEFORE the
+ // engine-vs-gateway agreement check, so 2 running requests with 1 still
+ // preparing read as 1 row against running=2 and the interval was discarded
+ // every time. An oMLX lane could therefore never contribute a speed sample.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const other={...job,id:'other'};
+ const rows=(tokens)=>({connected:true,source:'omlx',at:now,activity_at:now,requests:10,running:2,waiting:0,
+   request_rows:[{id:job.id,model:'glm',phase:'decode',computedTokens:100,generatedTokens:tokens},
+     {id:'other',model:'glm',phase:'preparing',computedTokens:0,generatedTokens:0}]});
+ monitor.observeNative(worker,rows(20),[job,other]);
+ now=3000;monitor.observeNative(worker,rows(60),[job,other]);
+ assert.equal(monitor.samples.length,1);
+ assert.deepEqual([monitor.samples[0].tokens,monitor.samples[0].concurrency],[40,2]);
+ // A phase change between the two ends is still not attributable work.
+ const changed=new RoutingObservations({enabled:true,now:()=>now});now=1000;
+ changed.observeNative(worker,rows(20),[job,other]);
+ now=3000;changed.observeNative(worker,{...rows(60),request_rows:[
+   {id:job.id,model:'glm',phase:'preparing',computedTokens:0,generatedTokens:0},
+   {id:'other',model:'glm',phase:'decode',computedTokens:100,generatedTokens:60}]},[job,other]);
+ assert.equal(changed.samples.length,0);
+});
+test('an in-flight request whose engine row is not yet working still scores',()=>{
+ // Regression: a row present in a non-work phase (waiting/preparing) used to
+ // leave progress null, so EVERY running request on that lane scored
+ // 'running_progress_unavailable' and the lane could not be timed at all —
+ // a slower-but-measured lane then won placement against it.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ const active={...structuredClone(job),id:'active',dispatched:1000};
+ monitor.started({job:active,worker,fleet:[worker],concurrency:1});
+ now=1200;
+ const native={connected:true,source:'omlx',at:now,activity_at:now,requests:10,running:1,waiting:0,
+   request_rows:[{id:'active',model:'glm',phase:'preparing',computedTokens:0,generatedTokens:0}]};
+ // The lane's own running request must carry a finite remaining time; before the
+ // fix it scored 'running_progress_unavailable' and the whole lane was untimed.
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:1,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'running_progress_unavailable');
+ assert.ok(Number.isFinite(busy.candidates[0].completionSeconds));
+});
+test('a dispatch basis is recorded even when the lane has no per-concurrency measurement',()=>{
+ // Regression: the basis was written only when a full estimate resolved, so a
+ // lane with a measurement at another concurrency (or none) left its in-flight
+ // requests with no basis — and therefore no progress — for their whole life.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ // A lane measured at a DIFFERENT concurrency than the one it is dispatched at,
+ // which must fall back to the approved default guess rather than abstaining.
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'other-concurrency',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:4,scope:'request',waitExcluded:true,concurrencyStable:true});
+ const active={...structuredClone(job),id:'active',dispatched:1000};
+ monitor.started({job:active,worker,fleet:[worker],concurrency:1});
+ const basis=active.routingProgressBasis;
+ assert.ok(basis,'a basis is recorded at an unmeasured concurrency');
+ assert.ok(basis.prefill>0&&basis.decode>0&&Number.isSafeInteger(basis.inputTokens));
+ // The c=4 measurement extrapolated by the approved default guess: a lower
+ // concurrency extrapolates UP (0.9^-3), and the row is labelled a guess.
+ assert.ok(basis.prefill>1000&&basis.decode>100);
+ assert.equal(basis.evidence,'estimated');
+});
+test('the reported decision mode is the live policy, not a fixed label',()=>{
+ // Regression: the summary hardcoded 'observation_only' while the router ran in
+ // 'active' mode, so the panel contradicted the live policy it was reporting.
+ const monitor=new RoutingObservations({enabled:true,mode:'active',now:()=>1000});
+ const workers=[{...worker,capacity:1,running:[],queue:[job],turnReservations:[]}];
+ const result=monitor.evaluate({job,workers,currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.equal(result.mode,'active');
+ assert.equal(monitor.snapshot().last.mode,'active');
+});
