@@ -397,7 +397,8 @@ function updateRoutingNode(current,fresh) {
 }
 function renderCatalogue(s,now){
   const container=$('fleet-catalogue');if(!container)return;
-  const {entries,warnings}=buildCatalogue({members:s.fleet_machines??[],workers:s.gateway?.workers??[],devices:s.devices??[],media:fleetWorkloadsUnavailable?{workloads:[],native_engines:[]}:fleetWorkloads,routes:s.gateway?.model_routes??{},now});
+  const members=(s.fleet_machines??[]).filter(m=>showArchived||!archivedWorkers.includes(m.id));
+  const {entries,warnings}=buildCatalogue({members,workers:s.gateway?.workers??[],devices:s.devices??[],media:fleetWorkloadsUnavailable?{workloads:[],native_engines:[]}:fleetWorkloads,routes:s.gateway?.model_routes??{},now});
   const wasOpen=container.querySelector('details')?.open??false;
   const rows=entries.map(e=>`<tr data-state="${e.state}"><td title="${esc(e.detail)}">${esc(e.id)}</td><td>${esc(e.machines.length?e.machines.join(' + '):'—')}</td><td><span class="catalogue-state" data-state="${e.state}">${e.state.replace(/-/g,' ')}</span> <span class="catalogue-detail">${esc(e.detail)}</span></td><td>${esc(e.routes.length?e.routes.join(', '):'—')}</td><td>${e.observed_at?esc(new Date(e.observed_at).toLocaleTimeString()):'—'}</td></tr>`).join('');
   container.innerHTML=`<details class="catalogue"${wasOpen?' open':''}><summary>Fleet catalogue — model to machine mapping${warnings.length?` · ${warnings.length} note${warnings.length===1?'':'s'}`:''}</summary>${warnings.length?`<ul class="catalogue-warnings">${warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>`:''}<table class="catalogue-table"><thead><tr><th scope="col">Model</th><th scope="col">Machines</th><th scope="col">State</th><th scope="col">Routes</th><th scope="col">Observed</th></tr></thead><tbody>${rows}</tbody></table></details>`;
@@ -488,6 +489,12 @@ function patchDeviceNode(current,fresh){
   }
   while(cursor){const next=cursor.nextSibling;cursor.remove();cursor=next;}
 }
+function renderArchiveToggle(count){
+  const button=$('archive-toggle');if(!button)return;
+  button.hidden=count===0&&!showArchived;
+  button.textContent=showArchived?'Hide archived services':`Show ${count} archived service${count===1?'':'s'}`;
+  button.setAttribute('aria-pressed',String(showArchived));
+}
 function renderDevices(devices,workers,now,stale,scales,controls) {
   const viewport={x:window.scrollX,y:window.scrollY};
   const container=$('devices'),existing=new Map([...container.querySelectorAll('.device')].map(el=>[el.dataset.workerId,el]));
@@ -501,7 +508,7 @@ function renderDevices(devices,workers,now,stale,scales,controls) {
   };
   const mediaIds=mediaWorkerIds(workers,now,devices);
   const presentation=fleetPresentation(workers.filter(w=>devices.some(d=>d.id===w.id)),mediaIds);presentation.devices=new Map(devices.map(d=>[d.id,d]));
-  const ordered=devices.filter(d=>!presentation.owner.has(d.id)).sort((a,b)=>stale
+  const ordered=devices.filter(d=>!presentation.owner.has(d.id)&&(showArchived||!archivedWorkers.includes(d.id))).sort((a,b)=>stale
     ?(existingOrder.get(a.id)??devices.length)-(existingOrder.get(b.id)??devices.length)
     :Number(serving(b))-Number(serving(a)));
   ordered.forEach((d,i)=>{
@@ -919,6 +926,11 @@ function render(s) {
   const cap=capacity(g,stale),scales=rateScales(s.devices,s.rate_peaks,now);
   renderCapacityPanel(g,cap,stale,door,s.continuity_door_error);
   visibleWorkers=g?.workers??[];workerUiStale=stale;workerControlsVisible=s.worker_management===true;
+  // Archived services stay registered but leave the Fleet view. The toggle only
+  // controls presentation; nothing about routing or the model server changes.
+  // The list includes script-only entries that are not routing workers at all.
+  archivedWorkers=s.archived_workers??[];
+  renderArchiveToggle(archivedWorkers.length);
   $('capacity-note').title=stale?'Live gateway status is unavailable.':!g?.total?'No model servers are registered. Open Settings to add your first endpoint.':schedulingExplanation(g,visibleWorkers,cap).trim();
   if(s.fleet_power?.control&&workerControlsReady&&!fleetPowerPolling){fleetPowerPolling=true;void fetch('/api/workers/power',{headers:{}}).then(r=>r.ok?r.json():null).then(p=>{fleetPower=p&&p.enabled!==undefined?p:null;renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,lastDevicesSpec.now,lastDevicesSpec.stale,lastDevicesSpec.scales,lastDevicesSpec.controls);}).catch(()=>{}).finally(()=>{fleetPowerPolling=false;});}
   lastDevicesSpec={devices:s.devices.map(d=>({...d,cache_continuity:s.cache_continuity,performance_history:s.performance_lights})),workers:visibleWorkers,now,stale,scales,controls:workerControlsVisible};
@@ -1015,6 +1027,7 @@ async function poll() {
 let controlsWired = false, workerBusy = false, workersLoading = false, csrfToken = null,recoveryState=null;
 let workerControlsReady=false,workerControlsVisible=false,workerUiStale=true,visibleWorkers=[];
 let fleetPower=null,fleetPowerBusy=new Set(),fleetPowerPolling=false,lastDevicesSpec=null;
+let archivedWorkers=[],showArchived=false;
 let endpointEdit=null, registeredWorkers=[];
 let contextDirty=false, contextExpected=null;
 let queueDirty=false,queueExpected=null;
@@ -1036,7 +1049,11 @@ function workerRows(workers) {
     const ownership=`${w.operator_paused?'<br><small>Operator pause</small>':''}${holds.map(h=>`<br><small>Held by ${esc(h.owner_id)}${h.reason?`: ${esc(h.reason)}`:''}</small>`).join('')}${locks.map(lock=>`<br><small class="maintenance-lock${Number.isFinite(lock.review_at)&&lock.review_at<=Date.now()?' overdue':''}">Maintenance: ${esc(lock.name)}${lock.reason?` · ${esc(lock.reason)}`:''}${Number.isFinite(lock.review_at)?` · review ${lock.review_at<=Date.now()?'overdue':`in ${remaining(lock.review_at,Date.now())}`}`:' · no automatic expiry'}</small>`).join('')}`;
     const routes=w.ssh?`<button class="button" title="Edit only the host-key-verified SSH fallback aliases. The current inference stream and primary route are not interrupted; the new list applies on the next reconnect." data-action="fallbacks" data-id="${id}" ${workerBusy?'disabled':''}>Routes ${fmt(1+(w.ssh_fallbacks?.length??0))}</button>`:'';
     const lockActions=locks.map(lock=>`<button class="button" title="Release only ${esc(lock.name)}. The server stays paused until a separate checked Resume." data-action="unlock" data-id="${id}" data-lock-id="${esc(lock.id)}" ${workerBusy?'disabled':''}>Release ${esc(lock.name)}</button>`).join('');
-    return `<tr><td>${id}<br><small class="muted">${esc(w.url??'')}</small>${Object.entries(w.model_aliases??{}).map(([alias,id])=>`<br><small>Model: ${esc(alias)} → ${esc(id)}</small>`).join('')}</td><td>${fmt(w.context_length)}</td><td title="${esc(info.detail)}">${routing}${ownership}</td><td>Gateway: ${fmt(w.load)} active / ${fmt(w.queued)} queued<br><small>Engine: ${fmt(w.execution_capacity?.running)} running / ${fmt(w.execution_capacity?.waiting)} waiting</small><br><small>${w.execution_capacity?.engine_execution!=null?`${w.execution_capacity.source==='manual_execution'?'Manual':'Detected'} execution capacity: ${fmt(w.execution_capacity.engine_execution)}`:w.execution_capacity?.manual_stale?'Saved execution limit is stale; verify and re-enter it':'Execution capacity unverified; enter the engine limit below'}${w.execution_capacity?.mismatch?' · MISMATCH with gateway admissions':''}</small></td><td class="worker-actions"><button class="button" data-action="${info.action}" data-id="${id}"${(workerBusy||info.blocked)?blockedTail(info.title,workerBusy):''}>${info.button}</button><button class="button" title="Create a named durable maintenance lock. It immediately stops new admission and never auto-expires." data-action="lock" data-id="${id}" ${workerBusy?'disabled':''}>Maintenance lock</button>${lockActions}${held&&!w.operator_paused?`<button class="button" title="Keep an operator pause even after all agents release their holds." data-action="drain" data-id="${id}" ${workerBusy?'disabled':''}>Keep paused</button>`:''}${routes}${w.execution_capacity?.manual_identity?`<button class="button" data-action="execution-capacity" data-id="${id}" title="Record the engine execution limit for routing when detection is unavailable. Does not change the engine or interrupt running work." ${workerBusy?'disabled':''}>Manual execution limit ${fmt(w.execution_capacity.manual_execution)}</button>`:''}<button class="button" data-action="concurrency" data-id="${id}" title="Change gateway request capacity after this worker is paused and idle. Use capacity qualified for its model server." ${workerBusy||!w.drained||busy||w.recovery_waiting||!Number.isSafeInteger(w.max_concurrent_requests)?'disabled':''}>Gateway capacity ${fmt(w.max_concurrent_requests??1)}</button><button class="button" data-action="endpoint" data-id="${id}" ${workerBusy?'disabled':''}>Edit endpoint</button><button class="button" title="Remove registration only after draining and releasing all holds and maintenance locks. Does not stop the model server." data-action="remove" data-id="${id}" ${workerBusy||!w.drained||busy||held||locked?'disabled':''}>Remove</button></td></tr>`;
+    const archiveAction=w.archived===true
+      ? `<button class="button" title="Restore this service to the Fleet view. Routing stays paused until a separate checked Resume." data-action="archive" data-id="${id}" data-archived="false" ${workerBusy?'disabled':''}>Restore from archive</button>`
+      : `<button class="button" title="Hide this paused service from the Fleet view. Keeps its registration, sessions, scripts and history; routing and the model server are untouched." data-action="archive" data-id="${id}" data-archived="true" ${(workerBusy||!w.drained||busy||w.recovery_waiting)?'disabled':''}>Archive</button>`;
+    const archivedMark=w.archived===true?'<br><small class="muted">Archived — hidden from the Fleet view</small>':'';
+    return `<tr><td>${id}${archivedMark}<br><small class="muted">${esc(w.url??'')}</small>${Object.entries(w.model_aliases??{}).map(([alias,id])=>`<br><small>Model: ${esc(alias)} → ${esc(id)}</small>`).join('')}</td><td>${fmt(w.context_length)}</td><td title="${esc(info.detail)}">${routing}${ownership}</td><td>Gateway: ${fmt(w.load)} active / ${fmt(w.queued)} queued<br><small>Engine: ${fmt(w.execution_capacity?.running)} running / ${fmt(w.execution_capacity?.waiting)} waiting</small><br><small>${w.execution_capacity?.engine_execution!=null?`${w.execution_capacity.source==='manual_execution'?'Manual':'Detected'} execution capacity: ${fmt(w.execution_capacity.engine_execution)}`:w.execution_capacity?.manual_stale?'Saved execution limit is stale; verify and re-enter it':'Execution capacity unverified; enter the engine limit below'}${w.execution_capacity?.mismatch?' · MISMATCH with gateway admissions':''}</small></td><td class="worker-actions"><button class="button" data-action="${info.action}" data-id="${id}"${(workerBusy||info.blocked)?blockedTail(info.title,workerBusy):''}>${info.button}</button><button class="button" title="Create a named durable maintenance lock. It immediately stops new admission and never auto-expires." data-action="lock" data-id="${id}" ${workerBusy?'disabled':''}>Maintenance lock</button>${lockActions}${held&&!w.operator_paused?`<button class="button" title="Keep an operator pause even after all agents release their holds." data-action="drain" data-id="${id}" ${workerBusy?'disabled':''}>Keep paused</button>`:''}${routes}${w.execution_capacity?.manual_identity?`<button class="button" data-action="execution-capacity" data-id="${id}" title="Record the engine execution limit for routing when detection is unavailable. Does not change the engine or interrupt running work." ${workerBusy?'disabled':''}>Manual execution limit ${fmt(w.execution_capacity.manual_execution)}</button>`:''}<button class="button" data-action="concurrency" data-id="${id}" title="Change gateway request capacity after this worker is paused and idle. Use capacity qualified for its model server." ${workerBusy||!w.drained||busy||w.recovery_waiting||!Number.isSafeInteger(w.max_concurrent_requests)?'disabled':''}>Gateway capacity ${fmt(w.max_concurrent_requests??1)}</button><button class="button" data-action="endpoint" data-id="${id}" ${workerBusy?'disabled':''}>Edit endpoint</button><button class="button" title="Remove registration only after draining and releasing all holds and maintenance locks. Does not stop the model server." data-action="remove" data-id="${id}" ${workerBusy||!w.drained||busy||held||locked?'disabled':''}>Remove</button>${archiveAction}</td></tr>`;
   }).join('') || '<tr><td colspan="5">No workers registered.</td></tr>';
 }
 async function loadWorkers() {
@@ -1228,6 +1245,12 @@ function wireWorkerControls() {
       $('endpoint-edit-title').textContent=`Edit endpoint · ${id}`;
       editor.elements.connection.value=worker.ssh?'ssh':'local';editor.elements.ssh.value=worker.ssh??'';editor.elements.remote_port.value=worker.remote_port??8000;editor.elements.ssh_fallbacks.value=(worker.ssh_fallbacks??[]).join(', ');editConnectionFields();editor.elements.url.value=worker.url;editor.elements.backend.value=worker.backend??'ds4';editor.elements.context_length.value=worker.context_length??'';editor.elements.api_key_file.value=worker.api_key_file??'';editor.hidden=false;editor.scrollIntoView({block:'center',behavior:'smooth'});editor.elements.url.focus();return;
     }
+    if(action==='archive'){
+      const archived=button.dataset.archived==='true';
+      const confirm=archived?`Archive ${id}? It leaves the Fleet view but keeps its registration, sessions, scripts and history. Routing stays paused and the model server is not touched.`:`Restore ${id} to the Fleet view? Routing stays paused until you resume it separately.`;
+      if(!window.confirm(confirm))return;
+      void workerAction('archive',{id,archived});return;
+    }
     if(action==='lock'){
       const name=window.prompt(`Name this maintenance lock for ${id}. It will survive Star Gate restarts and never auto-expire.`,`maintenance-${id}`);if(name===null)return;
       const reason=window.prompt(`Why must ${id} stay out of Star Gate routing? Do not include secrets or conversation text.`,'External model-server testing in progress');if(reason===null)return;
@@ -1253,6 +1276,11 @@ function wireWorkerControls() {
   };
   $('worker-rows').addEventListener('click',handleWorkerClick);
   $('devices').addEventListener('click',handleWorkerClick);
+  $('archive-toggle')?.addEventListener('click',()=>{
+    showArchived=!showArchived;
+    renderArchiveToggle(archivedWorkers.length);
+    if(lastDevicesSpec)renderDevices(lastDevicesSpec.devices,lastDevicesSpec.workers,Date.now(),workerUiStale,lastDevicesSpec.scales,workerControlsVisible);
+  });
   $('relocation-offers').addEventListener('click',e=>{
     const button=e.target.closest('button[data-relocation]');if(!button||button.disabled)return;
     const offer=JSON.parse(button.dataset.relocation);

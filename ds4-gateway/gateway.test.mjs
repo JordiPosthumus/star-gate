@@ -362,6 +362,42 @@ test('DSG identifies its errors without prefixing upstream HTTP or SSE errors',a
   assert.equal((await r.request(JSON.stringify({fixture_sse:sse}),'b')).body,sse);
 });
 
+test('archiving hides a paused worker without touching registration, drain or routing',async t=>{
+  const r=await rig(t,1,{control_socket:true}),ctl=(route,body)=>workerControl(r.config.control_socket,route,body);
+  // A live worker must not be archivable: routing state is not a presentation detail.
+  await assert.rejects(ctl('/archive-worker',{id:'spark1',archived:true}),/Pause this worker/);
+  await ctl('/drain-workers',{workers:['spark1']});
+  const before=r.gateway.stats().workers.find(w=>w.id==='spark1');
+  const after=await ctl('/archive-worker',{id:'spark1',archived:true});
+  const row=after.workers.find(w=>w.id==='spark1');
+  assert.equal(row.archived,true);
+  // Registration, drain and the routing surface survive archival unchanged.
+  assert.equal(row.drained,true);
+  assert.deepEqual(after.archived,['spark1']);
+  assert.equal(r.gateway.stats().total,before===undefined?1:1);
+  // An archived worker cannot silently resume; restoring is a separate decision.
+  await assert.rejects(ctl('/resume-workers',{workers:['spark1']}),/Restore this worker from the archive/);
+  const restored=await ctl('/archive-worker',{id:'spark1',archived:false});
+  assert.equal(restored.workers.find(w=>w.id==='spark1').archived,false);
+  assert.deepEqual(restored.archived,[]);
+  assert.equal(restored.workers.find(w=>w.id==='spark1').drained,true,'restore leaves routing paused');
+  // Only known workers or enrolled script entries are archivable, and only with a boolean.
+  await assert.rejects(ctl('/archive-worker',{id:'absent',archived:true}),/^Error: DSG Report: Unknown worker/);
+  await assert.rejects(ctl('/archive-worker',{id:'spark1',archived:'yes'}),/must be boolean/);
+  await assert.rejects(ctl('/archive-worker',{id:'spark1',archived:true,extra:1}),/archived state only/);
+});
+
+test('archive state survives a gateway restart and keeps sessions',async t=>{
+  const r=await rig(t,1,{control_socket:true}),ctl=(route,body)=>workerControl(r.config.control_socket,route,body);
+  await ctl('/drain-workers',{workers:['spark1']});
+  await ctl('/archive-worker',{id:'spark1',archived:true});
+  await r.restart();
+  const s=r.gateway.stats();
+  assert.equal(s.workers.find(w=>w.id==='spark1').archived,true,'archived flag is persisted');
+  assert.deepEqual(s.archived,['spark1']);
+  assert.equal(s.workers.find(w=>w.id==='spark1').drained,true,'drain is preserved through archival');
+});
+
 test('scoped agent ingress preserves admitted work, ownership and receipts across gateway restart',async t=>{
   const r=await rig(t,1,{control_socket:true}),ctl=(route,body)=>workerControl(r.config.control_socket,route,body);
   const grant=await ctl('/grant-agent',{agent_id:'tester',workers:['spark1']}),credential={control_socket:r.config.control_socket,token:grant.token};

@@ -183,3 +183,7 @@
 .alternative-service>span,.alternative-service>small{color:var(--muted);line-height:1.4}
 .alternative-service>.button{justify-self:start}
 .alternative-service button:disabled{opacity:.55;cursor:not-allowed}
+
+/* Archived services toggle: presentation only, sits under the servers heading. */
+#archive-toggle{margin:0 0 6px}
+#archive-toggle[hidden]{display:none}

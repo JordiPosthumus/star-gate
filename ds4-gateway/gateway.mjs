@@ -34,6 +34,7 @@ import {RoutingObservations,routingRequestMetadata,routingIdentity} from './rout
 import {EndpointTelemetry} from './endpoint-telemetry.mjs';
 import { GenerationFaultObserver, verifyGeneration } from './generation-health.mjs';
 import { workerConfig, workerConfigs, workerFields, assertUniqueWorker, sshTargets, replaceSshFallbacks } from './worker-config.mjs';
+import { powerWorkers } from './power-scripts.mjs';
 import {endpointUrl, endpointTransport, endpointHeaders, endpointMetadata, endpointAliases} from './endpoint.mjs';
 import { Recovery } from './recovery.mjs';
 import { classifySshFailure } from './recovery-transport.mjs';
@@ -132,6 +133,7 @@ export class AffinityStore {
       if(data.queue_timeout_ms!==undefined){if(typeof data.queue_timeout_ms!=='number')throw new Error('Invalid saved queue allowance');queueTimeout(data.queue_timeout_ms);}
       if(data.direct_reserve_enabled!==undefined&&typeof data.direct_reserve_enabled!=='boolean')throw new Error('Invalid saved direct-reserve toggle');
       if(data.quarantined!==undefined && (!data.quarantined || typeof data.quarantined!=='object' || Array.isArray(data.quarantined)))throw new Error('Invalid saved quarantine state');
+      if(data.archived!==undefined && (!data.archived || typeof data.archived!=='object' || Array.isArray(data.archived) || Object.values(data.archived).some(v=>typeof v!=='boolean')))throw new Error('Invalid saved archived state');
       if(data.protections!==undefined&&(!data.protections||typeof data.protections!=='object'||Array.isArray(data.protections)||Object.keys(data.protections).some(k=>k!=='vision_jpeg')||(data.protections.vision_jpeg!==undefined&&typeof data.protections.vision_jpeg!=='boolean')))throw new Error('Invalid saved protection state');
       if(data.operator_actions!==undefined&&(!Array.isArray(data.operator_actions)||data.operator_actions.length>256||data.operator_actions.some(action=>!validOperatorAction(action))))throw new Error('Invalid saved operator action history');
       if(data.operator_action_heads!==undefined&&(!data.operator_action_heads||typeof data.operator_action_heads!=='object'||Array.isArray(data.operator_action_heads)||Object.entries(data.operator_action_heads).some(([id,action])=>!validOperatorAction(action)||!action.workers.includes(id))))throw new Error('Invalid saved current operator actions');
@@ -151,6 +153,14 @@ export class AffinityStore {
   setDrained(ids, drained) {
     const next = { ...this.data, drained: { ...this.data.drained } };
     for (const id of ids) next.drained[id] = drained;
+    this.save(next);
+  }
+  // Archive is presentation-only: it keeps the registration (so sessions, scripts
+  // and history survive) and hides the worker from the main Fleet view. It never
+  // replaces draining — a worker must already be routing-paused to be archived.
+  setArchived(ids, archived) {
+    const next = { ...this.data, archived: { ...this.data.archived } };
+    for (const id of ids) { if (archived) next.archived[id] = true; else delete next.archived[id]; }
     this.save(next);
   }
   setWorkers(workers, drained = this.data.drained ?? {}) {
@@ -318,7 +328,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   // Like registered workers, an explicit UI setting survives process restarts.
   const contextLimit = () => store.data.pool_context_length ?? config.context_length;
   const requiredContext = node => node.route_only ? node.context_length : contextLimit();
-  const makeNode = n => ({ ...n, drained: store.data.drained?.[n.id] === true, quarantine:store.data.quarantined?.[n.id] ?? null, inferenceFailures:0, transportFailures:0, healthy: false, failures: 0, slots: [{}], get active(){return oldestActive(this);}, queue: [], completed: 0, failed: 0, protected:0, observationLimited:0, probing: false, healthProbeDeferred:0,
+  const makeNode = n => ({ ...n, drained: store.data.drained?.[n.id] === true, archived: store.data.archived?.[n.id] === true, quarantine:store.data.quarantined?.[n.id] ?? null, inferenceFailures:0, transportFailures:0, healthy: false, failures: 0, slots: [{}], get active(){return oldestActive(this);}, queue: [], completed: 0, failed: 0, protected:0, observationLimited:0, probing: false, healthProbeDeferred:0,
     managementPath:n.ssh?{transport:'ssh_tunnel',state:'pending',reason:null,attempts:0,route_count:sshTargets(n).length,changed_at:new Date().toISOString(),last_verified_at:null}:{transport:'local',state:'local',reason:null,attempts:0,route_count:0,changed_at:new Date().toISOString(),last_verified_at:null} });
   let definitions;
   try { definitions = store.data.workers === undefined ? initial : workerConfigs(store.data.workers); }
@@ -410,6 +420,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   let mutation = Promise.resolve();
   const serialize = fn => { const next = mutation.then(fn); mutation = next.catch(() => {}); return next; };
   const definition = n => Object.fromEntries(workerFields.filter(k => n[k] !== undefined).map(k => [k,n[k]]));
+  // Script-only fleet entries (power switches with no routing registration).
+  // These are the lanes that still show start/stop scripts but are not current
+  // recipes; archive hides them from the Fleet view without touching routing.
+  const scriptEntries = new Set(powerWorkers());
   let recovery;
   try { recovery=new Recovery(serviceConfig.recovery,{store,nodes,model:config.model,stopping:()=>shuttingDown||draining,log,fleetConfig:serviceConfig,directReserved,isPairQualificationEnabled:()=>capabilityStatus().server_changes&&capabilityStatus().inspection,isOmlxQualificationEnabled:()=>capabilityStatus().server_changes&&capabilityStatus().inspection,
     reinstate:(n,expected,recoveryState)=>{
@@ -452,8 +466,9 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       waiting:waiting.length,oldest_wait_seconds:waiting.length?Math.max(0,(performance.now()-oldestQueued(waiting).createdMono)/1000):null,
       waiting_reasons:Object.fromEntries([...new Set(waiting.map(j=>j.waitReason))].map(reason=>[reason,waiting.filter(j=>j.waitReason===reason).length]))},
     total: nodes.length, healthy: nodes.filter(n => n.healthy).length, available: nodes.filter(n => n.healthy && !n.drained).length,
+    archived: [...new Set([...nodes.filter(n=>n.archived===true).map(n=>n.id),...Object.entries(store.data.archived??{}).filter(([,v])=>v===true).map(([id])=>id)])],
     active: nodes.reduce((sum,n)=>sum+activeCount(n),0), queued: waiting.length+nodes.reduce((s, n) => s + n.queue.length, 0),media_uploads:mediaJobs?.inputs.active??0,
-    workers: nodes.map(n => ({ id: n.id, url: n.url, is_healthy: n.healthy, drained: n.drained, quarantine:n.quarantine, inference_failures:n.inferenceFailures, transport_failures:n.transportFailures, last_failure_class:n.lastFailureClass??null,
+    workers: nodes.map(n => ({ id: n.id, url: n.url, is_healthy: n.healthy, drained: n.drained, archived: n.archived === true, quarantine:n.quarantine, inference_failures:n.inferenceFailures, transport_failures:n.transportFailures, last_failure_class:n.lastFailureClass??null,
       ...agents.pauseStatus(n.id),last_operator_action:lastOperatorAction(n.id),
       gateway_drained: n.drained && !n.active && !n.queue.length, load: activeCount(n),
       max_concurrent_requests:requestCapacity(n),execution_capacity:routingCapacity(n),
@@ -1502,6 +1517,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     if (node.ssh) node.stopTunnel = tunnelFactory(node, () => shuttingDown || node.removed);
   };
   const registry = () => ({ routing_capacity_control:true,routing_margin_control:true,routing_switching_margin_seconds:routingMargin(),routing_time_mode:timeRouting?'active':routingObservations.enabled?'observation_only':'off',spark_services_version:1,genie_capabilities:capabilityStatus(), model: config.model, minimum_context: contextLimit(), context_limit_control:true,concurrency_control_version:1,conditional_resume_version:1,media_maintenance_version:1,direct_reserve_control:true,direct_reserve_enabled:directReserveEnabled(),direct_reserve_release_ms:directReserveMs(),
+    archived:[...new Set([...nodes.filter(n=>n.archived===true).map(n=>n.id),...Object.entries(store.data.archived??{}).filter(([,v])=>v===true).map(([id])=>id)])],
     genie_admission_version:1,genie_flexible_assignment:true,
     context_limit_source:store.data.pool_context_length === undefined ? 'config' : 'saved',
     conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs,conversation_turns_control:true,conversation_turns_source:store.data.conversation_turns!==undefined?'saved':config.conversation_turns!==undefined?'config':'default',
@@ -1775,6 +1791,28 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     log('worker_removed', { node: id });
     return registry();
   }
+  // Presentation-only: hides an already routing-paused worker (or a script-only
+  // fleet entry that is not a gateway worker at all) from the main Fleet view.
+  // Never touches drain, quarantine, sessions or the model server, so an
+  // archived entry keeps its registration and can be restored in place.
+  function archiveWorker(input) {
+    if (shuttingDown) throw new Error('Gateway is stopping');
+    if (!input || Array.isArray(input) || Object.keys(input).some(k => !['id', 'archived'].includes(k))) throw new Error('Specify a worker ID and archived state only');
+    if (typeof input.id !== 'string' || typeof input.archived !== 'boolean') throw new Error('Archived state must be boolean');
+    const node = nodes.find(n => n.id === input.id);
+    if (node) {
+      if (input.archived && (!node.drained || activeCount(node) || node.queue.length || parkedFor(node).length || node.recovering)) throw new Error('Pause this worker and wait for its admitted work to finish before archiving it');
+      if (!input.archived && !node.archived) return registry();
+      node.archived = input.archived;
+    } else if (scriptEntries.has(input.id)) {
+      // Script-only fleet entry: enrolled power scripts, never a routing worker,
+      // so there is no routing state to protect.
+      if (!input.archived && !(store.data.archived?.[input.id] === true)) return registry();
+    } else throw new Error('Unknown worker');
+    store.setArchived([input.id], input.archived);
+    log(input.archived ? 'worker_archived' : 'worker_restored', { node: input.id, routed: !!node });
+    return registry();
+  }
   function operatorAction(ids,drained,controlChannel='in_process'){
     const channel=typeof controlChannel==='string'&&/^[a-z][a-z0-9_]{0,31}$/.test(controlChannel)?controlChannel:'unidentified_local_client';
     return {id:randomUUID(),time:new Date().toISOString(),action:drained?'pause':'resume',workers:[...ids],control_channel:channel};
@@ -1819,7 +1857,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       let body='';req.on('data',chunk=>{body+=chunk;if(Buffer.byteLength(body)>2048)req.destroy();});req.on('error',()=>{});
       req.on('end',()=>{void serialize(async()=>{try{const input=JSON.parse(body);return json(res,202,await (req.url==='/genie-media-start'?mediaExecution.start(input):req.url==='/genie-media-setup'?mediaSetup.start(input):req.url==='/genie-media-repair'?mediaSetup.repair(input):req.url==='/genie-media-audit'?mediaSetup.audit(input):mediaSetup.finish(input)));}catch(e){return error(res,409,'media_start_failed',e.message);}});});return;
     }
-    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-execution-capacity','/set-routing-margin','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
+    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/archive-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-execution-capacity','/set-routing-margin','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
     let body = '';
     req.on('data', chunk => { body += chunk; if (Buffer.byteLength(body) > 4096) req.destroy(); });
     req.on('error', () => {});
@@ -1879,6 +1917,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           if (req.url === '/set-worker-concurrency') return json(res,200,setWorkerConcurrency(input));
           if (req.url === '/set-direct-reserve') return json(res,200,setDirectReserve(input));
           if (req.url === '/remove-worker') return json(res, 200, removeWorker(input.id));
+          if (req.url === '/archive-worker') return json(res, 200, archiveWorker(input));
           if (req.url === '/resume-workers') {
             if (!Array.isArray(input.workers) || !input.workers.length || input.workers.some(id=>!nodes.some(n=>n.id===id))) throw new Error('Specify known worker IDs');
             const selected=nodes.filter(n=>input.workers.includes(n.id));
@@ -1897,6 +1936,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
               }
             };
             checkExpectedActions();
+            if(selected.some(n=>n.archived))throw new Error('Restore this worker from the archive before enabling routing');
             agents.manualUpdate(input.workers,false); // Reject owned holds before probes.
             if(selected.some(n=>n.recovering))throw new Error('Recovery owns this worker; pause is allowed but wait before enabling');
             await Promise.all(selected.map(freshProbe));
