@@ -250,3 +250,33 @@ test('OpenAI workers rediscover Tensorfold on the shared /metrics route',async()
  assert.ok(calls.length>=1&&calls.every(c=>c.endsWith('/metrics')));
  t.close();
 });
+
+test('native request rows preserve attribution and phase without leaking raw activity fields',()=>{
+ const a=omlxActivity({active_models:{total_active_requests:2,total_waiting_requests:1,models:[{id:'glm',prefilling:[{request_id:'p',processed:40,total:100,prompt:'PRIVATE'}],generating:[{request_id:'d',generated_tokens:30}],waiting:[{request_id:'w'}]}]}});
+ assert.deepEqual(a.request_rows,[{id:'p',model:'glm',phase:'prefill',computedTokens:40,totalTokens:100,generatedTokens:null},{id:'d',model:'glm',phase:'decode',computedTokens:null,totalTokens:null,generatedTokens:30},{id:'w',model:'glm',phase:'waiting',computedTokens:null,totalTokens:null,generatedTokens:null}]);
+ assert.doesNotMatch(JSON.stringify(a),/PRIVATE/);assert.equal(a.execution_capacity,undefined);
+ assert.throws(()=>omlxActivity({active_models:{models:[{id:'bad',waiting:{}}]}}));
+});
+
+test('TensorFold publishes native stream maximum separately from running and waiting',()=>{
+ const value=tensorfoldSnapshot(tfBase({running:1,decoding:1})+'tensorfold_health:streams{state="max"} 4\n',1000);
+ assert.equal(value.execution_capacity,4);assert.equal(value.capacity_source,'tensorfold_streams_max');assert.equal(value.running,1);
+});
+
+test('dashboard reuses fresh core telemetry without duplicate polling and resumes standalone reads after a core gap',async()=>{
+ let now=1000,calls=0,notifications=0;
+ const worker={id:'spark',backend:'openai',url:'http://127.0.0.1:1/v1'};
+ const telemetry=new EndpointTelemetry({now:()=>now,onSample:()=>notifications++,fetcher:async()=>{calls++;return new Response(metrics());}});
+ telemetry.sync([worker]);const row={id:worker.id,url:worker.url,metrics:{at:1000,source:'vllm',connected:true,running:1,series:[]}};
+ telemetry.useShared([row]);await telemetry.sample(worker);assert.equal(calls,0);assert.equal(telemetry.snapshot(worker.id).running,1);
+ telemetry.useShared([row]);assert.equal(notifications,1);
+ now=8000;await telemetry.sample(worker);assert.equal(calls,1);
+ telemetry.useShared([{...row,url:'http://wrong'}]);now=10000;await telemetry.sample(worker);assert.equal(calls,2);telemetry.close();
+});
+
+test('core collector can inspect legacy tunnel registrations without changing their backend contract',async()=>{
+ const w={id:'ring',url:'http://127.0.0.1:18091',ssh:'Spark6'};
+ const t=new EndpointTelemetry({includeLegacy:true,now:()=>1000,fetcher:async()=>new Response(metrics().replace('vllm:num_requests_running{engine="0"}','vllm:num_requests_running{engine="0",model_name="deepseek-v4.1-flash"}'))});
+ t.sync([w]);await t.sample(w);assert.equal(t.snapshot(w.id).source,'vllm');
+ assert.deepEqual(t.snapshot(w.id).model_ids,['deepseek-v4.1-flash']);assert.equal(w.backend,undefined);t.close();
+});

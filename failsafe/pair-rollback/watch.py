@@ -508,6 +508,21 @@ def main():
         lane["cycle_count"] = lane.get("cycle_count", 0) + 1
         roster = roster_map.get(lane_id)
 
+        # fold repair-published blacklist additions (journal is the race-free
+        # channel — audit T2: direct state.json writes would race the watcher)
+        try:
+            for line in JOURNAL_F.read_text(errors="ignore").splitlines()[-200:]:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("event") == "blacklist_add" and d.get("lane") == lane_id \
+                        and d.get("image") and d["image"] not in lane["blacklist"]:
+                    lane["blacklist"].append(d["image"])
+                    del lane["blacklist"][:-20]
+        except OSError:
+            pass
+
         # ---- observe image identity on both ranks (reused as evidence) ----
         inspect = {"head": rank_inspect(lane_cfg["head"]),
                    "worker": rank_inspect(lane_cfg["worker"])}

@@ -3,8 +3,9 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {execFile,spawn} from 'node:child_process';
 import {promisify} from 'node:util';
+import {createHermesTerminal} from './hermes-terminal.mjs';
 const exec=promisify(execFile),here=path.dirname(fileURLToPath(import.meta.url));
-export function createBrainStore(home,{root=path.resolve(here,'../vendor/hermes'),runtimeHome=home}={}) {
+export function createBrainStore(home,{root=path.resolve(here,'../vendor/hermes'),runtimeHome=home,terminal=createHermesTerminal(home,{root})}={}) {
   const launcher=path.join(root,'.hermes/bin/hermes');
   let python;
   const runtime=()=>{
@@ -29,5 +30,5 @@ export function createBrainStore(home,{root=path.resolve(here,'../vendor/hermes'
       child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify(input));
     });
   }
-  return {read:async()=>({...await run({action:'read'}),runtime:runtime()}),save:async input=>({...await run({...input,action:'save'}),runtime:runtime()}),test:input=>run({...input,action:'test'}),runtime};
+  return {read:async()=>({...await run({action:'read'}),runtime:runtime(),terminal:terminal.status()}),save:async input=>({...await run({...input,action:'save'}),runtime:runtime(),terminal:terminal.status()}),test:input=>run({...input,action:'test'}),openTerminal:input=>terminal.launch(input),runtime};
 }

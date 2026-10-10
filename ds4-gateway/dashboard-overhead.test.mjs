@@ -36,7 +36,10 @@ for(const Reader of [FleetSpeedReader,RatePeaks])test(`${Reader.name} skips unch
  fs.renameSync(file,file+'.old');fs.writeFileSync(file,line);reader.poll();reader.poll();assert.ok(opens>appended);
 });
 
-for(const [script,view] of [['current-jobs.js','view-activity'],['hourglass.js','view-analytics']])test(`${script} fetches only while its panel is visible`,async()=>{
+// Only scripts that poll on their own are covered here. The Load-balancing tab
+// has no separate poller: ui.js renders it from the status snapshot it already
+// fetches, so there is nothing to gate.
+for(const [script,view] of [['current-jobs.js','view-activity']])test(`${script} fetches only while its panel is visible`,async()=>{
  const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,{hidden:false,contains:()=>false});return nodes.get(id);};
  get(view).hidden=true;const observers=[],events=new Map(),timers=[];let calls=0;
  const document={hidden:false,activeElement:null,getElementById:get,addEventListener:(name,callback)=>events.set(name,callback)};

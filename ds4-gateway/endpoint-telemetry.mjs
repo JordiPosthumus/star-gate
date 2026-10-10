@@ -119,7 +119,7 @@ export function vllmSnapshot(text,now,previous){
   }
   const rate=(tokens,duration)=>get(duration)>0&&get(tokens)!==null?get(tokens)/get(duration):null;
   return {
-    source:'vllm',live_rate_scope:'poll_interval_throughput',at:now,connected:true,running,
+    source:'vllm',model_ids:[...new Set([...text.matchAll(/^vllm:num_requests_running\{[^\n]*?model_name="([^"]+)"/gm)].map(match=>match[1]))],live_rate_scope:'poll_interval_throughput',at:now,connected:true,running,
     waiting:get('num_requests_waiting'),generated,computed,phase,phase_basis:decoding===null?'unresolved':'sampled_request_lifecycle',live_activity:true,
     interval_start:sampleValid?previous.at:null,interval_phase:intervalPhase,
     interval_generated:sampleValid?generationDelta:null,interval_prefill:prefillDelta,
@@ -156,7 +156,7 @@ export function omlxSnapshot(value,now,previous){
 
 export function omlxActivity(value){
   const models=value?.active_models?.models;
-  if(!Array.isArray(models)||models.some(model=>!model||typeof model!=='object'||['prefilling','generating'].some(key=>model[key]!==undefined&&!Array.isArray(model[key]))))throw new UnsupportedMetrics();
+  if(!Array.isArray(models)||models.some(model=>!model||typeof model!=='object'||['prefilling','generating','waiting'].some(key=>model[key]!==undefined&&!Array.isArray(model[key]))))throw new UnsupportedMetrics();
   const prefill=models.flatMap(model=>model.prefilling??[]);
   // oMLX also puts request setup/cache restore and other zero-output work in
   // "generating". Positive generated tokens are the evidence of generation.
@@ -167,8 +167,13 @@ export function omlxActivity(value){
   };
   const running=finite(value.active_models.total_active_requests)??(models.length?sum(models,'active_requests'):0);
   const waiting=finite(value.active_models.total_waiting_requests)??(models.length?sum(models,'waiting_requests'):0);
+  const request_rows=models.flatMap(model=>['prefilling','generating','waiting'].flatMap(group=>(model[group]??[]).flatMap(row=>
+    typeof row?.request_id==='string'&&row.request_id.length<=256&&typeof model.id==='string'&&model.id.length<=256?[{
+      id:row.request_id,model:model.id,phase:group==='prefilling'?'prefill':group==='waiting'?'waiting':row.generated_tokens>0?'decode':'preparing',
+      computedTokens:finite(row.processed),totalTokens:finite(row.total),generatedTokens:finite(row.generated_tokens)
+    }]:[]))).slice(0,512);
   return {
-    live_activity:true,running,waiting,
+    live_activity:true,running,waiting,request_rows,
     phase:prefill.length&&generation.length?'mixed':prefill.length?'prefill':generation.length?'decode':running===0?'idle':'working',
     live_prefill_tps:sum(prefill,'speed'),live_decode_tps:sum(generation,'tokens_per_second'),
     prefill_processed:sum(prefill,'processed'),prefill_total:sum(prefill,'total'),generated_tokens:sum(generation,'generated_tokens'),
@@ -215,6 +220,10 @@ export function tensorfoldSnapshot(text,now,previous){
     snapshot.phase_basis='engine_stream_gauges';
   }
   snapshot.source='tensorfold';
+  const executionCapacity=tensorfoldStreams(text,'max');
+  if(Number.isSafeInteger(executionCapacity)&&executionCapacity>0){
+    snapshot.execution_capacity=executionCapacity;snapshot.capacity_source='tensorfold_streams_max';
+  }
   // Completion-scoped evidence for the activity markers, mirroring oMLX.
   const finished=previous?.source==='tensorfold'&&previous.connected!==false&&Number.isSafeInteger(previous.requests)&&Number.isSafeInteger(snapshot.requests)?snapshot.requests-previous.requests:null;
   snapshot.completed_prefill_tokens=Number.isSafeInteger(finished)&&finished>0?snapshot.interval_prefill??null:null;
@@ -222,19 +231,35 @@ export function tensorfoldSnapshot(text,now,previous){
 }
 
 export class EndpointTelemetry {
-  constructor({fetcher=fetch,now=Date.now,onSample=()=>{}}={}){
-    Object.assign(this,{fetcher,now,onSample});
-    this.states=new Map();this.workers=[];this.busy=new Map();this.closed=false;
+  constructor({fetcher=fetch,now=Date.now,onSample=()=>{},includeLegacy=false}={}){
+    Object.assign(this,{fetcher,now,onSample,includeLegacy});
+    this.states=new Map();this.shared=new Map();this.workers=[];this.busy=new Map();this.closed=false;
     this.cookies=new Map();this.histories=new Map();this.activityRetry=new Map();this.identities=new Map();
   }
   sync(workers){
-    this.workers=workers.filter(worker=>worker.backend==='openai');
+    this.workers=workers.filter(worker=>worker.backend==='openai'||this.includeLegacy);
     const next=new Map(this.workers.map(worker=>[worker.id,workerKey(worker)]));
     for(const [id,key]of this.identities)if(next.get(id)!==key){
-      this.states.delete(id);this.histories.delete(id);this.activityRetry.delete(id);this.cookies.delete(key);
+      this.states.delete(id);this.shared.delete(id);this.histories.delete(id);this.activityRetry.delete(id);this.cookies.delete(key);
       this.busy.get(id)?.controller.abort();this.busy.delete(id);
     }
     this.identities=next;
+  }
+  useShared(rows){
+    const accepted=new Set();
+    for(const row of Array.isArray(rows)?rows:[]){
+      const address=url=>{try{return new URL(url).href.replace(/\/v1\/?$/,'').replace(/\/$/,'');}catch{return null;}};
+      const worker=this.workers.find(worker=>worker.id===row.id&&address(worker.url)===address(row.url));
+      if(!worker)continue;
+      accepted.add(worker.id);this.shared.set(worker.id,this.now());
+      this.busy.get(worker.id)?.controller.abort();this.busy.delete(worker.id);
+      const before=this.states.get(worker.id),value=row.metrics;
+      if(!value||!Number.isFinite(value.at))continue;
+      this.states.set(worker.id,{...value,url:worker.url});
+      this.histories.set(worker.id,Array.isArray(value.series)?value.series.slice(-1024):[]);
+      if(before?.at!==value.at||before?.connected!==value.connected)this.notify(worker.id,before);
+    }
+    for(const id of this.shared.keys())if(!accepted.has(id))this.shared.delete(id);
   }
   snapshot(id){
     const state=this.states.get(id);if(!state)return null;
@@ -275,7 +300,7 @@ export class EndpointTelemetry {
     return omlxActivity(JSON.parse(await this.read(worker,'/admin/api/activity',{cookie},signal)));
   }
   async sample(worker){
-    if(this.closed||this.busy.has(worker.id))return;
+    if(this.closed||this.busy.has(worker.id)||(this.shared.has(worker.id)&&this.now()-this.shared.get(worker.id)<=6000))return;
     const key=workerKey(worker),started=this.now(),controller=new AbortController(),pending={key,controller};
     this.busy.set(worker.id,pending);
     const before=this.states.get(worker.id),current=()=>!this.closed&&this.identities.get(worker.id)===key&&this.busy.get(worker.id)===pending;

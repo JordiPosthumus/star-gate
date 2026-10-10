@@ -30,7 +30,7 @@ test('Brain saves through native Hermes, preserves unrelated settings/comments, 
  assert.equal(first.settings.reasoning,'max');assert.equal(first.settings.model,'PoolModel');
  const settings={provider:'custom',model:'another-model',base_url:'http://127.0.0.1:34567/v1',reasoning:'high'};
  const saved=await store.save({settings,revision:first.revision});
- assert.deepEqual(saved.settings,settings);assert.equal(fs.readFileSync(saved.backup,'utf8'),original);
+ assert.deepEqual(saved.settings,{...settings,compaction_tokens:first.settings.compaction_tokens,api_key:'',api_key_set:false});assert.equal(fs.readFileSync(saved.backup,'utf8'),original);
  const actual=readYaml(home);assert.deepEqual(actual,{...config,model:{...config.model,provider:settings.provider,default:settings.model,base_url:settings.base_url},agent:{...config.agent,reasoning_effort:'high'}});
  assert.match(fs.readFileSync(path.join(home,'config.yaml'),'utf8'),/owner comment/);
  await assert.rejects(store.save({settings,revision:first.revision}),{status:409});
@@ -56,4 +56,71 @@ test('Brain HTTP editor and model-list test use a temporary profile without infe
  assert.equal((await fetch(base+'/api/brain',{method:'PUT',headers,body})).status,409);
  for(const asset of ['/brain.js','/brain.css'])assert.equal((await fetch(base+asset)).status,200);
  assert.equal((await fetch(base+'/api/brain/status')).status,200);
+});
+test('Compaction editing preserves native settings and old tabs, validates input, and can remove the token cap',{skip:!installed},async t=>{
+ const {home,store,config}=fixture(t);
+ config.compression={threshold:0.5,threshold_tokens:200000,target_ratio:0.2,enabled:true};
+ const original='# compaction owner comment\n'+JSON.stringify(config)+'\n';
+ fs.writeFileSync(path.join(home,'config.yaml'),original);
+ const first=await store.read();assert.equal(first.settings.compaction_tokens,'200000');
+ const settings={...first.settings,compaction_tokens:'180000'};
+ const saved=await store.save({settings,revision:first.revision});
+ assert.equal(saved.settings.compaction_tokens,'180000');
+ assert.equal(fs.readFileSync(saved.backup,'utf8'),original);
+ assert.deepEqual(readYaml(home),{...config,compression:{...config.compression,threshold_tokens:180000}});
+ assert.match(fs.readFileSync(path.join(home,'config.yaml'),'utf8'),/compaction owner comment/);
+ const afterSave=fs.readFileSync(path.join(home,'config.yaml'),'utf8');
+ for(const cap of ['0','-1','1.5','abc','1e5','9007199254740992',true,200000,null]){
+  await assert.rejects(store.save({settings:{...settings,compaction_tokens:cap},revision:saved.revision}),/Compaction point must be a positive whole number/);
+ }
+ assert.equal(fs.readFileSync(path.join(home,'config.yaml'),'utf8'),afterSave);
+ await assert.rejects(store.save({settings:{...settings,compaction_tokens:'190000'},revision:first.revision}),{status:409});
+ const legacy={...saved.settings,reasoning:'high'};delete legacy.compaction_tokens;
+ const legacySaved=await store.save({settings:legacy,revision:saved.revision});
+ assert.equal(legacySaved.settings.compaction_tokens,'180000');
+ const cleared=await store.save({settings:{...legacySaved.settings,compaction_tokens:''},revision:legacySaved.revision});
+ assert.equal(cleared.settings.compaction_tokens,'');
+ assert.deepEqual(readYaml(home),{...config,agent:{...config.agent,reasoning_effort:'high'},compression:{...config.compression,threshold_tokens:null}});
+ await store.save({settings:cleared.settings,revision:cleared.revision});
+ assert.equal(fs.readdirSync(path.join(home,'brain-history')).length,3);
+});
+test('Brain API key persists for the endpoint, keeps blanks, and pins placeholder keys',{skip:!installed},async t=>{
+ const {home,store}=fixture(t),first=await store.read();
+ assert.equal(first.settings.api_key,'');assert.equal(first.settings.api_key_set,false);
+ const saved=await store.save({settings:{...first.settings,api_key:'sk-real-key-123'},revision:first.revision});
+ assert.equal(saved.settings.api_key,'');assert.equal(saved.settings.api_key_set,true);
+ let entry=readYaml(home).custom_providers.find(item=>item.name==='custom');
+ assert.equal(entry.api_key,'sk-real-key-123');assert.equal(entry.base_url,'http://127.0.0.1:30000/v1');assert.equal(entry.extra_headers,undefined);
+ const pinned=await store.save({settings:{...saved.settings,api_key:'none'},revision:saved.revision});
+ assert.equal(pinned.settings.api_key_set,true);
+ entry=readYaml(home).custom_providers.find(item=>item.name==='custom');
+ assert.equal(entry.api_key,'none');assert.equal(entry.extra_headers.Authorization,'Bearer none');
+ const kept=await store.save({settings:{...pinned.settings,reasoning:'low'},revision:pinned.revision});
+ assert.equal(kept.settings.api_key_set,true);
+ assert.equal(readYaml(home).custom_providers.find(item=>item.name==='custom').api_key,'none');
+ const replaced=await store.save({settings:{...kept.settings,api_key:'sk-second-456'},revision:kept.revision});
+ entry=readYaml(home).custom_providers.find(item=>item.name==='custom');
+ assert.equal(entry.api_key,'sk-second-456');assert.equal(entry.extra_headers,undefined);
+ await assert.rejects(store.save({settings:{...replaced.settings,api_key:'bad\nkey'},revision:replaced.revision}),/control characters/);
+ await assert.rejects(store.save({settings:{...replaced.settings,base_url:'',api_key:'sk-third'},revision:replaced.revision}),/API endpoint is required/);
+ assert.equal(readYaml(home).custom_providers.find(item=>item.name==='custom').api_key,'sk-second-456');
+});
+test('Brain test connection probes a draft endpoint with the typed key verbatim',{skip:!installed},async t=>{
+ const {store,home,original}=fixture(t);const seen=[];
+ const provider=http.createServer((req,res)=>{seen.push(req.headers.authorization??'');const ok=req.headers.authorization==='Bearer none';res.writeHead(ok?200:401,{'content-type':'application/json'});res.end(JSON.stringify(ok?{data:[{id:'GLM-5.3-Flash-oQ8e-mtp'}]}:{error:{message:'Invalid API key'}}));});
+ provider.listen(0,'127.0.0.1');await once(provider,'listening');t.after(()=>{provider.closeAllConnections();provider.close();});
+ const server=createDashboard(()=>({}), {brain:store});
+ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const base=`http://127.0.0.1:${server.address().port}`,loaded=await(await fetch(base+'/api/brain')).json();
+ const headers={'content-type':'application/json',origin:base,'x-dsg-csrf':loaded.csrf_token};
+ const settings={...loaded.settings,provider:'glm53f-m3',model:'GLM-5.3-Flash-oQ8e-mtp',base_url:`http://127.0.0.1:${provider.address().port}/v1`,api_key:'none'};
+ const tested=await fetch(base+'/api/brain/test',{method:'POST',headers,body:JSON.stringify({settings,revision:loaded.revision})});
+ assert.equal(tested.status,200);assert.equal((await tested.json()).model_listed,true);
+ assert.deepEqual(seen,['Bearer none']);assert.equal(fs.readFileSync(path.join(home,'config.yaml'),'utf8'),original);
+});
+test('An unrelated save does not pin an implicit native compaction default',{skip:!installed},async t=>{
+ const {home,store}=fixture(t),first=await store.read();
+ assert.match(first.settings.compaction_tokens,/^[1-9][0-9]*$/);
+ await store.save({settings:{...first.settings,reasoning:'high'},revision:first.revision});
+ assert.equal(Object.hasOwn(readYaml(home),'compression'),false);
 });

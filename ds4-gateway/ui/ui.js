@@ -509,45 +509,94 @@ function renderArchiveToggle(count){
   button.textContent=showArchived?'Hide archived services':`Show ${count} archived service${count===1?'':'s'}`;
   button.setAttribute('aria-pressed',String(showArchived));
 }
-// Load-balancing math: what the gateway records and the rule it applies.
+// Load-balancing tab: what the gateway measures, what it fits, and what it did.
 // Read-only display of values the core already publishes; it never changes routing.
 function renderRoutingMath(s,now){
-  const container=$('routing-math');if(!container)return;
-  const rt=s?.gateway?.routing_time;
-  const wasOpen=container.querySelector('details')?.open??false;
-  if(!rt){
-    container.innerHTML='<details class="catalogue"><summary>Load-balancing math</summary><p class="muted">Routing observations are unavailable in this snapshot.</p></details>';
-    return;
-  }
+  const status=$('lb-status');if(!status)return;
+  const g=s?.gateway,rt=g?.routing_time;
   const num=value=>Number.isFinite(value)?fmt(Math.round(value*100)/100):'—';
   const secs=value=>Number.isFinite(value)?`${fmt(Math.round(value*10)/10)}s`:'—';
-  const fit=rt.fit;
-  const last=rt.last;
+  const rate=value=>Number.isFinite(value)?`${fmtWhole(value)} t/s`:'—';
+  const word=value=>esc(String(value??'—').replace(/_/g,' '));
+  const panel=(title,body,extra)=>body?`<details class="catalogue"${extra?' open':''}><summary>${esc(title)}</summary>${body}</details>`:'';
+  const stat=(label,value,title)=>`<li title="${esc(title??'')}"><span>${esc(label)}</span><b>${esc(value)}</b></li>`;
+  if(!rt){
+    status.textContent='Routing observations are unavailable in this snapshot.';
+    for(const id of ['lb-parameters','lb-efficacy','lb-speeds','lb-decision','lb-shadow'])$(id).innerHTML='';
+    return;
+  }
+  const mode=rt.mode==='active'?'active':rt.enabled?'observation only':'off';
+  status.textContent=`Time-based routing is ${mode}${Number.isFinite(rt.errors)&&rt.errors>0?` · ${fmt(rt.errors)} internal error${rt.errors===1?'':'s'}`:''}.`;
   const margin=Number.isFinite(rt.margin_seconds)?rt.margin_seconds:null;
-  const counters=[
-    ['Evaluations',fmt(rt.evaluations)],
-    ['Errors',fmt(rt.errors)],
-    ['Output-length samples',fmt(rt.outputSamples)],
-    ['Verified speed samples',fmt(rt.speedSamples)],
-    ['Margin',margin===null?'—':`${fmt(margin)}s`],
-    ['Mode',rt.mode==='active'?'active':rt.enabled?'observation only':'off'],
-  ];
+
+  // 1. Parameters: the rule and every setting the router obeys.
+  const fit=rt.fit;
   const fitLine=fit&&Number.isFinite(fit.mu)
-    ? `Fitted output length: mean ${num(fit.mu)} · sigma ${num(fit.sigma)} · ${fmt(fit.sampleCount)} samples`
-    : 'Fitted output length: not enough samples yet';
-  const rule=`Move a queued request only when the other server finishes earlier by more than the margin: T_other + ${margin===null?'margin':fmt(margin)+'s'} &lt; T_current.`;
+    ?`Fitted output length: mean ${num(fit.mu)} tokens · sigma ${num(fit.sigma)} · ${fmt(fit.sampleCount)} completed samples`
+    :'Fitted output length: not enough completed samples yet';
+  $( 'lb-parameters').innerHTML=panel('Parameters — the rule and the settings the router obeys',
+    `<p class="routing-math-rule">Move a queued request only when the other server finishes earlier by more than the margin: <b>T_other + ${margin===null?'margin':fmt(margin)+'s'} &lt; T_current</b>.</p>
+<p class="routing-math-line">Mode <b>${esc(mode)}</b>${g?.placement_policy?` · placement <b>${esc(g.placement_policy)}</b>`:''}${g?.capacity_basis?` · capacity basis <b>${esc(g.capacity_basis)}</b>`:''}${g?.config_revision!==undefined?` · revision ${esc(String(g.config_revision))}`:''}</p>
+<p class="routing-math-line">${esc(fitLine)}</p>
+<ul class="routing-math-counters">${[
+      stat('Margin',margin===null?'—':`${fmt(margin)}s`,'Extra predicted savings required before any queued request is moved.'),
+      stat('Mode',mode,'active means the router may move queued work; observation only means it records but never moves.'),
+      stat('Placement',g?.placement_policy??'—','The configured placement policy the core applies.'),
+      stat('Capacity basis',g?.capacity_basis??'—','Where concurrent-slot capacity comes from.'),
+    ].join('')}</ul>`,true);
+
+  // 2. Efficacy: is the router actually seeing enough to decide anything?
+  const speedSamples=Number.isFinite(rt.speedSamples)?rt.speedSamples:0;
+  const parked=Number.isFinite(rt.unverifiedSavedSpeedSamples)?rt.unverifiedSavedSpeedSamples:0;
+  const outputs=Number.isFinite(rt.outputSamples)?rt.outputSamples:0;
+  const healthy=outputs>=32&&speedSamples>0;
+  $( 'lb-efficacy').innerHTML=panel('Efficacy — is the router seeing enough to decide?',
+    `<p class="routing-math-line">${healthy?'The router has both output-length and measured speed evidence.':outputs<32?'Waiting for more completed outputs before the length fit is usable.':'No speed sample is in use yet, so completion times stay unknown and no queued request can be moved.'}</p>
+<ul class="routing-math-counters">${[
+      stat('Evaluations',fmt(rt.evaluations),'Times the router scored candidates for a request.'),
+      stat('Internal errors',fmt(rt.errors),'Exceptions swallowed inside observation. Any non-zero value means measurements were lost.'),
+      stat('Output-length samples',fmt(outputs),'Completed single-choice outputs feeding the length fit.'),
+      stat('Speed samples in use',fmt(speedSamples),'Rows the estimator may use right now. Only these produce a completion time.'),
+      stat('Parked speed samples',fmt(parked),'Saved rows kept but withheld: a model name alone does not prove the engine behind an endpoint survived.'),
+    ].join('')}</ul>`,true);
+
+  // 3. Per-worker measured speeds: the numbers the estimator actually fits.
+  const speeds=Array.isArray(rt.speed)?rt.speed:[];
+  const speedRows=speeds.map(row=>`<tr><td>${esc(row.workerId)}</td><td>${esc(row.phase)}</td><td>${rate(row.tokensPerSecond)}</td><td>${fmt(row.samples)}</td><td>${fmt(row.engineAggregate)}</td><td>${fmt(row.cleanWindow)}</td><td class="muted">${esc((row.concurrency??[]).map(c=>`${fmt(c.value)}×${fmt(c.count)}`).join(' · ')||'—')}</td></tr>`).join('');
+  const liveRows=Array.isArray(g?.routing_capacity)?g.routing_capacity.map(row=>`<tr><td>${esc(row.id)}</td><td>${row.connected?'<span class="routing-math-ok">connected</span>':'<span class="routing-math-no">unavailable</span>'}</td><td>${esc(row.source??'—')}</td><td>${esc(row.live_rate_scope??'—')}</td><td>${esc(row.phase??'—')}</td><td>${row.running===null?'—':fmt(row.running)}</td><td>${row.waiting===null?'—':fmt(row.waiting)}</td><td class="muted">${esc(row.error??'')}</td></tr>`).join(''):'';
+  $('lb-speeds').innerHTML=panel('Measured speed — what each server has actually given the estimator',
+    `${speedRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Phase</th><th scope="col">Measured</th><th scope="col">Rows</th><th scope="col">Engine</th><th scope="col">Clean</th><th scope="col">Concurrency seen</th></tr></thead><tbody>${speedRows}</tbody></table>
+<p class="routing-math-line">Engine rows are the mean work per completed request taken from the engine's own counters, bucketed at the concurrency observed across the interval. Clean rows are single-request windows where one request ran alone. A mean over mixed concurrency is a real engine measurement, but not a constant-concurrency one.</p>`
+      :'<p class="routing-math-line muted">No measured speed row is in use yet. vLLM lanes report through their request histograms; other engines report per-request rates.</p>'}
+${liveRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Endpoint</th><th scope="col">Live</th><th scope="col">Source</th><th scope="col">Rate scope</th><th scope="col">Phase</th><th scope="col">Running</th><th scope="col">Waiting</th><th scope="col">Error</th></tr></thead><tbody>${liveRows}</tbody></table>
+<p class="routing-math-line">Live endpoint readings are separate from the fitted rows above. Poll-interval throughput includes queueing and is not the same quantity as per-request engine work.</p>`:''}`,true);
+
+  // 4. The last decision, with its candidates.
+  const last=rt.last;
   const decision=last
-    ? `<p class="routing-math-line"><b>Last decision</b> ${esc(last.action??'—')} · ${esc(String(last.reason??'—').replace(/_/g,' '))} · ${esc(last.source??'—')} → ${esc(last.destination??'—')}${Number.isFinite(last.savingSeconds)?` · predicted saving ${secs(last.savingSeconds)}`:' · no predicted saving'}${Number.isFinite(last.marginSeconds)?` · margin ${fmt(last.marginSeconds)}s`:''}</p>`
-    : '<p class="routing-math-line muted">No routing decision recorded yet.</p>';
+    ?`<p class="routing-math-line"><b>Last decision</b> ${word(last.action)} · ${word(last.reason)} · ${esc(last.source??'—')} → ${esc(last.destination??'—')}${Number.isFinite(last.savingSeconds)?` · predicted saving ${secs(last.savingSeconds)}`:' · no predicted saving'}${Number.isFinite(last.marginSeconds)?` · margin ${fmt(last.marginSeconds)}s`:''}</p>${
+      Number.isFinite(last.at)?`<p class="routing-math-line muted">Recorded ${esc(new Date(last.at).toLocaleString())}${Number.isFinite(now)?` (${esc(age(last.at,now))})`:''}.</p>`:''}`
+    :'<p class="routing-math-line muted">No routing decision recorded yet.</p>';
   const candidates=Array.isArray(last?.candidates)?last.candidates:[];
-  const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${esc(String(c.reason??'—').replace(/_/g,' '))}</td></tr>`).join('');
-  container.innerHTML=`<details class="catalogue"${wasOpen?' open':''}><summary>Load-balancing math — the numbers behind routing</summary>
-<p class="routing-math-rule">${rule}</p>
-<p class="routing-math-line">${fitLine}</p>
-${decision}
-<ul class="routing-math-counters">${counters.map(([label,value])=>`<li><span>${esc(label)}</span><b>${esc(value)}</b></li>`).join('')}</ul>
-${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th></tr></thead><tbody>${rows}</tbody></table>`:''}
-</details>`;
+  const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${word(c.reason)}</td><td class="muted">${word(c.inputEvidence)} / ${word(c.speedEvidence)}</td></tr>`).join('');
+  $('lb-decision').innerHTML=panel('Last decision — the candidates and why each was scored as it was',
+    `${decision}${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th><th scope="col">Input / speed evidence</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="routing-math-line muted">The last decision carried no candidate list.</p>'}`,true);
+
+  // 5. Shadow: what the router would have done, without doing it.
+  const shadow=g?.routing_shadow;
+  $('lb-shadow').innerHTML=shadow
+    ?panel('Shadow evaluation — what it would have moved',
+      `<p class="routing-math-line">${shadow.enabled?'A parallel pass scores queued work every time without moving it; the two answers are compared before any behaviour change is trusted.':'The shadow pass is off.'}</p>
+<ul class="routing-math-counters">${[
+        stat('Evaluations',fmt(shadow.evaluations),'Times the shadow pass scored a queued request.'),
+        stat('Would move',fmt(shadow.would_move),'Occasions the shadow judged a move would have helped.'),
+        stat('Insufficient evidence',fmt(shadow.insufficient_evidence),'Occasions the shadow abstained because timing was unknown.'),
+        stat('Skipped',fmt(shadow.skipped),'Occasions the shadow declined to consider the request at all.'),
+        stat('Errors',fmt(shadow.errors),'Exceptions inside the shadow pass.'),
+        stat('Predictor',shadow.predictor??'—','Which predictor the shadow used. Unvalidated means it is not trusted for real moves.'),
+      ].join('')}</ul>
+${shadow.last?`<p class="routing-math-line"><b>Last shadow verdict</b> ${word(shadow.last.verdict)} · ${word(shadow.last.reason)} · ${esc(shadow.last.source??'—')} → ${esc(shadow.last.alternative??'no alternative')}${Number.isFinite(shadow.last.saving_ms)?` · predicted saving ${fmt(Math.round(shadow.last.saving_ms/100)/10)}s`:' · no predicted saving'}</p>`:''}`,false)
+    :'';
 }
 function renderDevices(devices,workers,now,stale,scales,controls) {
   const viewport={x:window.scrollX,y:window.scrollY};
@@ -905,33 +954,6 @@ function configurationRows(row){
     ['Min-p','serving_contract.generation_defaults.min_p'],['Repetition penalty','serving_contract.generation_defaults.repetition_penalty'],['Generation output default','serving_contract.generation_defaults.max_new_tokens']];
   return fields.map(([label,key])=>({label,values:['observed','approved','proposed'].map(kind=>{const record=row[kind];if(!record)return {present:false,value:null};return {present:true,value:key.split('.').reduce((v,k)=>v?.[k],record)??null};})})).filter(r=>r.values.some(v=>v.value!==null));
 }
-function hourglassReportLines(row){
-  const s=row.summary,a=row.association,score=s.score;
-  const lines=[`Run: ${s.run_date?new Date(s.run_date).toLocaleString():'date unknown'} · Reported state: ${s.state}`,
-    `Metric: ${score.version??'unknown'} · Hourglass ${s.benchmark_version??'version unknown'} · Scoring: ${s.scoring_policy??'unknown'}`,
-    `Active seconds: ${s.active_seconds??'unknown'} / window ${s.window_seconds??'unknown'} · Clock adjustment: ${s.clock_adjustment_seconds??'unknown'}s`,
-    `Hardware: ${s.hardware.label??'unknown'} (${s.hardware.source??'source unknown'})`,
-    `Worker: ${a.worker_id??'not linked'} · Route: ${a.route} · Contention: ${a.contention} (operator supplied)`,
-    `Associated configuration revision: ${a.approved_configuration_revision??'not linked'} (operator supplied; not verified by the report)`,
-    `Bank fingerprint: ${s.bank_fingerprint??'unknown'} · Hourglass configuration key: ${s.configuration_key??'unknown'}`,
-    `Timing policy: ${s.timing_policy??'unknown'} · Question timeout policy: ${s.question_timeout_policy??'unknown'}`,
-    `Execution: timeout ${s.execution.question_timeout_s??'unknown'}s; repeats ${s.execution.repeat??'unknown'}; wrong-answer stop ${s.execution.stop_after_wrong??'unknown'}; rounds ${s.execution.round_policy??'unknown'}`,
-    `Report created: ${s.report_created_at?new Date(s.report_created_at).toLocaleString():'unknown'} · Report revision: ${row.report_revision??'unknown'}`];
-  if(s.repaired)lines.push('The report records a repaired run.');
-  for(const c of s.caveats)lines.push(`Caveat: ${c.label??'unlabelled'} · affected attempts ${c.attempts??'unknown'}`);
-  return {title:`${s.model} · ${score.value===null?'Score not reported':String(score.value)+' '+(score.unit??'reported score (unknown metric)')} · ${s.state}`,lines};
-}
-function renderHourglassReports(value){
-  const panel=$('hourglass-reports');if(!panel)return;panel.hidden=!value?.configured;
-  const items=$('hourglass-report-items');if(!value?.configured){items.replaceChildren();return;}
-  const signature=JSON.stringify(value);if(items.dataset.signature===signature)return;items.dataset.signature=signature;items.replaceChildren();
-  $('hourglass-report-status').textContent=`${value.reports.length} saved reports · ${value.unavailable.length} unavailable. Different metrics and conditions are not automatically comparable.`;
-  for(const row of value.reports){
-    const item=hourglassReportLines(row),entry=document.createElement('details'),heading=document.createElement('summary');
-    entry.style.overflowWrap='anywhere';entry.style.whiteSpace='normal';heading.textContent=item.title;entry.append(heading);
-    for(const line of item.lines){const p=document.createElement('p');p.textContent=line;entry.append(p);}items.append(entry);
-  }
-}
 function renderServerRecords(value){
   const panel=$('server-records');if(!panel)return;panel.hidden=!value?.configured;
   const items=$('server-record-items');if(!value?.configured){items.replaceChildren();return;}
@@ -959,7 +981,6 @@ function renderServerRecords(value){
 }
 function render(s) {
   renderServerRecords(s.server_records);
-  renderHourglassReports(s.hourglass_reports);
   const g = s.gateway, now = s.time, stale = !!s.gateway_error;
   requestEvents=s.events??[];
   renderAgentWatch(g?.client_watch);

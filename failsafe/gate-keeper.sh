@@ -26,8 +26,9 @@ TICK=$(( $( [ -f "$JOURNAL" ] && wc -l < "$JOURNAL" || echo 0 ) + 1 ))
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 OFF=false; [ -f "$OFF_SWITCH" ] && OFF=true
 
-probe(){ # $1=base-url  -> http code, or "down" if unreachable/hang
-  local c; c=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null); local rc=$?
+probe(){ # $1=base-url; remaining args passed to curl (e.g. auth header)
+  local url="$1"; shift || true
+  local c; c=$(curl -s -m 2 "$@" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null); local rc=$?
   if [ $rc -ne 0 ] || [ -z "$c" ] || [ "$c" = "000" ]; then echo down; else echo "$c"; fi
 }
 KEY=$(python3 -c "import json;print(json.load(open('$KEYJSON')).get('api_key',''))" 2>/dev/null || echo "")
@@ -55,7 +56,8 @@ if [ "${GATEKEEPER_FORCE_DEEP:-0}" = "1" ] || [ $((TICK % 10)) -eq 0 ]; then
   DEEP="$RC"
 fi
 CORE=$(probe "$CORE_URL/health")
-M3=$(probe "$M3_URL/v1/models")
+M3KEY=$(cat "$HOME/.dsg-secrets/glm53f-m3.key" 2>/dev/null || echo "")
+M3=$(probe "$M3_URL/v1/models" -H "Authorization: Bearer $M3KEY")
 LANES_CSV=""
 for p in $LANES; do r=$(probe "http://127.0.0.1:$p/v1/models"); LANES_CSV="$LANES_CSV,$p:$r"; done
 LANES_CSV=${LANES_CSV#,}
@@ -120,8 +122,14 @@ if lines:
         else: break
 door=env.get('GK_DOOR','')
 streak=streak0+1 if door=='down' else 0
+# Lane liveness (2026-10-07): the 04:48 jetsam kill sat 3.5h dark because
+# lane state never reached the verdict. A serving lane answering 'down' is
+# an incident regardless of the door.
+dark=[k for k,v in lanes.items() if v=='down']
+if env.get('GK_M3')=='down': dark.append('m3')
 verdict='ok'
 if env.get('GK_OFF')=='true': verdict='failsafe_off'
+elif dark: verdict='lane_down: '+','.join(sorted(dark))
 elif door=='down' and streak>=3: verdict='WOULD_ESCALATE_L2 (observe-only)'
 elif door=='down': verdict='door_down_suspect'
 elif env.get('GK_DEEP')=='timeout': verdict='wedged_suspect (observe-only)'

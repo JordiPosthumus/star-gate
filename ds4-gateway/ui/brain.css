@@ -9,3 +9,10 @@
 @media(max-width:700px){.brain-reasoning-card{flex-direction:column;align-items:stretch;gap:16px;padding:18px}.brain-reasoning-card select{width:100%;min-width:0}}
 
 .brain-fields .brain-model-field{grid-column:1/-1}
+.brain-fields .brain-compaction-field{grid-column:1/-1}
+.brain-fields .brain-key-field{grid-column:1/-1}
+.brain-key-field input{max-width:520px}
+.brain-compaction-field input{max-width:360px}
+.brain-chat{padding:18px 22px;margin-bottom:20px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+.brain-chat strong{font-size:17px}.brain-chat p{font-size:12px;line-height:1.6;color:var(--muted);margin:7px 0 12px}.brain-chat-actions{display:flex;gap:10px;flex-wrap:wrap}.brain-chat code{font-size:12px}.brain-chat #brain-chat-message:empty{display:none}
+.brain-chat .brain-primary{color:#182016}

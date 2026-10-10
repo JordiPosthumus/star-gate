@@ -632,7 +632,7 @@ test('dashboard names model servers and explains gateway-only concurrency and av
 test('dashboard uses accessible persistent views instead of one overwhelming vertical page',()=>{
   const html=fs.readFileSync(new URL('./ui/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8'),css=fs.readFileSync(new URL('./ui/brand.css',import.meta.url),'utf8');
   assert.match(html,/class="workspace-tabs" role="tablist"/);
-  for(const [name,label] of [['fleet','Fleet'],['analytics','Evidence'],['activity','Activity']]){
+  for(const [name,label] of [['fleet','Fleet'],['analytics','Load balancing'],['activity','Activity']]){
     assert.match(html,new RegExp(`id="tab-${name}"[^>]*role="tab"[^>]*aria-controls="view-${name}"[^>]*data-workspace-tab="${name}"[^>]*>${label}<`));
     assert.match(html,new RegExp(`id="view-${name}"[^>]*role="tabpanel"[^>]*aria-labelledby="tab-${name}"[^>]*data-workspace-view="${name}"`));
   }
@@ -725,8 +725,8 @@ test('opt-in worker controls require same origin, JSON and a CSRF token; diagnos
   assert.equal((await post('/api/workers/context','{}',{'content-type':'application/json'})).status,403);
   assert.equal((await post('/api/workers/queue-timeout','{}',{'content-type':'application/json'})).status,403);
   assert.equal((await post('/api/workers/conversation-turns','{}',{'content-type':'application/json'})).status,403);
-  for(const action of ['add','endpoint','test','drain','resume','lock','unlock','remove','fallbacks','context','queue-timeout','conversation-turns','protection','relocate']) assert.equal((await post('/api/workers/'+action,JSON.stringify({id:'fake'}),valid)).status,200);
-  assert.deepEqual(calls.map(x=>x.action),['add','endpoint','test','drain','resume','lock','unlock','remove','fallbacks','context','queue-timeout','conversation-turns','protection','relocate']);
+  for(const action of ['add','endpoint','test','drain','resume','lock','unlock','remove','fallbacks','context','queue-timeout','routing-margin','conversation-turns','protection','relocate']) assert.equal((await post('/api/workers/'+action,JSON.stringify({id:'fake'}),valid)).status,200);
+  assert.deepEqual(calls.map(x=>x.action),['add','endpoint','test','drain','resume','lock','unlock','remove','fallbacks','context','queue-timeout','routing-margin','conversation-turns','protection','relocate']);
   assert.ok(!(await(await fetch(url+'/api/diagnostics')).text()).includes(init.csrf_token));
   const plain=await fixture(t);assert.deepEqual(await(await fetch(plain.url+'/api/workers')).json(),{enabled:false});
 });
@@ -1138,4 +1138,22 @@ test('manual media refresh invokes the explicit reader and returns completed obs
   assert.equal(manual,1);assert.equal(automatic,0);
   await fetch(base+'/api/fleet-workloads');assert.equal(manual,1);assert.equal(automatic,1);
  }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('capacity display distinguishes gateway bookings, engine work and an unverified manual admission limit',()=>{
+ const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
+ const context=vm.createContext({});vm.runInContext(source,context);
+ const worker={id:'m3',is_healthy:true,load:3,queued:0,max_concurrent_requests:4,execution_capacity:{running:1,waiting:2,engine_execution:1,mismatch:true}};
+ const render=w=>vm.runInContext(`workerRows(${JSON.stringify([w])})`,context);
+ const html=render(worker);assert.match(html,/Gateway: 3 active \/ 0 queued/);assert.match(html,/Engine: 1 running \/ 2 waiting/);
+ assert.match(html,/Detected execution capacity: 1/);assert.match(html,/MISMATCH with gateway admissions/);assert.match(html,/Gateway capacity 4/);
+ const unknown=render({...worker,execution_capacity:{running:null,waiting:null,engine_execution:null,mismatch:null}});
+ assert.match(unknown,/Execution capacity unverified/);assert.doesNotMatch(unknown,/Detected execution capacity|MISMATCH/);
+});
+
+test('margin form and passive explanation module are served without implying policy activation',async t=>{
+ const {url}=await fixture(t);
+ const html=await(await fetch(url+'/')).text();assert.match(html,/Minimum saving before switching \(seconds\)/);
+ assert.match(html,/Saving this value does not activate time-based routing/);
+ const response=await fetch(url+'/routing-observation.js');assert.equal(response.status,200);assert.match(await response.text(),/Observation only/);
 });

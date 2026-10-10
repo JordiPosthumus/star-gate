@@ -1,4 +1,5 @@
 // Transient local observations and explicit owner queue edits; no inference or browser storage.
+import {routingObservationText} from './routing-observation.js';
 const $=id=>document.getElementById(id);
 const elapsed=ms=>Number.isFinite(ms)&&ms>=0?(ms<1000?'<1s':ms<60000?`${Math.floor(ms/1000)}s`:`${Math.floor(ms/60000)}m ${Math.floor(ms/1000)%60}s`):'unknown';
 const priorities=[['high','High'],['normal','Normal'],['idle-only','Idle only']];
@@ -15,6 +16,8 @@ function render(next){
     for(const value of [label,job.state==='running'?'Running':job.state==='queued'?'Queued':'Blocked',job.priority_policy==='genie'?'Genie · next slot':priorities.find(([value])=>value===job.priority)?.[1]??'Normal',job.machine||'Unassigned',job.state==='running'?`Waited ${elapsed(job.waiting_ms)}\nRunning ${elapsed(job.running_ms)}`:`Waiting ${elapsed(job.waiting_ms)}`,job.request_reason==='Request is already running'?'':job.request_reason||'']){
       const cell=document.createElement('td');cell.textContent=value;row.append(cell);
     }
+    const observation=routingObservationText(job.routing_decision??job.routing_observation);
+    if(observation)row.lastElementChild.textContent+=[row.lastElementChild.textContent?'\n':'',observation].join('');
     if(job.priority_policy!=='genie'&&next.priority_edit_enabled&&['queued','blocked'].includes(job.state)&&priorities.some(([value])=>value===job.priority)){
       const select=document.createElement('select');select.setAttribute('aria-label',`Priority for ${label}`);
       for(const [value,label]of priorities){const option=document.createElement('option');option.value=value;option.textContent=label;select.append(option);}

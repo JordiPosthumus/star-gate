@@ -56,12 +56,37 @@ export class RoutingObservations {
           finishReason: ['stop', 'tool_calls', 'function_call', 'length', 'content_filter'].includes(row.finishReason) ? row.finishReason : null}));
         // Preserve old speed rows without using them. A model name alone does not
         // verify that the engine build/configuration behind an endpoint survived.
-        this.restoredSamples = saved.samples.map(savedSpeed).filter(Boolean).slice(-4096);
+        // They stay in the file and stay listed as parked so the estimator's real
+        // evidence is never confused with unverified history.
+        this.restoredSamples = saved.samples.map(savedSpeed).filter(Boolean).slice(-4096).map(row => ({...row, parked: true}));
       } catch {this.state.storageError = 'Saved routing history is unreadable; preserved without overwrite';}
     }
   }
   snapshot() {return {...this.state, outputSamples: this.outputs.length, speedSamples: this.samples.length, unverifiedSavedSpeedSamples: this.restoredSamples?.length ?? 0,
-    fit: fitOutputLengths(this.outputs), last: this.state.last ? structuredClone(this.state.last) : null};}
+    fit: fitOutputLengths(this.outputs), speed: this.speedSummary(), last: this.state.last ? structuredClone(this.state.last) : null};}
+  // What the estimator can actually see, per worker and phase. Distinguishes
+  // engine-measured rows (mean work per completed request, taken inside the
+  // engine) from single clean request windows, and reports the concurrency the
+  // rows were measured at so a stale or empty lane is visible rather than implied.
+  // Parked history is deliberately excluded: it is not evidence the estimator uses.
+  speedSummary() {
+    const byWorker = new Map();
+    for (const sample of this.samples) {
+      if (!sample || !['prefill', 'decode'].includes(sample.phase)) continue;
+      const key = `${sample.workerId}\u0000${sample.phase}`;
+      const row = byWorker.get(key) ?? {workerId: sample.workerId, phase: sample.phase, samples: 0,
+        engineAggregate: 0, cleanWindow: 0, concurrency: new Map(), tokens: 0, seconds: 0};
+      row.samples++; if (sample.engineAggregate === true) row.engineAggregate++; else row.cleanWindow++;
+      row.concurrency.set(sample.concurrency, (row.concurrency.get(sample.concurrency) ?? 0) + 1);
+      row.tokens += sample.tokens; row.seconds += sample.seconds;
+      byWorker.set(key, row);
+    }
+    return [...byWorker.values()].map(row => ({workerId: row.workerId, phase: row.phase, samples: row.samples,
+      engineAggregate: row.engineAggregate, cleanWindow: row.cleanWindow,
+      tokensPerSecond: row.seconds > 0 ? row.tokens / row.seconds : null,
+      concurrency: [...row.concurrency.entries()].sort((a, b) => a[0] - b[0]).map(([value, count]) => ({value, count}))}))
+      .sort((a, b) => a.workerId.localeCompare(b.workerId) || a.phase.localeCompare(b.phase));
+  }
   attempt(fn) {if (!this.enabled || this.closed) return; try {return fn();} catch {this.state.errors++;}}
   complete({job, worker, usage, outcome, finishReason}) {
     this.attempt(() => {

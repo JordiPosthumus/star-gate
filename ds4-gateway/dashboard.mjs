@@ -15,9 +15,6 @@ import {endpointHeaders} from './endpoint.mjs';
 import {readService} from './service-control.mjs';
 import {safeGenieThinking} from './fleet-thinking-status.mjs';
 import {testingModeFile,testingSuspended} from './testing-mode.mjs';
-import {HourglassReports} from './hourglass-reports.mjs';
-import {HourglassRuns} from './hourglass-runs.mjs';
-import {createHourglassMaintenance} from './hourglass-maintenance.mjs';
 import {doorControl} from './door-client.mjs';
 import http from 'node:http';
 import {EndpointTelemetry} from './endpoint-telemetry.mjs';
@@ -67,7 +64,6 @@ assets.set('/brain.js',['brain.js','text/javascript']);
 assets.set('/brain.css',['brain.css','text/css']);
 assets.set('/soul.js',['soul.js','text/javascript']);
 assets.set('/soul.css',['soul.css','text/css']);
-assets.set('/hourglass.js',['hourglass.js','text/javascript']);
 assets.set('/activity.js',['activity.js','text/javascript']);
 assets.set('/fleet-catalogue.js',['fleet-catalogue.js','text/javascript']);
 assets.set('/logo.svg',['logo.svg','image/svg+xml']);
@@ -100,7 +96,7 @@ export function proxyMediaFile(config,req,res,route){
       res.on('close',()=>upstream.destroy());upstream.end();
     }
 
-export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 'ui'), management = null, requestHistory = null, currentJobs = null, testing = null, lanSharing = null, hourglass = null, mediaTools = null, powerTools = null, soul = null, brain = null, memory = null} = {}) {
+export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 'ui'), management = null, requestHistory = null, currentJobs = null, testing = null, lanSharing = null, mediaTools = null, powerTools = null, soul = null, brain = null, memory = null} = {}) {
   const csrf = randomBytes(32).toString('base64url');
   // Freeze one complete release in memory: edits on disk cannot expose half an
   // update to a live browser. Only the dashboard needs a reload to promote it.
@@ -193,20 +189,6 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
     }
     if(req.url==='/api/media'&&req.method==='GET'){
       void (mediaTools?mediaTools.tool({action:'status'}):management?.media?.()??Promise.resolve({configured:false,enabled:false,jobs:[],hosts:[]})).then(value=>{const snapshot=getSnapshot(),devices=snapshot.devices??[];reply(200,{...value,hosts:(value.hosts??[]).map(host=>{const h=devices.find(d=>d.id===host.id)?.hardware,w=snapshot.gateway?.workers?.find(w=>w.id===host.id);return {...host,memory:h?.state==='connected'?h.current:null,llm_model:snapshot.gateway?.model??null,maintenance:(w?.maintenance_locks??[]).map(lock=>lock.name),holds:(w?.holds??[]).map(hold=>hold.name),paused:w?.drained===true,quarantined:!!w?.quarantine};}),controls_enabled:!!management,csrf_token:csrf});}).catch(()=>reply(503,{error:'Media status is unavailable. Existing work may still be running.'}));return;
-    }
-    if(req.url==='/api/hourglass'&&req.method==='GET')return reply(200,{...(hourglass?.status()??{configured:false}),csrf_token:csrf});
-    if(req.url==='/api/hourglass'&&req.method==='POST'){
-      const token=Buffer.from(req.headers['x-dsg-csrf']??''),expected=Buffer.from(csrf);
-      if(!expected.length||req.headers.origin!==`http://${req.headers.host}`||token.length!==expected.length||!timingSafeEqual(token,expected))return reply(403,{error:'An authorized Hourglass session is required.'});
-      if(!hourglass)return reply(409,{error:'Hourglass console is not configured.'});
-      if(req.headers['content-type']!=='application/json')return reply(415,{error:'JSON required.'});
-      let body='',ended=false;req.setEncoding('utf8');
-      const timer=setTimeout(()=>{ended=true;reply(408,{error:'Incomplete Hourglass request.'});},5000);
-      req.on('error',()=>{ended=true;clearTimeout(timer);});req.on('aborted',()=>{ended=true;clearTimeout(timer);});
-      req.on('data',chunk=>{if(ended)return;body+=chunk;if(Buffer.byteLength(body)>2048){ended=true;clearTimeout(timer);reply(413,{error:'Hourglass request too large.'});}});
-      req.on('end',()=>{clearTimeout(timer);if(ended)return;ended=true;let input;try{input=JSON.parse(body);}catch{return reply(400,{error:'Invalid JSON.'});}
-        if(['prepare','start'].includes(input.action)&&getSnapshot().gateway?.genie_capabilities?.hourglass===false)return reply(409,{error:'Hourglass measurements are switched off. Existing runs continue.'});
-        void hourglass.change(input).then(value=>reply(200,hourglass.status())).catch(e=>reply(409,{error:e.message}));});return;
     }
     // Content-bearing previews belong only on this same-origin local surface.
     if(req.url==='/api/current-jobs'&&req.method==='GET'){
@@ -314,13 +296,6 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
 export async function runDashboard(configPath, port) {
   const {config} = loadConfig(configPath);
   let operations=null;
-  const hourglassReports=new HourglassReports(config.hourglass_reports);
-  const hourglassDirectory=path.join(path.dirname(config.state_file),'hourglass');
-  const hourglass=config.hourglass_console?new HourglassRuns(config.hourglass_console,hourglassDirectory,{
-    reports:()=>{const saved=hourglassReports.snapshot();return {...saved,reports:[...saved.reports,...(operations?.trialReports().reports??[])]};},
-    operationStatus:id=>operations?.tool({action:'status',id})??null,
-    maintenance:createHourglassMaintenance(config,path.join(hourglassDirectory,'operations')),
-    records:()=>serverRecords.snapshot(gateway?.workers?.map(w=>w.id)??[])}):null;
   port ??= dashboardPort(config);
   const fileSources = telemetryFiles(config.telemetry_files);
   const cacheSources=cacheInventoryDirectories(config.cache_directories);
@@ -488,7 +463,12 @@ export async function runDashboard(configPath, port) {
       gateway = { genie_thinking:safeGenieThinking(s.genie_thinking),genie_capabilities:s.genie_capabilities,genie_flexible_assignment:s.genie_flexible_assignment===true,genie_admission_version:s.genie_admission_version===1?1:null,model: s.model,model_routes:s.model_routes&&typeof s.model_routes==='object'?s.model_routes:null, context_length: s.context_length,direct_reserve_control:s.direct_reserve!==undefined,direct_reserve_enabled:s.direct_reserve?.enabled===true,direct_reserve_reserved:s.direct_reserve?.reserved??[],queue_timeout_ms:s.queue_timeout_ms,conversation_turns:s.conversation_turns,conversation_turn_idle_ms:s.conversation_turn_idle_ms,request_timeout_ms:s.request_timeout_ms, archived:Array.isArray(s.archived)?s.archived.slice(0,1024).filter(id=>typeof id==='string'):[],
         // The load-balancing math panel reads these directly; they are bounded
         // numeric counters plus the last decision's candidate evidence.
-        routing_time:s.routing_time&&typeof s.routing_time==='object'?s.routing_time:null,total: s.total, healthy: s.healthy, available: s.available, active: s.active, queued: s.queued, draining: s.draining, dataset:s.dataset,recovery:s.recovery,protections:s.protections,agent_api_version:s.agent_api_version,maintenance_lock_version:s.maintenance_lock_version,client_watch_version:s.client_watch_version,client_watch:clientWatchForDisplay(s.client_watch),
+        routing_time:s.routing_time&&typeof s.routing_time==='object'?s.routing_time:null,
+        routing_shadow:s.routing_shadow&&typeof s.routing_shadow==='object'?{enabled:s.routing_shadow.enabled===true,mode:typeof s.routing_shadow.mode==='string'?s.routing_shadow.mode:null,predictor:typeof s.routing_shadow.predictor==='string'?s.routing_shadow.predictor:null,evaluations:Number.isSafeInteger(s.routing_shadow.evaluations)?s.routing_shadow.evaluations:0,would_move:Number.isSafeInteger(s.routing_shadow.would_move)?s.routing_shadow.would_move:0,insufficient_evidence:Number.isSafeInteger(s.routing_shadow.insufficient_evidence)?s.routing_shadow.insufficient_evidence:0,skipped:Number.isSafeInteger(s.routing_shadow.skipped)?s.routing_shadow.skipped:0,errors:Number.isSafeInteger(s.routing_shadow.errors)?s.routing_shadow.errors:0,last:s.routing_shadow.last&&typeof s.routing_shadow.last==='object'?{reason:typeof s.routing_shadow.last.reason==='string'?s.routing_shadow.last.reason:null,verdict:typeof s.routing_shadow.last.verdict==='string'?s.routing_shadow.last.verdict:null,source:typeof s.routing_shadow.last.source==='string'?s.routing_shadow.last.source:null,alternative:typeof s.routing_shadow.last.alternative==='string'?s.routing_shadow.last.alternative:null,saving_ms:Number.isFinite(s.routing_shadow.last.saving_ms)?s.routing_shadow.last.saving_ms:null}:null}:null,
+        placement_policy:typeof s.placement_policy==='string'?s.placement_policy:null,
+        capacity_basis:typeof s.capacity_basis==='string'?s.capacity_basis:null,
+        routing_capacity:Array.isArray(s.routing_metrics)?s.routing_metrics.flatMap(row=>row&&typeof row.id==='string'&&row.metrics&&typeof row.metrics==='object'?[{id:row.id,connected:row.metrics.connected===true,source:typeof row.metrics.source==='string'?row.metrics.source:null,model_ids:Array.isArray(row.metrics.model_ids)?row.metrics.model_ids.filter(x=>typeof x==='string').slice(0,8):[],live_rate_scope:typeof row.metrics.live_rate_scope==='string'?row.metrics.live_rate_scope:null,prefill_rate_scope:typeof row.metrics.prefill_rate_scope==='string'?row.metrics.prefill_rate_scope:null,phase:typeof row.metrics.phase==='string'?row.metrics.phase:null,phase_basis:typeof row.metrics.phase_basis==='string'?row.metrics.phase_basis:null,running:Number.isFinite(row.metrics.running)?row.metrics.running:null,waiting:Number.isFinite(row.metrics.waiting)?row.metrics.waiting:null,error:typeof row.metrics.error==='string'?row.metrics.error.slice(0,120):null}]:[]):null,
+        total: s.total, healthy: s.healthy, available: s.available, active: s.active, queued: s.queued, draining: s.draining, dataset:s.dataset,recovery:s.recovery,protections:s.protections,agent_api_version:s.agent_api_version,maintenance_lock_version:s.maintenance_lock_version,client_watch_version:s.client_watch_version,client_watch:clientWatchForDisplay(s.client_watch),
         continuity:continuityForDisplay(s.continuity),
         workers: s.workers.map(w => ({ id: w.id, physical_machines:machinesFor(w.id,config), is_healthy: w.is_healthy, drained: w.drained, archived:w.archived===true, quarantine:safeQuarantine(w.quarantine), load: w.load, max_concurrent_requests:Number.isSafeInteger(w.max_concurrent_requests)&&w.max_concurrent_requests>0?w.max_concurrent_requests:1, queued: w.queued, active_seconds: w.active_seconds, completed: w.completed, failed: w.failed, assigned_sessions: w.assigned_sessions,
           gateway_drained:w.gateway_drained,recovery_waiting:Number.isSafeInteger(w.recovery_waiting)?w.recovery_waiting:0,operator_paused:w.operator_paused,holds:Array.isArray(w.holds)?w.holds.slice(0,1024).map(h=>({id:h.id,owner_id:h.owner_id,created_at:h.created_at})):[],maintenance_locks:Array.isArray(w.maintenance_locks)?w.maintenance_locks.slice(0,1024).flatMap(l=>typeof l.id==='string'&&typeof l.name==='string'&&Number.isFinite(l.created_at)?[{id:l.id,name:l.name.slice(0,64),created_at:l.created_at,review_at:Number.isFinite(l.review_at)?l.review_at:null,control_channel:typeof l.control_channel==='string'?l.control_channel:null}]:[]):[],
@@ -516,11 +496,10 @@ export async function runDashboard(configPath, port) {
   const managementEnabled = config.ui_worker_management === true && !!config.control_socket;
   const sparkInspection=managementEnabled?sparkInspectionSync(config,()=>workerControl(config.control_socket,'/spark-services')):null;
   const serverRecords=new ServerRecords(config.server_records_directory);
-  const combinedHourglass=()=>{const saved=hourglassReports.snapshot(),runs=hourglass?.reportSnapshot(),trials=operations?.trialReports().reports??[];return {...saved,configured:saved.configured||!!runs||trials.length>0,reports:[...saved.reports,...(runs?.reports??[]),...trials],unavailable:[...saved.unavailable,...(runs?.unavailable??[])]};};
   let cachedSnapshot=null,snapshotAt=0;
   const snapshot = () => {
     const now=Date.now();if(cachedSnapshot&&now-snapshotAt<1000)return cachedSnapshot;
-    snapshotAt=now;return cachedSnapshot=({ hourglass_measurements:hourglass?.status()??{configured:false},hourglass_reports:combinedHourglass(),server_records:serverRecords.snapshot(gateway?.workers?.map(w=>w.id)??[]),service:'dwarf-star-gate-dashboard', version: 1, time: Date.now(), started, read_only: !managementEnabled, worker_management:managementEnabled, gateway, gateway_at: gatewayAt, gateway_error: gatewayError, telemetry_error: writeError,monitoring_history:monitoringHistory.snapshot(),
+    snapshotAt=now;return cachedSnapshot=({server_records:serverRecords.snapshot(gateway?.workers?.map(w=>w.id)??[]),service:'dwarf-star-gate-dashboard', version: 1, time: Date.now(), started, read_only: !managementEnabled, worker_management:managementEnabled, gateway, gateway_at: gatewayAt, gateway_error: gatewayError, telemetry_error: writeError,monitoring_history:monitoringHistory.snapshot(),
     continuity_door:continuityDoor,continuity_door_error:continuityDoorError,rate_peaks:ratePeaks.snapshot(),cache_continuity:requestHistory.cacheSnapshot(),generation_alerts:requestHistory.generationEvidence.snapshot(),
     performance_lights:performanceHistory.snapshot(Date.now(),[...devices.values()].map(d=>({...d.snapshot(),connected:d.connected&&!gatewayError,active:performanceActive(d,gateway?.workers?.find(w=>w.id===d.id))}))),
     fleet_power:powerTools?{enabled:isCapabilityEnabled('fleet_power'),control:true}:null,
@@ -565,13 +544,11 @@ export async function runDashboard(configPath, port) {
   }:null, lanSharing:managementEnabled&&continuityEnabled(config)?{
     read:async()=>lanSharingDetails(await doorControl(doorSocket(config),'/lan-sharing'),config.port),
     set:async enabled=>lanSharingDetails(await doorControl(doorSocket(config),'/set-lan-sharing',{enabled}),config.port),
-  }:null, hourglass, powerTools, soul:createSoulStore(hermesHome(config)), brain:createBrainStore(hermesHome(config)), memory:createMemoryView(hermesHome(config))});
+  }:null, powerTools, soul:createSoulStore(hermesHome(config)), brain:createBrainStore(hermesHome(config)), memory:createMemoryView(hermesHome(config))});
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   operations?.bind(server.address().port);
-  hourglass?.bind(server.address().port);
-  hourglass?.startObserving();
   await poll(); endpointTelemetry.poll(); const interval = setInterval(poll, 2000), endpointTimer=setInterval(()=>endpointTelemetry.poll(),2000), historyTimer=setInterval(()=>monitoringHistory.save(activity,endpointTelemetry),10000);
-  const close = () => { monitoringHistory.save(activity,endpointTelemetry);endpointTelemetry.close(); closed = true; clearInterval(interval);clearInterval(endpointTimer);clearInterval(historyTimer);operations?.close();hourglass?.close();hardware.close(); for (const t of timers) clearTimeout(t); for (const child of children) child.kill(); server.closeAllConnections(); server.close(); process.removeListener('SIGTERM', close); process.removeListener('SIGINT', close); };
+  const close = () => { monitoringHistory.save(activity,endpointTelemetry);endpointTelemetry.close(); closed = true; clearInterval(interval);clearInterval(endpointTimer);clearInterval(historyTimer);operations?.close();hardware.close(); for (const t of timers) clearTimeout(t); for (const child of children) child.kill(); server.closeAllConnections(); server.close(); process.removeListener('SIGTERM', close); process.removeListener('SIGINT', close); };
 
   process.once('SIGTERM', close); process.once('SIGINT', close);
   console.log(`Star Gate: http://127.0.0.1:${server.address().port} (${managementEnabled ? 'local worker controls' : 'read-only'})`);

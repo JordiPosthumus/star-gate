@@ -224,3 +224,19 @@ test('an over-long poll gap does not become an engine phase sample',()=>{
    decode_tokens:1400,decode_seconds:70,prefill_tokens:14000,prefill_seconds:14}),[]);
  assert.equal(monitor.samples.length,0);
 });
+test('the UI speed summary reports measured work per phase and never counts parked history',()=>{
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ monitor.observeNative(worker,engineNative(now,{running:3}),[]);
+ now=5000;monitor.observeNative(worker,engineNative(now,{requests:12,decode_count:12,prefill_count:12,
+   decode_tokens:1400,decode_seconds:70,prefill_tokens:14000,prefill_seconds:14,running:3}),[]);
+ const speed=monitor.snapshot().speed;
+ const prefill=speed.find(row=>row.phase==='prefill'),decode=speed.find(row=>row.phase==='decode');
+ // 4000 prefill tokens over 4s = 1000 t/s; 400 decode over 20s = 20 t/s.
+ assert.deepEqual([prefill.workerId,prefill.tokensPerSecond,prefill.samples,prefill.engineAggregate,prefill.cleanWindow],
+   ['m3',1000,1,1,0]);
+ assert.deepEqual([decode.tokensPerSecond,decode.concurrency],[20,[{value:3,count:1}]]);
+ // A parked row is not evidence the estimator uses, so it must not appear here.
+ const parked=new RoutingObservations({enabled:true,now:()=>now});
+ parked.samples=[];parked.restoredSamples=[{workerId:'m3',phase:'decode',tokens:999,seconds:1,concurrency:1,engineAggregate:true}];
+ assert.deepEqual(parked.snapshot().speed,[]);
+});

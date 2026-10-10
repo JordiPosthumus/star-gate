@@ -1,6 +1,6 @@
 const $=id=>document.getElementById(id);
-const fields={provider:$('brain-provider'),base_url:$('brain-endpoint'),model:$('brain-model'),reasoning:$('brain-reasoning')};
-let loaded=null,busy=false;
+const fields={provider:$('brain-provider'),base_url:$('brain-endpoint'),api_key:$('brain-key'),model:$('brain-model'),reasoning:$('brain-reasoning'),compaction_tokens:$('brain-compaction')};
+let loaded=null,busy=false,openingTerminal=false;
 const draft=()=>Object.fromEntries(Object.entries(fields).map(([key,node])=>[key,node.value]));
 const dirty=()=>loaded&&JSON.stringify(draft())!==JSON.stringify(Object.fromEntries(Object.keys(fields).map(key=>[key,loaded.settings[key]??''])));
 function setField(key,value){
@@ -10,8 +10,13 @@ function setField(key,value){
 }
 function controls(){
   $('brain-reasoning-saved').textContent=loaded?`Saved · ${loaded.settings.reasoning||'Provider default'}`:'Reading saved setting…';
+  $('brain-compaction-saved').textContent=loaded?`Saved · ${loaded.settings.compaction_tokens?Number(loaded.settings.compaction_tokens).toLocaleString()+' tokens':'Native percentage threshold'}`:'Reading saved setting…';
+  $('brain-key-saved').textContent=loaded?(loaded.settings.api_key_set?'Saved · key stored':'Saved · no key'):'Reading saved key…';
   $('brain-save').disabled=busy||!loaded||!dirty();$('brain-test').disabled=busy||!loaded;
   $('brain-reload').disabled=busy;$('brain-dirty').textContent=dirty()?'Unsaved changes':'';
+  $('brain-chat').disabled=busy||openingTerminal||loaded?.terminal?.supported!==true;
+  $('brain-chat-copy').disabled=loaded?.terminal?.installed!==true;
+  $('brain-chat-command').textContent=loaded?.terminal?.command??'';
   for(const field of Object.values(fields))field.disabled=!loaded;
 }
 function runtime(value){
@@ -32,6 +37,17 @@ async function load(){
 }
 $('brain-form').addEventListener('input',controls);
 $('brain-reload').addEventListener('click',()=>void load());
+$('brain-chat').addEventListener('click',async()=>{
+  if(openingTerminal||!loaded)return;
+  openingTerminal=true;controls();$('brain-chat-message').textContent='Opening Terminal…';
+  try{const result=await request('/api/brain/terminal','POST',{});loaded.terminal=result.terminal;$('brain-chat-message').textContent=result.message;}
+  catch(error){$('brain-chat-message').textContent=error.name==='TimeoutError'?'The launch reply timed out. Check Terminal before clicking again.':error.message;}
+  finally{openingTerminal=false;controls();}
+});
+$('brain-chat-copy').addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText(loaded.terminal.command);$('brain-chat-message').textContent='Copied. Paste into Terminal to start a new Genie chat.';}
+  catch{$('brain-chat-message').textContent='Select and copy the command shown above.';}
+});
 $('brain-form').addEventListener('submit',async event=>{
   event.preventDefault();if(busy||!dirty())return;
   const submitted=draft();busy=true;controls();$('brain-message').textContent='Saving…';
