@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
-import {fitOutputLengths, phaseSpeed, remainingServiceEstimate, serviceEstimate} from './routing-estimates.mjs';
+import {fitOutputLengths, nonnegative, phaseSpeed, positive, remainingOutputTokens, remainingServiceEstimate, serviceEstimate} from './routing-estimates.mjs';
 import {chooseRoute} from './routing-plan.mjs';
 
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -362,7 +362,16 @@ export class RoutingObservations {
           if (row?.phase === 'prefill') request.cache = {};
           let rateSamples=this.samples,concurrency=worker.native?.running ?? worker.running.length;
           const basis=active.routingProgressBasis;
-          if(!progress&&!row&&basis?.identity===worker.identity&&this.now()>=basis.at){
+          // The dispatch basis is the fallback whenever this request has no
+          // engine row of its own. That includes a vLLM lane entirely (it never
+          // publishes per-request rows) and an engine row that is present but
+          // stale. Requiring `!row` outright meant a stale row suppressed the
+          // basis and left `remainingSeconds` null, which made the whole lane
+          // read 'running_progress_unavailable' and lose placements it should
+          // have won. A basis is a dispatch-time estimate, so it is strictly
+          // more trustworthy than no progress at all; it is labelled 'estimated'
+          // wherever it is consumed.
+          if(!progress&&basis?.identity===worker.identity&&this.now()>=basis.at){
             const elapsed=(this.now()-basis.at)/1000, prefillSeconds=basis.inputTokens/basis.prefill;
             request.inputTokens=basis.inputTokens;request.cache={};concurrency=basis.concurrency;
             progress=elapsed<prefillSeconds?{evidence:'estimated',phase:'prefill',generatedTokens:0,computedInputTokens:Math.floor(elapsed*basis.prefill)}
@@ -376,10 +385,74 @@ export class RoutingObservations {
         })}));
       // Unmatched native work is not free capacity. Its unknown remaining time
       // makes timing unavailable without changing actual gateway admissions.
-      for (const worker of normalized) if (worker.native?.connected && fresh(worker.native?.at, this.now())
-        && (worker.native.running > worker.running.length || worker.native.waiting > 0)) worker.running.push({remainingSeconds: null});
+      //
+      // The engine briefly reporting MORE running requests than the gateway
+      // tracks is normally a lifecycle race: the engine has accepted a request
+      // the gateway has already finished accounting, or has not yet been told.
+      // Treating it as permanently unknowable is what pinned this lane at
+      // 'running_progress_unavailable' against a sibling lane that merely
+      // happened to be in step, so the slower lane won placements. Give the
+      // surplus a finite, conservatively-labelled estimate instead: the fastest
+      // observed decode rate for this lane, charged for the fitted remaining
+      // output. It is only used while the engine reports work we cannot name.
+      const fitted = outputModel.fit;
+      for (const worker of normalized) if (worker.native?.connected && fresh(worker.native?.at, this.now())) {
+        // Work the gateway cannot account for is not free capacity, but it is
+        // also not all the same thing:
+        //
+        // - Untracked RUNNING work (engine reports more running requests than the
+        //   gateway tracks) is normally a lifecycle race. Treating it as
+        //   permanently unknowable is what pinned a lane at
+        //   'running_progress_unavailable' against a sibling that merely happened
+        //   to be in step, so the slower lane won placements. Give it a finite,
+        //   conservatively-labelled estimate from the lane's own fastest observed
+        //   decode rate against the fitted remaining output.
+        // - Queueing with NO untracked running work stays unavailable. The lane
+        //   has work the gateway cannot name and cannot time, and marking it free
+        //   would make it win every placement. It must not gain a phantom running
+        //   entry either, which could tip it into 'capacity_mismatch'.
+        const surplus = Math.max(0, (worker.native.running ?? 0) - worker.running.length);
+        // Never push past the lane's capacity in either direction: the planner
+        // treats running.length > capacity as 'capacity_mismatch' and would refuse
+        // to time the lane at all, which is the opposite of the intent here.
+        const room = Number.isSafeInteger(worker.capacity) && worker.capacity > 0
+          ? Math.max(0, worker.capacity - worker.running.length) : 0;
+        if (!room) continue;
+        if (!surplus) {
+          if ((worker.native.waiting ?? 0) > 0) {
+            const taken = new Set(worker.running.map((active, index) => active.slotIndex ?? index));
+            let slot = 0; while (taken.has(slot) && slot < worker.capacity) slot++;
+            worker.running.push({remainingSeconds: null, progressEvidence: 'unavailable', slotIndex: slot});
+          }
+          continue;
+        }
+        // Rate first: without a usable rate the estimate stays unavailable, which
+        // is the honest answer rather than a fabricated zero.
+        const speed = phaseSpeed({worker, fleet: normalized, samples: this.samples, phase: 'decode', concurrency: worker.running.length + 1});
+        const tokens = fitted ? remainingOutputTokens(fitted, 0, null) : null;
+        const seconds = positive(speed.tokensPerSecond) && nonnegative(tokens) ? tokens / speed.tokensPerSecond : null;
+        // Give each synthetic entry a FREE slot index. They carry no slotIndex,
+        // so the planner would default them to their array position and collide
+        // with a real request already occupying that slot — reporting
+        // 'capacity_mismatch' and making the lane untimeable, the very outcome
+        // this block exists to prevent. Free slots are chosen from the ones the
+        // real running requests did not take.
+        const taken = new Set(worker.running.map((active, index) => active.slotIndex ?? index));
+        const free = [];
+        for (let slot = 0; slot < worker.capacity && free.length < room; slot++) if (!taken.has(slot)) free.push(slot);
+        for (let i = 0; i < Math.min(surplus, room); i++) worker.running.push({remainingSeconds: seconds, progressEvidence: 'estimated', slotIndex: free[i]});
+      }
       const decision = chooseRoute({job: this.request(job, workers), workers: normalized, currentWorkerId,
         samples: this.samples, outputModel, marginSeconds, eligibility});
+      // Record what the planner was actually given, so a candidate that reads
+      // 'capacity_mismatch' can be explained from the decision record itself
+      // instead of by guesswork: this is the tracked running count, the capacity
+      // the planner compared it against, and whether a synthetic entry was added.
+      const planned = new Map(normalized.map(worker => [worker.id, worker]));
+      for (const row of decision.candidates ?? []) {
+        const worker = planned.get(row.workerId);
+        if (worker) Object.assign(row, {runningCount: worker.running.length, capacity: worker.capacity});
+      }
       // The mode of THIS comparison, not a fixed label: the panel showed
       // 'observation_only' while the live policy was 'active', which reads as a
       // contradiction to anyone watching the routing decision.
@@ -388,6 +461,7 @@ export class RoutingObservations {
         savingSeconds: decision.savingSeconds ?? null,
         candidates: decision.candidates.map(row => ({workerId: row.workerId, eligible: row.eligible,
           completionSeconds: row.completionSeconds, waitingSeconds: row.waitingSeconds, reason: row.reason,
+          runningCount: row.runningCount ?? null, capacity: row.capacity ?? null,
           inputEvidence: row.service?.input.evidence ?? null, speedEvidence: row.service?.decode.evidence ?? null}))};
       this.state.evaluations++; this.state.last = summary;
       return summary;

@@ -348,3 +348,152 @@ test('the reported decision mode is the live policy, not a fixed label',()=>{
  assert.equal(result.mode,'active');
  assert.equal(monitor.snapshot().last.mode,'active');
 });
+test('a stale engine row does not suppress the dispatch basis',()=>{
+ // Regression: the basis fallback required `!row`, so a row that was present but
+ // not fresh — exactly what a vLLM lane looks like, since it never publishes
+ // per-request activity rows at all, and what an omlx lane looks like between
+ // polls — suppressed the basis and left progress null. The whole lane then read
+ // 'running_progress_unavailable' and lost placements to a slower lane that
+ // merely happened to be in step.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ const active={...structuredClone(job),id:'active',dispatched:1000};
+ monitor.started({job:active,worker,fleet:[worker],concurrency:1});
+ assert.ok(active.routingProgressBasis,'a basis must exist for this request');
+ now=1200;
+ // connected, but activity_at far in the past: the row is stale and must not be
+ // treated as this request's engine evidence.
+ const native={connected:true,source:'omlx',at:now,activity_at:now-60000,requests:10,running:1,waiting:0,
+   request_rows:[{id:'active',model:'glm',phase:'decode',computedTokens:10,generatedTokens:5}]};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:1,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'running_progress_unavailable',
+   'a stale row must fall through to the dispatch basis, not abstain');
+ assert.ok(Number.isFinite(busy.candidates[0].completionSeconds));
+});
+
+test('engine work the gateway does not track still yields a finite estimate',()=>{
+ // Regression: the engine briefly reporting MORE running requests than the
+ // gateway tracks (a lifecycle race) used to push a {remainingSeconds:null}
+ // entry, which made every candidate on that lane 'running_progress_unavailable'.
+ // The sibling lane then won placements purely by being in step. The surplus is
+ // now estimated from the lane's own rate and is labelled 'estimated'.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ // The gateway tracks ONE running request; the engine reports TWO.
+ const active={...structuredClone(job),id:'active',dispatched:1000};
+ monitor.started({job:active,worker,fleet:[worker],concurrency:1});
+ assert.ok(active.routingProgressBasis,'the tracked request carries a dispatch basis');
+ now=1200;
+ const native={connected:true,source:'vllm',at:now,running:2,waiting:0};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:8,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'running_progress_unavailable');
+ assert.ok(Number.isFinite(busy.candidates[0].completionSeconds),
+   'untracked engine work must not make the lane untimeable');
+});
+
+test('a lane with no basis and no row still abstains rather than inventing progress',()=>{
+ // The opposite guarantee: never manufacture a finite time from nothing. With no
+ // dispatch basis, no engine row and no rate, the honest answer is unavailable.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const active={...structuredClone(job),id:'active',dispatched:1000};
+ const native={connected:true,source:'vllm',at:now,running:1,waiting:0};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:1,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.equal(busy.candidates[0].completionSeconds,null);
+ assert.equal(busy.candidates[0].reason,'running_progress_unavailable');
+});
+test('synthetic untracked work never exceeds the lane capacity',()=>{
+ // The planner treats running.length > capacity as 'capacity_mismatch' and
+ // refuses to time the lane, so synthesizing untracked engine work past the
+ // capacity cap would reintroduce the very 'unavailable' this replaced.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ // Engine claims far more running work than the lane can hold.
+ const native={connected:true,source:'vllm',at:now,running:99,waiting:50};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:2,running:[],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'capacity_mismatch');
+});
+
+test('native queueing is never converted into finite measured capacity',()=>{
+ // Regression: the surplus step fired on `waiting > 0` alone, so a lane with
+ // native queueing but NO untracked running request gained a phantom FINITE
+ // running entry — work the gateway cannot name presented as measured capacity,
+ // so the lane could win placements it should lose. Queueing must stay
+ // unavailable even when the lane has good rates and a fitted output length.
+ // Only untracked RUNNING work earns a finite estimate.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ now=1200;
+ // Nothing running anywhere; the engine reports only queueing.
+ const native={connected:true,source:'vllm',at:now,running:0,waiting:5};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:2,running:[],queue:[job],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'capacity_mismatch');
+ assert.equal(busy.candidates[0].completionSeconds,null,
+   'unnameable native queueing must not be presented as measured capacity');
+});
+test('a synthetic entry takes a free slot and never collides with a real one',()=>{
+ // Regression: synthetic entries carried no slotIndex, so the planner defaulted
+ // them to their array position. With a real request already in that slot the
+ // planner saw two requests occupying one slot, reported 'capacity_mismatch' and
+ // refused to time the lane — the opposite of the intent. Every synthetic entry
+ // must land on a slot no real request has taken.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:'rate',phase,tokens:phase==='prefill'?1000:100,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ const active={...structuredClone(job),id:'active',dispatched:1000,slotIndex:0};
+ monitor.started({job:active,worker,fleet:[worker],concurrency:1});
+ now=1200;
+ // The real request occupies slot 0; the engine reports one extra running request.
+ const native={connected:true,source:'vllm',at:now,running:2,waiting:0};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:2,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ assert.notEqual(busy.candidates[0].reason,'capacity_mismatch',
+   'the synthetic entry must not collide with the occupied slot');
+ assert.ok(Number.isFinite(busy.candidates[0].completionSeconds));
+});
+test('a faster busy lane beats a slower busy lane, instead of both abstaining',()=>{
+ // The owner-visible failure this whole change exists to fix: with a request
+ // already running on each lane and neither lane's progress resolvable, BOTH
+ // candidates read 'running_progress_unavailable', no candidate had timing, and
+ // placement fell back to the incumbent order — so the slower lane kept winning.
+ // With the dispatch basis in use, each lane is timed on its own measurement and
+ // the faster one wins on predicted completion.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150])complete(monitor,tokens);
+ const fast={...worker,id:'fast',identity:'id-fast',model:'glm',workRevision:1};
+ const slow={...worker,id:'slow',identity:'id-slow',model:'glm',workRevision:1};
+ for(const w of [fast,slow])for(const phase of ['prefill','decode'])
+   monitor.samples.push({workerId:w.id,identity:w.identity,model:w.model,requestId:`rate-${w.id}-${phase}`,
+     phase,tokens:phase==='prefill'?2000:(w.id==='fast'?200:20),seconds:1,concurrency:1,
+     scope:'request',waitExcluded:true,concurrencyStable:true});
+ const fastActive={...structuredClone(job),id:'fast-active',dispatched:1000};
+ const slowActive={...structuredClone(job),id:'slow-active',dispatched:1000,slotIndex:0};
+ monitor.started({job:fastActive,worker:fast,fleet:[fast],concurrency:1});
+ monitor.started({job:slowActive,worker:slow,fleet:[slow],concurrency:1});
+ assert.ok(fastActive.routingProgressBasis&&slowActive.routingProgressBasis,'both running requests carry a basis');
+ now=1200;
+ const roster=[
+   {...fast,capacity:8,running:[fastActive],queue:[],turnReservations:[],native:{connected:true,source:'vllm',at:now,running:1,waiting:0}},
+   {...slow,capacity:8,running:[slowActive],queue:[],turnReservations:[],native:{connected:true,source:'vllm',at:now,running:1,waiting:0}},
+ ];
+ const result=monitor.evaluate({job,workers:roster,currentWorkerId:'slow',marginSeconds:0,eligibility:()=>({eligible:true})});
+ const byId=Object.fromEntries(result.candidates.map(row=>[row.workerId,row]));
+ assert.ok(Number.isFinite(byId.fast.completionSeconds),'the faster lane must be timed');
+ assert.ok(Number.isFinite(byId.slow.completionSeconds),'the slower lane must be timed');
+ assert.ok(byId.fast.completionSeconds<byId.slow.completionSeconds,'faster lane has the lower predicted completion');
+ assert.equal(result.action,'move');
+ assert.equal(result.destination,'fast');
+});

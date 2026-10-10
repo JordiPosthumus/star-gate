@@ -79,6 +79,31 @@ test('the load-balancing speed table shows each lane at each concurrency, not on
   assert.doesNotMatch(html,/\bundefined\b|\bNaN\b|\[object Object\]/);
 });
 
+test('the decision panel shows each candidate\'s running count against its capacity',()=>{
+  // A 'capacity_mismatch' row is unreadable without the numbers behind it: it
+  // looks like the lane is over its limit when they may be perfectly sane (a
+  // synthetic entry colliding with an occupied slot was exactly that). The
+  // panel must publish what the planner compared.
+  const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
+  const nodes=new Map();
+  const context=vm.createContext({document:{getElementById:id=>{
+    if(!nodes.has(id))nodes.set(id,{id,innerHTML:'',textContent:'',hidden:false});
+    return nodes.get(id);
+  }}});
+  vm.runInContext(source,context);
+  const status={gateway:{routing_time:{enabled:true,mode:'active',evaluations:1,errors:0,speedSamples:1,outputSamples:1,
+    fit:null,margin_seconds:30,last:{mode:'active',at:1000,action:'stay',reason:'current_timing_unavailable',
+      source:'ring',destination:'ring',marginSeconds:30,candidates:[
+        {workerId:'ring',eligible:true,completionSeconds:null,waitingSeconds:null,reason:'capacity_mismatch',runningCount:2,capacity:8},
+        {workerId:'other',eligible:true,completionSeconds:12,waitingSeconds:0,reason:'estimated'}]}}}};
+  vm.runInContext(`renderRoutingMath(${JSON.stringify(status)},2000)`,context);
+  const html=nodes.get('lb-decision').innerHTML;
+  assert.match(html,/Running \/ capacity/,'the column exists');
+  assert.match(html,/2 \/ 8/,'the real running-over-capacity numbers are published');
+  assert.match(html,/—/,'a candidate without the numbers renders unavailable, not a wrong figure');
+  assert.doesNotMatch(html,/\bundefined\b|\bNaN\b|\[object Object\]/);
+});
+
 test('rate charts compress missing intervals to idle-coloured separators without joining measured runs',()=>{
   const source=fs.readFileSync(new URL('./ui/ui.js',import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'').split('\npoll();')[0];
   const context=vm.createContext({});vm.runInContext(source,context);

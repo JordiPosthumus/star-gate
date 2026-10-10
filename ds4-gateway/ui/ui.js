@@ -592,9 +592,12 @@ ${liveRows?`<table class="catalogue-table routing-math-table"><thead><tr><th sco
       Number.isFinite(last.at)?`<p class="routing-math-line muted">Recorded ${esc(new Date(last.at).toLocaleString())}${Number.isFinite(now)?` (${esc(age(last.at,now))})`:''}.</p>`:''}`
     :'<p class="routing-math-line muted">No routing decision recorded yet.</p>';
   const candidates=Array.isArray(last?.candidates)?last.candidates:[];
-  const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${word(c.reason)}</td><td class="muted">${word(c.inputEvidence)} / ${word(c.speedEvidence)}</td></tr>`).join('');
+  // Show the running count against the capacity the planner compared it with.
+  // Without it a 'capacity_mismatch' row is unreadable — it looks like the lane
+  // is over its limit when the numbers may be perfectly sane.
+  const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${word(c.reason)}</td><td class="muted">${Number.isFinite(c.runningCount)&&Number.isFinite(c.capacity)?`${fmt(c.runningCount)} / ${fmt(c.capacity)}`:'—'}</td><td class="muted">${word(c.inputEvidence)} / ${word(c.speedEvidence)}</td></tr>`).join('');
   $('lb-decision').innerHTML=panel('Last decision — the candidates and why each was scored as it was',
-    `${decision}${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th><th scope="col">Input / speed evidence</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="routing-math-line muted">The last decision carried no candidate list.</p>'}`,true);
+    `${decision}${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th><th scope="col">Running / capacity</th><th scope="col">Input / speed evidence</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="routing-math-line muted">The last decision carried no candidate list.</p>'}`,true);
 
   // 5. Shadow: what the router would have done, without doing it.
   const shadow=g?.routing_shadow;

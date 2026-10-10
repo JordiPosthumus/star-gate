@@ -49,6 +49,17 @@ Input length is measured or estimated by the caller. Cache input names `reusable
 
 Remaining prefill subtracts request-level computed uncached tokens once. Running decode uses its individual generated count and the shared conditional length fit. Missing or inconsistent phase/progress produces unavailable timing. The integrator may supply explicitly estimated progress; this slice does not fabricate progress from aggregate counters, characters or SSE chunks. Use actual execution cache counts for running requests where available. An existing applicable restoration timing can be added for a new request; ongoing prefill/decode does not charge completed restoration again.
 
+### In-flight progress and untracked engine work
+
+A running request is timed from, in order of preference: its own fresh engine activity row, then the **dispatch basis** recorded on the job at admission. The basis is a labelled estimate (input tokens, phase speeds, and the concurrency it was dispatched at) that every request records, so an in-flight request always has something to measure from.
+
+Two conditions previously suppressed the basis and left a lane unscoreable:
+
+- **A present-but-stale row.** The basis step originally required `!row`, so any row at all — including one from a previous poll — blocked it. vLLM lanes publish no per-request activity rows whatsoever, so those lanes could never be timed, and an omlx lane could not be timed between polls. The fallback now applies whenever this request has no *fresh row of its own*.
+- **Engine work the gateway cannot name.** When the engine briefly reports more running requests than the gateway tracks (a normal lifecycle race), the surplus is no longer recorded as a `null` remaining time. It is estimated from the lane's own fastest observed decode rate against the fitted remaining output, and labelled `estimated`.
+
+Both only affect comparison; neither changes admissions or moves a dispatched request. A lane with genuinely no basis, no row and no rate still abstains rather than inventing progress. Surplus entries are capped at the lane's capacity, because the planner refuses to time a lane whose running count exceeds its capacity.
+
 ## Placement and continuity
 
 The result retains compared times, components, evidence labels, margin and reason. Unknown home timing stays on that eligible home. If no candidate has timing, a new request preserves the supplied incumbent order. An ineligible home permits eligibility recovery without claiming a measured speed saving. Dispatched and cancelled requests cannot move.

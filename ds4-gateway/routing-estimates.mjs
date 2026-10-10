@@ -1,7 +1,7 @@
 // Offline routing arithmetic. Inputs are normalized observations, never engines
 // or gateway objects. No I/O, timers, configuration changes or live reservations.
-const nonnegative = x => Number.isFinite(x) && x >= 0;
-const positive = x => Number.isFinite(x) && x > 0;
+export const nonnegative = x => Number.isFinite(x) && x >= 0;
+export const positive = x => Number.isFinite(x) && x > 0;
 const count = x => Number.isSafeInteger(x) && x >= 0;
 const median = values => {
   const sorted = [...values].sort((a, b) => a - b), n = sorted.length;
