@@ -5,7 +5,7 @@ const labels={preparing:'Preparing the proposal',awaiting_approval:'Ready for yo
 export function operationLabel(row){return labels[row.runner?.state??row.state]??'Status unknown';}
 export function operationChanges(review){
   const before=review?.settings?.current??{},after=review?.settings?.proposed??{},changes=[];
-  if(review?.trial)changes.push(`Measured trial: qualify the candidate, run one hour of Hourglass (${review.trial.benchmark_version}), then restore and qualify the original. This does not adopt the candidate.`);
+  if(review?.trial)changes.push(`Measured trial: qualify the candidate, run a one-hour benchmark (${review.trial.benchmark_version}), then restore and qualify the original. This does not adopt the candidate.`);
   const labels={context_length:'Context',max_output_tokens:'Output allowance',server_concurrency:'Concurrent requests',prefill_batch_tokens:'Prefill batch',kv_cache_dtype:'KV cache precision',prefix_caching:'Prefix caching',speculative_decoding:'Speculative decoding'};
   const show=v=>v===undefined?'unknown':typeof v==='object'?JSON.stringify(v):String(v);
   for(const key of new Set([...Object.keys(before),...Object.keys(after)]))if(JSON.stringify(before[key])!==JSON.stringify(after[key])){
