@@ -15,6 +15,11 @@ function savedSpeed(row){
     ||!Number.isFinite(row.tokens)||row.tokens<=0||!Number.isFinite(row.seconds)||row.seconds<=0)return null;
   const keys=['workerId','identity','model','requestId','phase','tokens','seconds','concurrency','scope','waitExcluded','concurrencyStable'];
   if(row.engineAggregate===true)keys.push('engineAggregate');
+  // engineRow marks a sample taken straight from the engine's own per-request
+  // row (an id we cannot correlate to a gateway request). It must survive the
+  // save/restore round-trip or a restart would silently re-label those samples
+  // as clean one-request windows, which they are not.
+  if(row.engineRow===true)keys.push('engineRow');
   return Object.fromEntries(keys.map(key=>[key,row[key]]));
 }
 export const routingIdentity = (node, model, profile = null) => hash({worker: node.id, url: node.url,
@@ -57,6 +62,48 @@ export function routingRequestMetadata(body, route) {
     singleChoice: body.n === undefined || body.n === 1,
     template: hash({route, settings}),
     messages: Array.isArray(body.messages) && body.messages.length <= 512 ? body.messages.map(message => hash(message)) : null};
+}
+
+// Match an engine's own per-request rows to the gateway's tracked running
+// requests when the engine names its requests itself (oMLX/M3), so no row can
+// ever be correlated by id.
+//
+// A row is only lent to a request when BOTH sides agree on the count AND the
+// request is otherwise unscoreable: every request already matched by id is
+// marked taken first, and those marks are never lent, so a row can never
+// displace a real correlation. Requests whose own row is missing are filled in
+// order from the unused rows, matching each row's phase to the request it is
+// lent to.
+//
+// The order is NOT assumed to be meaningful, and it does not need to be. What
+// this recovers is the lane's total remaining work — the sum of per-slot
+// remaining times — and that sum is invariant under permuting which same-model
+// request holds which row: the planner charges remaining time per slot, and the
+// new request is booked into whatever slot frees first, not into a named one.
+// So a wrong pairing can never change this lane's own estimate. It only stops
+// the lane reading 'running_progress_unavailable' for its whole in-flight
+// window, which is what let a slower sibling that merely happened to be in step
+// keep winning placements.
+function engineRowOrdering(running, rows) {
+  if (rows.length !== running.length) return null;
+  const taken = new Set();
+  const matched = new Map();
+  for (const active of running) for (const [index, row] of rows.entries()) {
+    if (taken.has(index)) continue;
+    if (row.model !== undefined && row.model !== null && row.id === active.id && row.model === active.model) {
+      taken.add(index); matched.set(active, row); break;
+    }
+  }
+  const unused = rows.filter((_row, index) => !taken.has(index));
+  const ordering = new Map();
+  for (const active of running) {
+    if (matched.has(active)) { ordering.set(active, matched.get(active)); continue; }
+    const phase = active.routingProgressBasis?.phase;
+    const next = unused.findIndex(row => phase ? row.phase === phase : true);
+    if (next < 0) return null;
+    ordering.set(active, unused[next]); unused.splice(next, 1);
+  }
+  return ordering;
 }
 
 export class RoutingObservations {
@@ -220,6 +267,10 @@ export class RoutingObservations {
       }
       this.observeSerial(worker,value,jobs,changed);
       this.observeEnginePhases(worker,value,before,changed);
+      // The engine's own per-request rows run BEFORE the gateway-id correlation
+      // below, so a row whose id happens to be a gateway job id is handled once
+      // by whichever path owns it (this one skips ids the gateway knows).
+      this.observeEngineRows(worker,value,jobs);
       if (changed || !value?.connected || !fresh(value.activity_at, this.now()) || !Array.isArray(value.request_rows)) return;
       // Engine rows carry a phase that can be prefill/decode for measurable work,
       // or waiting/preparing for requests that have not produced output yet.
@@ -334,14 +385,91 @@ export class RoutingObservations {
       this.samples = this.samples.slice(-4096); this.save();
     });
   }
+  // An engine that publishes its OWN per-request rows is a first-class speed
+  // source even when those ids are not the gateway's.
+  //
+  // oMLX (the M3 lane) names every request itself, so the gateway-id correlation
+  // in observeNative can NEVER match: `known` holds gateway job ids, the row
+  // carries an engine id, and every oMLX row was therefore discarded. Meanwhile
+  // the same rows were measured and shown on the dashboard, so the lane produced
+  // hundreds of real throughput observations that never reached the estimator's
+  // samples — the M3 could never contribute a speed AND could never be timed
+  // in flight, which is why a lane that was actually fastest at low concurrency
+  // never won placements.
+  //
+  // Each row carries its own token count and elapsed seconds, so it is usable as
+  // a measurement directly; nothing needs to point at a gateway request. A row
+  // whose id IS a known gateway job id is left to the exact time-delta path so
+  // no request is counted twice, and ids are deduped within a poll.
+  //
+  // Two guards keep this from inventing evidence: the sample is only taken when
+  // the row's own numbers are present and positive, and when the engine publishes
+  // its own rate for the row that rate must corroborate the arithmetic (a
+  // counter that disagrees with its own rate is not a measurement). An engine
+  // that publishes no rate (oMLX reports 0.0 for prefill) is trusted on the
+  // arithmetic alone, which is the same computation the dashboard already shows.
+  observeEngineRows(worker, value, jobs) {
+    this.attempt(() => {
+      if (!value?.connected || value.source !== 'omlx' || !Array.isArray(value.request_rows)) return;
+      const known = new Set(jobs.map(job => job.id));
+      const concurrency = Number.isSafeInteger(value.running) && value.running >= 1
+        ? value.running : jobs.length;
+      if (concurrency < 1) return;
+      const seen = new Set();
+      const phases = [
+        {phase: 'prefill', tokens: row => row.computedTokens, seconds: row => row.elapsed, published: row => row.publishedSpeed},
+        {phase: 'decode', tokens: row => row.generatedTokens, seconds: row => row.elapsedSeconds, published: row => row.publishedTps},
+      ];
+      for (const row of value.request_rows) {
+        if (!row || typeof row.id !== 'string' || !row.id || row.id.length > 256) continue;
+        if (known.has(row.id) || seen.has(row.id)) continue;
+        seen.add(row.id);
+        for (const spec of phases) {
+          if (row.phase !== spec.phase) continue;
+          const tokens = spec.tokens(row), seconds = spec.seconds(row);
+          if (!positive(tokens) || !positive(seconds)) continue;
+          const rate = tokens / seconds;
+          if (!Number.isFinite(rate) || !positive(rate)) continue;
+          // Where the engine states its own rate, ours must agree with it: a
+          // disagreement means one of the two counters is malformed. Only a
+          // published rate of zero is treated as "not stated" (oMLX never fills
+          // the prefill speed in), never as a contradiction.
+          const said = spec.published(row);
+          if (positive(said) && (rate > said * 2 || rate < said / 2)) continue;
+          this.samples.push({workerId: worker.id, identity: worker.identity, model: worker.model,
+            requestId: `engine:${worker.id}:${row.id}`, phase: spec.phase, tokens, seconds,
+            concurrency, scope: 'request', waitExcluded: true, concurrencyStable: true,
+            engineAggregate: false, engineRow: true});
+          this.state.engineRowSamples = (this.state.engineRowSamples ?? 0) + 1;
+        }
+      }
+      this.samples = this.samples.slice(-4096); this.save();
+    });
+  }
   evaluate({job, workers, currentWorkerId, marginSeconds, eligibility}) {
     return this.attempt(() => {
       const outputModel = {fit: fitOutputLengths(this.outputs)};
-      const normalized = workers.map(worker => ({...worker,
+      const normalized = workers.map(worker => {
+        // Rows are matched for the whole lane at once, not per request: an
+        // engine that names its requests itself cannot be correlated by id at
+        // all, so the only safe source of a request's progress is its lane's own
+        // rows. See engineRowOrdering for why a positional pairing is safe.
+        const rows = Array.isArray(worker.native?.request_rows) ? worker.native.request_rows : [];
+        const current = worker.native?.connected && fresh(worker.native?.activity_at, this.now());
+        const ordering = current && rows.length ? engineRowOrdering(worker.running, rows) : null;
+        return {
+        ...worker,
         queue: worker.queue.map(queued => this.request(queued, workers)),
         running: worker.running.map(active => {
-          const request = this.request(active, workers), row = worker.native?.request_rows?.find(row => row.id === active.id && row.model === worker.model);
-          const current = worker.native?.connected && fresh(worker.native?.activity_at, this.now());
+          const request = this.request(active, workers);
+          // Prefer an exact id correlation: vLLM-family engines publish rows
+          // under the gateway's own request id. An engine that names its
+          // requests itself (oMLX/M3) can never match that way, so the lane's
+          // ordering fills the gap instead of the request losing its progress
+          // entirely — that loss is what made the lane untimeable in flight and
+          // cost it placements it should have won.
+          let row = rows.find(candidate => candidate.id === active.id && candidate.model === worker.model);
+          if (!row) row = ordering?.get(active);
           // Engine row present: a prefill/decode row is a real observation; a row
           // in any other phase (waiting/preparing/cache-restore) means the engine
           // holds the request but has produced no measured work yet. Treat that as
@@ -382,7 +510,7 @@ export class RoutingObservations {
           const estimate = remainingServiceEstimate({job: request, worker, fleet: workers, samples: rateSamples,
             concurrency, outputModel, progress});
           return {id: active.id, key: active.key, slotIndex:active.slotIndex, remainingSeconds: estimate.seconds,progressEvidence:progress?.evidence??'unavailable'};
-        })}));
+        })};});
       // Unmatched native work is not free capacity. Its unknown remaining time
       // makes timing unavailable without changing actual gateway admissions.
       //

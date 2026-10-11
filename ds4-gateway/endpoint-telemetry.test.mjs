@@ -252,9 +252,23 @@ test('OpenAI workers rediscover Tensorfold on the shared /metrics route',async()
 });
 
 test('native request rows preserve attribution and phase without leaking raw activity fields',()=>{
- const a=omlxActivity({active_models:{total_active_requests:2,total_waiting_requests:1,models:[{id:'glm',prefilling:[{request_id:'p',processed:40,total:100,prompt:'PRIVATE'}],generating:[{request_id:'d',generated_tokens:30}],waiting:[{request_id:'w'}]}]}});
- assert.deepEqual(a.request_rows,[{id:'p',model:'glm',phase:'prefill',computedTokens:40,totalTokens:100,generatedTokens:null},{id:'d',model:'glm',phase:'decode',computedTokens:null,totalTokens:null,generatedTokens:30},{id:'w',model:'glm',phase:'waiting',computedTokens:null,totalTokens:null,generatedTokens:null}]);
+ // The row also carries the engine's OWN per-request timing, which the router
+ // needs because oMLX names its requests itself: without these fields a lane
+ // that is measurably fast contributes no speed and cannot be timed in flight.
+ // Every added field is numeric or null — no raw activity field may pass through.
+ const a=omlxActivity({active_models:{total_active_requests:2,total_waiting_requests:1,models:[{id:'glm',prefilling:[{request_id:'p',processed:40,total:100,elapsed:0.5,elapsed_seconds:0.5,speed:80,tokens_per_second:80,prompt:'PRIVATE'}],generating:[{request_id:'d',generated_tokens:30,elapsed_seconds:2,tokens_per_second:15}],waiting:[{request_id:'w'}]}]}});
+ const shape={computedTokens:null,totalTokens:null,generatedTokens:null,elapsed:null,elapsedSeconds:null,publishedTps:null,publishedSpeed:null};
+ assert.deepEqual(a.request_rows,[
+   {id:'p',model:'glm',phase:'prefill',...shape,computedTokens:40,totalTokens:100,elapsed:0.5,elapsedSeconds:0.5,publishedTps:80,publishedSpeed:80},
+   {id:'d',model:'glm',phase:'decode',...shape,generatedTokens:30,elapsedSeconds:2,publishedTps:15},
+   {id:'w',model:'glm',phase:'waiting',...shape}]);
  assert.doesNotMatch(JSON.stringify(a),/PRIVATE/);assert.equal(a.execution_capacity,undefined);
+ // Only numbers (or null) may cross this boundary: a raw string field would be
+ // an unbounded, unvetted payload from the engine reaching the router.
+ for(const row of a.request_rows)for(const [key,value]of Object.entries(row)){
+   if(key==='id'||key==='model'||key==='phase')continue;
+   assert.ok(value===null||typeof value==='number',`${key} must be a number or null, got ${typeof value}`);
+ }
  assert.throws(()=>omlxActivity({active_models:{models:[{id:'bad',waiting:{}}]}}));
 });
 

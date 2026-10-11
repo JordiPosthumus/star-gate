@@ -497,3 +497,161 @@ test('a faster busy lane beats a slower busy lane, instead of both abstaining',(
  assert.equal(result.action,'move');
  assert.equal(result.destination,'fast');
 });
+
+// --- an engine that names its own requests (oMLX / the M3 lane) ---
+
+// The M3 produced hundreds of real throughput observations that the dashboard
+// displayed while the ESTIMATOR collected none: oMLX publishes its own
+// request ids, the sampler correlated strictly against gateway job ids, and
+// every row was therefore discarded. The lane could never contribute a speed,
+// so it could never be timed and never won a placement it was fastest for.
+test('an engine row with the engine\'s own request id becomes a speed sample',()=>{
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const lane={...worker,id:'m3',identity:'m3-build',model:'DeepSeek-V4.1-Flash-oQ4e-mtp'};
+ const gatewayJob={...structuredClone(job),id:'gw-request-1',dispatched:1000};
+ const rows=[
+   // The engine names itself: this id is NOT a gateway job id.
+   {id:'engine-internal-aaa',model:lane.model,phase:'decode',generatedTokens:400,elapsedSeconds:8},
+   // oMLX never fills in a prefill speed (0.0) but does report the work done.
+   {id:'engine-internal-bbb',model:lane.model,phase:'prefill',computedTokens:2048,elapsed:0.1,publishedSpeed:0},
+ ];
+ const value={connected:true,source:'omlx',at:now,activity_at:now,requests:50,running:1,waiting:0,request_rows:rows};
+ monitor.observeNative(lane,value,[gatewayJob]);
+ const decode=monitor.samples.filter(s=>s.phase==='decode');
+ const prefill=monitor.samples.filter(s=>s.phase==='prefill');
+ assert.equal(decode.length,1,'the decode row yields a sample');
+ assert.equal(decode[0].tokens,400);
+ assert.equal(decode[0].seconds,8);
+ assert.equal(decode[0].concurrency,1);
+ assert.equal(decode[0].engineRow,true,'the row is labelled as engine-sourced');
+ assert.equal(decode[0].identity,lane.identity);
+ assert.ok(decode[0].requestId.startsWith('engine:'),'the engine id is namespaced, never mistaken for a gateway id');
+ assert.equal(prefill.length,1,'a prefill row with no published rate is still usable');
+ assert.equal(prefill[0].tokens,2048);
+});
+
+test('an engine row is skipped when its own counters contradict its stated rate',()=>{
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const lane={...worker,id:'m3',identity:'m3-build',model:'glm'};
+ const bad={id:'engine-internal-ccc',model:'glm',phase:'decode',generatedTokens:400,elapsedSeconds:8,publishedTps:1000};
+ const value={connected:true,source:'omlx',at:now,activity_at:now,requests:50,running:1,waiting:0,request_rows:[bad]};
+ monitor.observeNative(lane,value,[{...structuredClone(job),id:'gw-1',dispatched:1000}]);
+ assert.equal(monitor.samples.filter(s=>s.phase==='decode').length,0,
+  'a counter that disagrees with its own rate is malformed, not a measurement');
+});
+
+test('an engine row with unusable numbers invents nothing',()=>{
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const lane={...worker,id:'m3',identity:'m3-build',model:'glm'};
+ const value={connected:true,source:'omlx',at:now,activity_at:now,requests:50,running:1,waiting:0,request_rows:[
+   {id:'e1',model:'glm',phase:'decode',generatedTokens:0,elapsedSeconds:5},
+   {id:'e2',model:'glm',phase:'decode',generatedTokens:100,elapsedSeconds:0},
+   {id:'e3',model:'glm',phase:'preparing',generatedTokens:10,elapsedSeconds:1},
+   {id:'',model:'glm',phase:'decode',generatedTokens:100,elapsedSeconds:1},
+ ]};
+ monitor.observeNative(lane,value,[{...structuredClone(job),id:'gw-1',dispatched:1000}]);
+ assert.equal(monitor.samples.length,0,'no positive tokens and positive seconds means no sample');
+});
+
+test('a gateway-named row is not counted twice by both sampling paths',()=>{
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const lane={...worker,id:'m3',identity:'build1',model:'glm'};
+ const gatewayJob={...structuredClone(job),id:'gw-shared'};
+ // A row the gateway OWNS must be left to the exact time-delta path; the
+ // engine-row path skips it so one request never yields two speed samples.
+ const value={connected:true,source:'omlx',at:now,activity_at:now,requests:50,running:1,waiting:0,
+   request_rows:[{id:'gw-shared',model:'glm',phase:'decode',generatedTokens:400,elapsedSeconds:8}]};
+ monitor.observeNative(lane,value,[gatewayJob]);
+ assert.equal(monitor.samples.filter(s=>s.phase==='decode'&&s.engineRow===true).length,0,
+  'a gateway-named row is left to the exact path');
+});
+
+test('engine-sourced samples survive the save and restore round-trip',async (t)=>{
+ const file=fixture(t);
+ let now=1000;
+ const first=new RoutingObservations({enabled:true,filename:file,now:()=>now});
+ const lane={...worker,id:'m3',identity:'m3-build',model:'glm'};
+ const value={connected:true,source:'omlx',at:now,activity_at:now,requests:50,running:1,waiting:0,
+   request_rows:[{id:'engine-internal-ddd',model:'glm',phase:'decode',generatedTokens:320,elapsedSeconds:8}]};
+ first.observeNative(lane,value,[{...structuredClone(job),id:'gw-1',dispatched:1000}]);
+ assert.equal(first.samples.length,1);
+ // The store is written asynchronously; wait for it to land, then restore.
+ for(let i=0;i<80&&!fs.existsSync(file);i++)await new Promise(r=>setTimeout(r,10));
+ first.close();
+ for(let i=0;i<80&&(!fs.existsSync(file)||!JSON.parse(fs.readFileSync(file,'utf8')).samples?.length);i++)await new Promise(r=>setTimeout(r,10));
+ const second=new RoutingObservations({enabled:true,filename:file,now:()=>now});
+ const restored=second.restoredSamples.find(s=>s.phase==='decode');
+ assert.ok(restored,'the engine-sourced sample is persisted');
+ assert.equal(restored.engineRow,true,'the engine-sourced label survives the round-trip');
+});
+// A lane whose engine names its OWN requests cannot be correlated by id, so the
+// only source of progress for its running work is the lane's own rows. With TWO
+// concurrent requests the old rule (match only when both sides hold exactly one)
+// attached nothing, so every running request scored 'running_progress_unavailable'
+// for the lane's whole in-flight window — the lane was untimeable exactly when it
+// was busy, and a slower sibling that happened to be in step kept winning.
+const multiLane = ({rows, running}) => {
+ const now=1100,monitor=new RoutingObservations({enabled:true,now:()=>now});
+ for(const tokens of [100,120,200,300,150,180,90,240])complete(monitor,tokens);
+ for(const phase of ['prefill','decode'])monitor.samples.push({workerId:worker.id,identity:worker.identity,model:worker.model,
+   requestId:`rate:${phase}`,phase,tokens:phase==='prefill'?900:120,seconds:1,concurrency:1,scope:'request',waitExcluded:true,concurrencyStable:true});
+ monitor.started({job:running[0],worker,fleet:[worker],concurrency:1});
+ const native={connected:true,source:'omlx',at:now,activity_at:now,requests:40,running:rows.length,waiting:0,
+   request_rows:rows.map(({tokens,publishedTps})=>({id:'engine-placeholder',model:'glm',phase:'decode',
+     generatedTokens:tokens,elapsedSeconds:8,publishedTps}))};
+ const result=monitor.evaluate({job,workers:[{...worker,capacity:4,running,queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ return result.candidates[0];
+};
+const inFlight = () => [{...structuredClone(job),id:'gw-a',dispatched:1000},
+  {...structuredClone(job),id:'gw-b',sequence:2,dispatched:1000}];
+
+test('an engine that names its own requests stays timeable with several in flight',()=>{
+ const [a,b]=inFlight();
+ const rows=[{id:'engine-1',tokens:120,publishedTps:15},{id:'engine-2',tokens:60,publishedTps:15}];
+ // The ids are the engine's own; neither is a gateway request id.
+ const lane=multiLane({rows,running:[a,b]});
+ assert.notEqual(lane.reason,'running_progress_unavailable');
+ assert.ok(Number.isFinite(lane.completionSeconds),
+   'a multi-request lane that names its own requests is still timeable');
+ assert.equal(lane.runningCount,2);
+});
+// The lane's estimate is the SUM of its per-slot remaining times, and that sum is
+// invariant under which same-model request holds which row — the planner books new
+// work into whichever slot frees first, not into a named one. So a positional
+// pairing can never change this lane's own estimate; it only stops the lane being
+// untimeable. This pins that safety property rather than trusting the comment.
+test('the pairing order cannot change the lane estimate, only whether it exists',()=>{
+ const rows=[{id:'engine-1',tokens:120,publishedTps:15},{id:'engine-2',tokens:300,publishedTps:37}];
+ const forward=multiLane({rows,running:inFlight()});
+ const backward=multiLane({rows:[...rows].reverse(),running:inFlight()});
+ assert.ok(Number.isFinite(forward.completionSeconds)&&Number.isFinite(backward.completionSeconds));
+ assert.equal(forward.completionSeconds,backward.completionSeconds,
+   'permuting which request holds which row leaves this lane estimate identical');
+});
+// A real id correlation is evidence; a borrowed row is an inference. A partially
+// matched lane (one request owns its row, one borrows) must still be timed, and it
+// must reach the SAME total as the identical row multiset with no id match at all —
+// that equality is what proves every row is used exactly once, none dropped and
+// none counted twice by the borrowing path.
+test('a partially matched lane uses every row exactly once',()=>{
+ const [a,b]=inFlight();
+ const exact=a.id, tokens={exact:400,borrowed:8};
+ const partial=multiLane({rows:[{id:exact,tokens:tokens.exact,publishedTps:50},
+   {id:'engine-9',tokens:tokens.borrowed,publishedTps:1}],running:[a,b]});
+ const allBorrowed=multiLane({rows:[{id:'engine-8',tokens:tokens.exact,publishedTps:50},
+   {id:'engine-9',tokens:tokens.borrowed,publishedTps:1}],running:[a,b]});
+ assert.ok(Number.isFinite(partial.completionSeconds),'a partially matched lane is still timed');
+ assert.equal(partial.completionSeconds,allBorrowed.completionSeconds,
+   'the exact match is used in place of the borrowed row, neither dropped nor doubled');
+});
+// Borrowing is only safe when the two sides agree on how much work there is.
+// Rows cannot be matched one-to-one, so every running request stays unavailable
+// rather than attaching a row to a request that may not own it.
+test('rows are never borrowed when the counts disagree',()=>{
+ const [a,b]=inFlight();
+ const lane=multiLane({rows:[{id:'engine-1',tokens:120,publishedTps:15},
+   {id:'engine-2',tokens:60,publishedTps:15},{id:'engine-3',tokens:30,publishedTps:4}],running:[a,b]});
+ assert.equal(lane.completionSeconds,null);
+ assert.equal(lane.reason,'running_progress_unavailable');
+});

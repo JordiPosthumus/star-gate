@@ -170,7 +170,14 @@ export function omlxActivity(value){
   const request_rows=models.flatMap(model=>['prefilling','generating','waiting'].flatMap(group=>(model[group]??[]).flatMap(row=>
     typeof row?.request_id==='string'&&row.request_id.length<=256&&typeof model.id==='string'&&model.id.length<=256?[{
       id:row.request_id,model:model.id,phase:group==='prefilling'?'prefill':group==='waiting'?'waiting':row.generated_tokens>0?'decode':'preparing',
-      computedTokens:finite(row.processed),totalTokens:finite(row.total),generatedTokens:finite(row.generated_tokens)
+      computedTokens:finite(row.processed),totalTokens:finite(row.total),generatedTokens:finite(row.generated_tokens),
+      // The engine's own per-request timing. oMLX names its requests itself, so
+      // its rows can never be correlated to a gateway request id — the router's
+      // sample collector needs these fields to measure the lane at all, and the
+      // panel needs them to explain the number. Dropping them here is what left
+      // a lane that was measurably fast with no speed and no in-flight timing.
+      elapsedSeconds:finite(row.elapsed_seconds),elapsed:finite(row.elapsed),
+      publishedTps:finite(row.tokens_per_second),publishedSpeed:finite(row.speed)
     }]:[]))).slice(0,512);
   return {
     live_activity:true,running,waiting,request_rows,
