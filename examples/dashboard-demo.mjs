@@ -108,18 +108,7 @@ const currentJobs={read:async()=>({schema:1,demo:true,jobs:[
 const registry=()=>({model:'deepseek-v4-flash',minimum_context:snapshot.gateway.context_length,context_limit_control:true,context_limit_source:'saved',queue_timeout_ms:snapshot.gateway.queue_timeout_ms,conversation_turns:snapshot.gateway.conversation_turns,conversation_turn_idle_ms:2000,conversation_turns_control:true,conversation_turns_source:'saved',queue_timeout_control:true,queue_timeout_source:'saved',workers,recovery,queued_relocation:relocation});
 if(agentHold)Object.assign(workers[2],{drained:true,operator_paused:false,holds:[{id:'demo-hold',owner_id:'test-agent',reason:'<DS4 compatibility test>'}]});
 if(quarantinedWorker)Object.assign(workers[2],{is_healthy:false,quarantine:{reason:'repeated_inference_failures',at:new Date(now-600000).toISOString()}});
-return createDashboard(()=>({...snapshot,time:Date.now(),gateway_at:Date.now(),
-  performance_lights:performanceHistory.snapshot(Date.now(),workers.map(w=>({id:w.id,backend_epoch:'d'.repeat(64),connected:w.is_healthy,active:!!w.load,decode:{time:Date.now()-1000},prefill:{time:Date.now()-1000}}))),
-  devices:workers.map(w=>{
-    const d=devices.find(d=>d.id===w.id);if(!d)return new DeviceTelemetry(w.id).snapshot();
-    const shift=Date.now()-now;
-    return {...d,last_event:d.last_event+shift,decode:{...d.decode,time:d.decode.time+shift},prefill:{...d.prefill,time:d.prefill.time+shift},series:d.series.map(row=>({...row,time:row.time+shift}))};
-  }),
-  cache_continuity:{...snapshot.cache_continuity,checked_at:Date.now()},
-  gateway:{...snapshot.gateway,total:workers.length,healthy:workers.filter(w=>w.is_healthy).length,available:workers.filter(w=>w.is_healthy&&!w.drained).length,active:workers.filter(w=>w.load).length,queued:workers.reduce((a,w)=>a+w.queued,0)}}),undefined,{
-  media:async()=>({jobs:mediaDemo?[{id:'00000000-0000-4000-8000-000000000002',kind:'video',state:'running',execution:{worker_id:'sparkA',operation_id:'00000000-0000-4000-8000-000000000001',active_job_id:'00000000-0000-4000-8000-000000000002',phase:'generating',native_progress:{connected:true,at:Date.now()-4000,node:'9',node_type:'KSampler',value:12,max:20},started_at:new Date(Date.now()-660000).toISOString(),changed_at:new Date(Date.now()-180000).toISOString(),heartbeat_at:new Date(Date.now()-2000).toISOString(),batch_index:2,batch_size:3}}]:[]}),
-  read:async()=>registry(),
-  act:async(action,input)=>{
+const managementAct=async(action,input)=>{
     if(action==='conversation-turns'){
       if(Object.keys(input).sort().join(',')!=='conversation_turns,expected_conversation_turns'||!Number.isSafeInteger(input.conversation_turns)||input.conversation_turns<1)throw new Error('Invalid conversation turn allowance');
       if(input.expected_conversation_turns!==snapshot.gateway.conversation_turns)throw new Error('Conversation turn allowance changed');
@@ -167,9 +156,42 @@ return createDashboard(()=>({...snapshot,time:Date.now(),gateway_at:Date.now(),
       }
     } else throw new Error('This screenshot demo does not run recovery. No real services are connected.');
     return registry();
+};
+
+return createDashboard(()=>({...snapshot,time:Date.now(),gateway_at:Date.now(),
+  performance_lights:performanceHistory.snapshot(Date.now(),workers.map(w=>({id:w.id,backend_epoch:'d'.repeat(64),connected:w.is_healthy,active:!!w.load,decode:{time:Date.now()-1000},prefill:{time:Date.now()-1000}}))),
+  devices:workers.map(w=>{
+    const d=devices.find(d=>d.id===w.id);if(!d)return new DeviceTelemetry(w.id).snapshot();
+    const shift=Date.now()-now;
+    return {...d,last_event:d.last_event+shift,decode:{...d.decode,time:d.decode.time+shift},prefill:{...d.prefill,time:d.prefill.time+shift},series:d.series.map(row=>({...row,time:row.time+shift}))};
+  }),
+  cache_continuity:{...snapshot.cache_continuity,checked_at:Date.now()},
+  gateway:{...snapshot.gateway,total:workers.length,healthy:workers.filter(w=>w.is_healthy).length,available:workers.filter(w=>w.is_healthy&&!w.drained).length,active:workers.filter(w=>w.load).length,queued:workers.reduce((a,w)=>a+w.queued,0)}}),{
+  // The dashboard takes a single options object. This demo used to pass its
+  // handlers positionally, which silently stopped matching once the signature
+  // changed: the management object landed on assetsDirectory, so the worker
+  // registry answered {enabled:false} and every control route fell through to
+  // 404/410. mediaTools carries the synthetic media panel; the custom Genie chat
+  // API was removed from the dashboard, so no console is registered.
+  mediaTools: {
+  media:async()=>({jobs:mediaDemo?[{id:'00000000-0000-4000-8000-000000000002',kind:'video',state:'running',execution:{worker_id:'sparkA',operation_id:'00000000-0000-4000-8000-000000000001',active_job_id:'00000000-0000-4000-8000-000000000002',phase:'generating',native_progress:{connected:true,at:Date.now()-4000,node:'9',node_type:'KSampler',value:12,max:20},started_at:new Date(Date.now()-660000).toISOString(),changed_at:new Date(Date.now()-180000).toISOString(),heartbeat_at:new Date(Date.now()-2000).toISOString(),batch_index:2,batch_size:3}}]:[]}),
+  read:async()=>registry(),
+  act:managementAct,
   },
-},genie,()=>({enabled:true,status:'ready',demo:true,window_limit:500,not_dispatched:1,throughput:throughput.snapshot(),fleet_speed:{...fleetSpeed.snapshot(Date.now(),workers.map(worker=>worker.id)),status:'ready',partial_history:false},
-  handovers:{rows:[]}}),currentJobs,null,null,chatFactory?.(()=>({...snapshot,time:Date.now(),gateway_at:Date.now()}))??null,null,operations);
+  management: {read:async()=>registry(), act:managementAct},
+  // Synthetic observed handovers, so the demo shows a populated panel without a
+  // real dataset behind it. Marked demo so no one reads it as live evidence.
+  requestHistory:()=>({demo:true,source:'observed_applied_relocations',counterfactual:'unknown',
+    total:2,dispatched:2,completed:1,excluded:0,pending:1,
+    rows:[{source:'sparkA',destination:'mac-ultra',actor:'operator',at:Date.now()-180000,waiting_before_move_ms:84000,
+      post_move_wait_ms:1800,service_ms:null,service_state:'pending',cached_fraction:null},
+      {source:'sparkB',destination:'sparkA',actor:'operator',at:Date.now()-600000,waiting_before_move_ms:41000,
+      post_move_wait_ms:900,service_ms:15300,service_state:'complete',cached_fraction:0.42}],
+    rejected_events:0,evicted_records:0,fleet_speed:{status:'ready',partial_history:false},
+    note:'Synthetic demonstration rows. No real dataset is connected.'}),
+  currentJobs,
+  memory,
+});
 }
 if(isMain(import.meta.url)) {
 const server=createDemoServer();
