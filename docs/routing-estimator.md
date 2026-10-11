@@ -53,6 +53,15 @@ Remaining prefill subtracts request-level computed uncached tokens once. Running
 
 A running request is timed from, in order of preference: its own fresh engine activity row, then the **dispatch basis** recorded on the job at admission. The basis is a labelled estimate (input tokens, phase speeds, and the concurrency it was dispatched at) that every request records, so an in-flight request always has something to measure from.
 
+#### Engines that name their own requests
+
+A vLLM-family engine publishes its per-request rows under the gateway's own request id, so a row and a request can be correlated exactly. **oMLX — the M3 lane — names every request itself**, and those ids have nothing to do with the gateway's. An id-keyed sampler therefore discarded every row that lane produced: its real measurements were displayed on the dashboard and thrown away before they reached the estimator, so the lane contributed no speed and could not be timed while busy — precisely when placement is being decided.
+
+Such a lane is now a first-class source on its own terms:
+
+- **Speed.** Each row carries its own token count and elapsed seconds, so it is a measurement with no gateway request to point at. Rows whose id *is* a known gateway job id stay on the exact time-delta path and ids are deduped within a poll, so nothing is counted twice. A row is accepted only when its own numbers are positive and, where the engine publishes its own rate, that rate corroborates the arithmetic. An engine that publishes no rate (oMLX reports `0.0` for prefill) is trusted on the arithmetic alone.
+- **In-flight timing.** Rows are matched to the lane's running requests as a set. Requests already correlated by id are marked taken first and are never lent a row, so a borrowed row cannot displace a real correlation. Rows are lent only when both sides agree on the count; otherwise the lane abstains. The pairing is deliberately *not* treated as meaningful, because it does not need to be: a lane's estimate is the **sum of its per-slot remaining times**, and that sum is invariant under permuting which same-model request holds which row — new work is booked into whichever slot frees first, not into a named one. The pairing therefore cannot change the lane's estimate; it only stops the lane reading `running_progress_unavailable` for its whole in-flight window.
+
 Two conditions previously suppressed the basis and left a lane unscoreable:
 
 - **A present-but-stale row.** The basis step originally required `!row`, so any row at all — including one from a previous poll — blocked it. vLLM lanes publish no per-request activity rows whatsoever, so those lanes could never be timed, and an omlx lane could not be timed between polls. The fallback now applies whenever this request has no *fresh row of its own*.
