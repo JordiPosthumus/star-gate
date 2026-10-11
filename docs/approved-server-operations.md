@@ -383,7 +383,7 @@ allowance or qualify an actual candidate image.
 `server_change_status` now includes the saved outcome: whether the candidate or
 the previous version was retained, published and previous configuration revisions,
 its native qualification summary, and the separate gateway readmission receipt.
-Genie can match those exact revisions against Hourglass report associations before
+Genie can match those exact revisions against benchmark report associations before
 comparing results. An owner pause can remain after successful verification; the
 status does not mislabel that as readmitted. Missing or unreadable qualification
 receipts remain explicit and are preserved.
@@ -392,66 +392,3 @@ These are dated execution receipts, not fresh health checks or measured speed
 improvements. The tool does not launch, repeat, approve, keep or restore a change.
 The complete research-to-trial-to-keep-or-restore workflow still needs native
 acceptance; this evidence connection alone does not establish it.
-
-## Measured experiments that return the original
-
-Genie can set `trial: true` on `propose_server_change`. This uses the same server
-changes capability switch and exact-plan approval. The worker must already have
-an enrolled direct Hourglass target with owned maintenance enabled. Preparation
-captures the native one-hour measurement review using read-only requests.
-
-The approved operation drains existing work, retains the original container,
-applies the proposed recipe and runs its native checks. If those pass, it submits
-the reviewed Hourglass request once and observes that same job until it finishes.
-It then restores and qualifies the original, even when the candidate passes.
-Failed qualification skips measurement; a proven measurement rejection also
-returns the original. Unknown start acceptance keeps the hold for inspection:
-the runner neither repeats the start nor stops potentially active work.
-
-The review card explicitly identifies the trial and its return behavior. Saved
-status includes the native job ID and measured candidate signature. The private
-record keeps the original approval and archives both versions' check results
-and the trial receipts. A candidate trial has no newly approved configuration
-revision: do not attribute its score to the restored original's record revision.
-Read its native job report and exact trial identity when comparing with a baseline.
-Adopting an improvement remains a separate reviewed serving change.
-
-Reading a completed trial's server-change status fetches its exact aggregate
-report through the existing Hourglass adapter and retains that summary beside
-the operation. The summary then appears in measurement status, chat context and
-the existing comparison tool. Its association carries the operation ID, native
-job ID and candidate signature, with no candidate approval revision. Comparison
-checks those identities and the report's run key. Missing reports remain
-unavailable and can be read again; no benchmark is restarted. Baseline record
-revisions that changed since measurement still require review.
-
-Ordinary proposals without `trial: true` retain their existing apply-and-qualify
-behavior. Fixture tests cover the new lifecycle; native trial acceptance remains
-necessary before claiming that a particular upstream improvement works or is faster.
-
-
-### Native rejected-trial check, 17 September 2026
-
-One actual Genie-prepared image-only trial passed all eight native serving groups:
-text, tools, vision, model/context, full context boundary, prefix-cache reuse,
-reasoning/EOS and fault counters. Candidate KV capacity was 493,873 tokens against
-a pre-change 512,701, so the reviewed zero-loss allowance rejected it. Hourglass
-was not submitted. The executor automatically restored the retained original,
-passed its native checks, committed private evidence and readmitted it.
-
-The restored original reported 502,563 cache tokens with unchanged serving
-settings. Startup allocation varied too; these numbers do not establish a causal
-patch cost or a speed result. Actual cache reuse returned from zero to 4,800 tokens
-in both checked conversations. This proves the apply/reject/restore path for that
-installed profile, not a successfully measured or adopted improvement.
-
-Candidate rejection details are now available to Genie and the operation card
-while restoration is in progress. Readmission remains a separate result. A real
-Genie status check correctly explained the rejection from its new tool receipt;
-an earlier ungrounded answer in a long conversation required correction and is
-retained as a failed check, not counted as autonomous verification success.
-
-Final Hourglass reports also accept its observed `stopped` hour-window outcome
-without renaming that state. A stopped status alone is not a full-hour result:
-comparison flags incomplete or unknown measured windows and still checks the
-exact job, configuration identity and report protocol.

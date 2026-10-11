@@ -23,7 +23,7 @@ the backend; DSG preserves its existing scheduling and a shared context limit.
 
 For adding an inference backend, see the
 [new-backend onboarding guide](docs/server-setup-guide.md): parameter contracts,
-thinking choices and evidence for the Hourglass → DSG → backend chain.
+thinking choices and evidence for the client → DSG → backend chain.
 
 Use [Testing mode](docs/testing-mode.md) for isolated admission through the normal
 gateway machinery. [Conversation turns](docs/conversation-turns.md) explains the

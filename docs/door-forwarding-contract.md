@@ -1,4 +1,4 @@
-# Hourglass → DSG forwarding contract
+# Continuity Door forwarding contract
 
 Use DSG's public Continuity Door for inference, or its [Testing endpoint](testing-mode.md) when Testing is enabled. The synthetic regression suite exercises the Door, gateway and mock OpenAI backends together. It does not certify a particular deployed backend's parameter resolution or model quality.
 
@@ -15,7 +15,7 @@ Routes retain worker health, pauses and queue deadlines. A missing route header 
 
 ## Synthetic forwarding coverage
 
-`ds4-gateway/hourglass-forwarding.test.mjs`, included in `npm test`, verifies:
+`ds4-gateway/door-forwarding.test.mjs`, included in `npm test`, verifies:
 
 - Request bytes survive except for an explicitly configured top-level model alias. Whitespace, Unicode, zero/false settings, nested thinking controls, tools, output budgets and omitted fields survive.
 - Incremental uploads reach the backend before upload completion.

@@ -23,7 +23,7 @@ Configuration in `config.local.json`:
 - A failed or cancelled active request releases its unused allowance. Queue cancellation and deadlines remain in effect. Missing conversation IDs use FIFO within their priority class and never acquire an allocation.
 - Allocations are local to each worker and are not persisted across restart. Existing routing, worker pauses, health checks, conversation ownership, no-replay protections and one active request per worker remain in effect. A turn count is not a maximum generation duration.
 
-## Hourglass integration contract
+## Conversation affinity contract
 
 Send a stable `x-session-affinity` header on every model request belonging to the same benchmark conversation, including tool continuations and follow-up prompts. Use a distinct ID for each independent question/conversation and concurrent attempt; do not reuse one ID for the whole benchmark or worker route. DSG also recognizes its existing `x-ds4-conversation-id`, `x-session-id`, and `session_id` headers, in that priority order after `x-session-affinity`.
 
@@ -31,12 +31,12 @@ Example request headers:
 
 ```text
 x-dsg-model: spark1
-x-session-affinity: hourglass-<unique-attempt-conversation-id>
+x-session-affinity: conv-<unique-attempt-conversation-id>
 ```
 
 `x-dsg-model` selects the configured worker route. It does not identify the conversation. Do not use a request ID that changes at every tool turn as the affinity value.
 
-In Pi 0.85.1, the OpenAI completion adapter defaults `sendSessionAffinityHeaders` to false. The Hourglass owner can explicitly enable `compat.sendSessionAffinityHeaders` for DSG models so Pi sends its session ID, or attach the header at the existing DSG transport boundary using one stable per-conversation ID. Verify two successive model calls share the header and independent conversations differ. Configure this in the client; DSG cannot infer conversation identity from a worker route.
+In Pi 0.85.1, the OpenAI completion adapter defaults `sendSessionAffinityHeaders` to false. The client operator can explicitly enable `compat.sendSessionAffinityHeaders` for DSG models so Pi sends its session ID, or attach the header at the existing DSG transport boundary using one stable per-conversation ID. Verify two successive model calls share the header and independent conversations differ. Configure this in the client; DSG cannot infer conversation identity from a worker route.
 
 Use `http://127.0.0.1:30000/testing/v1` while Testing is on. The same scheduler applies to testing and normal inference. Compare N=1 and N=5 using concurrent conversations, recording dispatch order, queue wait and completed work. Cache and throughput improvements require measurements from the actual backend.
 

@@ -8,11 +8,11 @@ produce a complete contract. No new live inference was run for these checks.
 ## Approved reasoning policy and corrected implementation status
 
 The owner approved explicit supported reasoning choices and rejection of
-unsupported selections on 10 September 2026. Hourglass owns preflight selection;
+unsupported selections on 10 September 2026. The backend owner owns preflight selection;
 DSG must preserve the value and backend errors. No silent aliases or substitution
 are approved. Intentional client aliases require explicit agreement and visible
 selected-label/native-value recording. This decision does not implement changes
-in Hourglass, DSG, Pi or the servers.
+in the client, DSG, Pi or the servers.
 
 The audited Qwen templates support `low`, `medium` and `xhigh`; omission defaults
 to `xhigh`. The earlier guide's “high/max: reject” entries described the desired
@@ -76,8 +76,8 @@ identities remain in the [deployment reference](server-deployment-reference.md).
 
 **Full chain readiness is not established.** The backend owner must resolve or
 clearly bound the parameter-handling defects and complete authorized application
-tests. Hourglass owns supported-choice exposure and preflight validation; DSG
+tests. The backend owner owns supported-choice exposure and preflight validation; DSG
 owns deployed route and forwarding verification. The
-[DSG receipt](hourglass-dsg-contract.md) covers synthetic source tests and records
+[DSG receipt](door-forwarding-contract.md) covers synthetic source tests and records
 the unverified deployed routing and vision-recovery exception. This document
 neither fixes those systems nor authorizes changes to them.

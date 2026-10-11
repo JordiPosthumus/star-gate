@@ -1,8 +1,8 @@
 # New-backend onboarding guide
 
 Use this procedure when adding a backend such as DS4, a vLLM container, oMLX or
-LM Studio to **Hourglass → DSG → backend**. The result is one concise contract
-for the particular model and runtime: Hourglass can select a valid configuration,
+LM Studio to **client → DSG → backend**. The result is one concise contract
+for the particular model and runtime: the client can select a valid configuration,
 DSG can forward it unchanged, and the backend accepts and honours it.
 
 An OpenAI-compatible endpoint or a successful response is not proof of parameter
@@ -12,7 +12,7 @@ support. Do not infer capabilities from a server family or model name.
 
 - **Backend owner:** establishes native model identity, supported settings,
   resolution and actual application, capacity behaviour and explicit errors.
-- **Hourglass owner:** exposes supported choices, validates profiles before a
+- **Backend owner:** exposes supported choices, validates profiles before a
   run, records what was sent and owns scoring.
 - **DSG owner:** owns transport, declared model aliases and fixed-worker routing;
   preserves parameter values, omission, inputs, responses and errors.
@@ -64,7 +64,7 @@ checks may establish preliminary evidence without exercising the live model.
    tests cannot establish. Pending approval means this stage remains untested.
 
 5. **Verify the chain and assign readiness.** With the respective owners and
-   required authorization, compare the Hourglass request, DSG's forwarded
+   required authorization, compare the client's request, DSG's forwarded
    request, selected backend identity, resolved settings and returned result
    or error. Parameters and inputs must survive unchanged; record declared
    model-ID routing separately. Source-only forwarding tests do not certify a
@@ -192,7 +192,7 @@ mean the same thing across backends, or that effort selects a token budget.
 
 | Record | Required contents |
 |---|---|
-| Requested | Exact synthetic request at Hourglass and DSG egress, including zero, false and omitted fields; selected route/model |
+| Requested | Exact synthetic request at the client and DSG egress, including zero, false and omitted fields; selected route/model |
 | Server-resolved | Identified parser/default/template/sampler result; explicit offline or live provenance |
 | Directly tested | Observed application or error, test conditions and limits; “not run” where applicable |
 
@@ -207,7 +207,7 @@ remaining gap and its owner; do not call acceptance alone “honoured”.
 ## References
 
 - [OpenAI-compatible worker configuration](openai-endpoints.md)
-- [DSG forwarding contract and limitations](hourglass-dsg-contract.md)
+- [Continuity Door forwarding contract and limitations](door-forwarding-contract.md)
 - [Testing endpoint](testing-mode.md)
 
 Keep per-installation observations, deployment history and backend audit handoffs

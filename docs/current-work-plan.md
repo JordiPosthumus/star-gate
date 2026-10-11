@@ -20,7 +20,7 @@ restoration before conditional readmission. The Spark executor exercises native
 context acceptance and two simultaneous requests; the oMLX executor verifies
 cold-to-warm cache reuse and retains adaptive MTP observations. This qualifies
 only the enrolled trial and observed worker, not every engine or future recipe.
-The broader configuration-aware research/Hourglass loop below remains partial.
+The broader configuration-aware research loop below remains partial.
 
 Fleet power uses fresh native idle checks, a separate healthy worker and detached
 launchers. Native serving checks exercise gateway generation, tool-result exchange
@@ -34,7 +34,7 @@ measurements, approvals and restoration receipts remain private.
   feature switches and visible failures. Further hardening follows real use;
   preserve active jobs, established settings and deliberate maintenance stops.
 - Independent switches cover routine reviews, Genie queue balancing, recovery,
-  public research, inspection, approved server changes, Hourglass measurement,
+  public research, inspection, approved server changes, benchmark measurement,
   media jobs, new-Spark preparation and fleet power. All ten choices can be saved
   before their services are connected. Direct reservation is a separate gateway
   setting, not an additional Genie capability switch.
@@ -78,7 +78,7 @@ measurements, approvals and restoration receipts remain private.
   Join each server's recorded configuration and actual installed revisions to
   relevant upstream PRs/releases, retaining sources and the last studied revision.
   Public research has standing owner permission; server changes and measurements
-  keep their separate controls. After recovery and Hourglass are connected, join
+  keep their separate controls. After recovery and measurement are connected, join
   research to one approved candidate trial on a drained worker, compare against
   the saved baseline, and report whether to keep or restore it. The inspection,
   research, proposal and measurement pieces are partly built; this complete loop
@@ -105,11 +105,6 @@ measurements, approvals and restoration receipts remain private.
   as proof. Reminder mode still requires a start action; automatic mode waits for
   existing chats to finish and honors the Public research switch and testing mode.
   The complete candidate trial and baseline comparison loop remains outstanding.
-  A read-only `compare_hourglass_reports` tool now compares selected retained
-  report revisions, checks their recorded methodology and exposes condition
-  gaps separately from score arithmetic. It reuses the existing Hourglass tool
-  endpoint and private chat receipts; it neither starts a measurement nor chooses
-  whether to keep a server change. Native whole-trial acceptance remains required.
   Server-change status now supplies the retained serving version, saved
   qualification/readmission and exact published/previous configuration revisions
   so Genie can connect those reports to an operation. Missing receipts remain
@@ -148,7 +143,7 @@ measurements, approvals and restoration receipts remain private.
   installed worker. A real image-only trial now completed candidate native checks,
   rejected its reduced reported cache capacity, restored and qualified the original,
   published private evidence and readmitted the worker. The measured-candidate
-  success path remains unproven; this rejected candidate did not run Hourglass. Published results now link to their raw JSON evidence for Genie
+  success path remains unproven; this rejected candidate was not measured. Published results now link to their raw JSON evidence for Genie
   inspection. Optional dashboard enrollment, real Hermes proposal/status
   tools and the owner approval/progress card now pass isolated integration and
   browser checks. The executed trial used an actual Genie-created proposal and an
@@ -186,23 +181,6 @@ measurements, approvals and restoration receipts remain private.
   follow-ups after zero-cache cold calls; its production binding is activated.
   This is same-launcher recovery, not previous-version rollback or a new approved
   model configuration. See [oMLX recovery](omlx-recovery.md).
-- [ ] Integrate owner-started Hourglass runs, initially measuring the chosen
-  server directly with recorded configuration and measurement provenance.
-  Saved aggregate reports are wired into the dashboard and chat,
-  with explicit operator-supplied worker/revision associations. Owner-started
-  start controls, durable receipts, restart observation and result collection are
-  included as optional support in this release. One installation now connects
-  the current Hourglass console and a direct target with owned maintenance,
-  preserving its original native entries and settings. Live capability and
-  review controls are verified. One real owned one-hour Spark measurement has
-  finished, produced its native aggregate report and automatically returned the
-  unchanged server to gateway service. Actual Genie tool calls inspected the
-  live server and compared saved reports. Numeric outcome counts and native job
-  IDs now remain visible, including a refresh of older report projections.
-  This verifies that installed lifecycle, not historical performance parity or
-  all measurement failure paths.
-  Preserve each report's recorded metric and rules; current Hourglass source uses
-  total points, while older reports include incompatible AUC-derived scores.
 - [ ] Deliver the official Star Gate build for two additional Sparks as a
   near-term acceptance target: pinned chosen LLM, MiniMax H3 and ACE-Step setups,
   with Genie-led installation, real generation checks for each engine, gateway
