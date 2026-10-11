@@ -6,9 +6,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {diagnoseSparkConnection,sshAuthenticationEvidence} from './spark-connection-diagnosis.mjs';
 import {sparkIdentity} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './spark-setup-transport.mjs';
 import http from 'node:http';
-
 
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 function fixture(t){
@@ -58,10 +56,4 @@ test('destination changes, extra input, missing local config and concurrent proo
   const g=fixture(t);g.options.discovery.connectionProof=async()=>({...g.proof,scan_id:++g.rechecks===1?'first':'changed'});
   await assert.rejects(g.inspect(),/changed during/);
 });
-test('read-only diagnosis follows inspection permission independently from mutation permission',async()=>{
-  let inspection=true,testing=false,calls=0;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{isEnabled:()=>false,isDiscoveryEnabled:()=>inspection,isTesting:()=>testing,connectionRepair:{inspect:async input=>{calls++;return {connection:input.connection,state:'observed'};}}});
-  assert.equal((await tools.tool({action:'inspect_connection',connection:'FixtureSpark'})).state,'observed');
-  inspection=false;await assert.rejects(tools.tool({action:'inspect_connection',connection:'FixtureSpark'}),/switched off/);
-  inspection=true;testing=true;await assert.rejects(tools.tool({action:'inspect_connection',connection:'FixtureSpark'}),/testing mode/);assert.equal(calls,1);
-});
+

@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {createSparkDiscovery,sparkIdentity,networkAddresses,neighborAddresses,localAddress,configuredSSH,sparkIdentityProbe,multicastInterfaces,multicastReplyAddresses,localNetworkSources,discoverySSHReason} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './spark-setup-transport.mjs';
 
 // Generate synthetic RFC1918 addresses for locality tests; never use deployment inventory.
 const ip=(...octets)=>octets.join('.');
@@ -185,28 +184,12 @@ test('initial-access eligibility binds saved IDs and keys and excludes known inv
   assert.deepEqual(proof.known_identities,[sparkIdentity(facts())]);assert.match(proof.known_hosts_sha256,/^[a-f0-9]{64}$/);
   aliases.push('other');await assert.rejects(f.service.accessCandidates({scan_id:scan.scan_id}),/fresh discovery/);
 });
-test('setup tool exposes discovery with capability/testing gates and strict argument schemas',async t=>{
-  const f=fixture(t);let enabled=false,testing=false;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{discovery:f.service,isEnabled:()=>enabled,isTesting:()=>testing});
-  await assert.rejects(tools.tool({action:'discover'}),/switched off/);enabled=true;testing=true;await assert.rejects(tools.tool({action:'discover'}),/testing mode/);testing=false;
-  for(const extra of [{password:'no'},{host:ip(10,0,0,1)},{command:'reboot'},{username:'owner;whoami'}])await assert.rejects(tools.tool({action:'discover',...extra}));
-  const result=await tools.tool({action:'discover'});await f.service.settled();assert.equal((await tools.tool({action:'discovery_status'})).scan_id,result.scan_id);
-  assert.equal((await tools.tool({action:'status'})).discovery.state,'complete');
-  await assert.rejects(tools.tool({action:'discovery_status',username:'owner'}),/no other arguments/);
-});
+
 test('no configured user never invents a login, and incomplete known-host identity stays visible',async t=>{
   const f=fixture(t,{aliases:async()=>[]});await f.service.discover();await f.service.settled();
   assert.equal(f.calls.length,0);assert.ok(f.service.status().issues.some(i=>i.reason==='no_existing_ssh_username'));
   const g=fixture(t,{inspect:async()=>{throw Error('unreachable');}});await g.service.discover();await g.service.settled();
   assert.ok(g.service.status().issues.some(i=>i.reason==='identity_probe_unavailable'));
-});
-test('read-only discovery uses inspection permission without enabling new-host enrollment',async t=>{
-  const f=fixture(t);let inspection=true;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{discovery:f.service,isEnabled:()=>false,isDiscoveryEnabled:()=>inspection});
-  assert.equal((await tools.tool({action:'discover'})).state,'running');await f.service.settled();
-  await assert.rejects(tools.tool({action:'enroll',target_id:'new'}),/New Spark setup is switched off/);
-  inspection=false;await assert.rejects(tools.tool({action:'discover'}),/Server inspection is switched off/);
-  assert.equal((await tools.tool({action:'discovery_status'})).state,'complete','Existing receipts stay readable when inspection is disabled.');
 });
 test('candidate enrollment resolves IDs from saved evidence, excludes existing machines and rejects changed topology',async t=>{
   let aliases=['existing-spark'];const f=fixture(t,{aliases:async()=>aliases});

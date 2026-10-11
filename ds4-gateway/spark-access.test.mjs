@@ -7,7 +7,6 @@ import http from 'node:http';
 import {randomUUID,createHash} from 'node:crypto';
 import {SparkAccess,handleSparkAccessSettings} from './spark-access.mjs';
 import {sparkIdentity} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './spark-setup-transport.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const facts=(id='a')=>({system:'Linux',architecture:'aarch64',machine_id:id.repeat(64),gpus:[{name:'NVIDIA GB10',uuid:`GPU-${id.repeat(32)}`}]});
@@ -102,15 +101,7 @@ test('restart forgets an unused local grant and malformed receipts are preserved
   const data=JSON.parse(fs.readFileSync(f.access.file));data[access_id].endpoints[0].host='unexpected-host';const bytes=JSON.stringify(data);fs.writeFileSync(f.access.file,bytes);
   const invalid=new SparkAccess(f.options);assert.equal(invalid.status().available,false);assert.equal(fs.readFileSync(f.access.file,'utf8'),bytes);assert.equal(f.calls.length,0);invalid.close();
 });
-test('actual setup tool dispatch accepts only IDs and preserves independent status reads',async t=>{
-  const f=fixture(t);let enabled=true;
-  const tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{access:f.access,isEnabled:()=>enabled});
-  const request={action:'request_access',scan_id:f.proof.scan_id,endpoint_ids:f.proof.endpoints.map(e=>e.endpoint_id)};
-  const {access_id}=await tools.tool(request);assert.equal(f.calls.length,0);
-  for(const action of ['request_access','bootstrap_access','access_status'])await assert.rejects(tools.tool({...request,action,access_id,password:'must-not-pass'}));
-  enabled=false;await assert.rejects(tools.tool({action:'bootstrap_access',access_id}),/switched off/);assert.equal((await tools.tool({action:'access_status',access_id})).state,'credentials_required');
-  enabled=true;f.grant(access_id);await tools.tool({action:'bootstrap_access',access_id});await f.access.settled();assert.equal((await tools.tool({action:'access_status',access_id})).state,'complete');
-});
+
 test('changed identity or restricted existing key cannot be presented as successful setup',async t=>{
   for(const state of ['identity_changed','existing_key_restricted']){
     const f=fixture(t,{transport:{install:async()=>({state,changed:false})}}),{access_id}=await f.request();f.grant(access_id);

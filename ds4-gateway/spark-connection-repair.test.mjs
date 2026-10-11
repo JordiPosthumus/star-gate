@@ -7,11 +7,8 @@ import {createHash,randomUUID} from 'node:crypto';
 import {createSparkConnectionRepair} from './spark-connection-repair.mjs';
 import {createSparkDiscovery,sparkIdentity} from './spark-discovery.mjs';
 import {inspectNewSpark} from './spark-enrollment.mjs';
-import {createSparkSetupTools} from './spark-setup-transport.mjs';
 import {assertDashboardIdle} from './service-control.mjs';
 import http from 'node:http';
-
-
 
 const sha=b=>createHash('sha256').update(b).digest('hex');
 function fixture(t){
@@ -80,14 +77,6 @@ test('strict ordinary connection check forbids implicit host-key updates and reu
   let argv;await inspectNewSpark('FixtureSpark',{strict:true,command:async(_cmd,args)=>{argv=args;return {stdout:JSON.stringify({home:'/home/fixture'})};}});
   for(const flag of ['StrictHostKeyChecking=yes','UpdateHostKeys=no','ControlMaster=no','ControlPath=none'])assert.ok(argv.includes(flag),flag);
   await assert.rejects(inspectNewSpark('FixtureSpark',{strict:true,command:async()=>{throw {stderr:'No route to host'};}}),e=>e.discovery_reason==='connection_unavailable');
-});
-
-test('connection tools obey the existing capability and testing gates while receipts remain readable',async()=>{
-  let enabled=false,testing=false,repairs=0;
-  const c=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true,targets:{}}},{isEnabled:()=>enabled,isTesting:()=>testing,connectionRepair:{busy:()=>true,status:async()=>({state:'complete'}),repair:async()=>{repairs++;return {state:'complete'};}}});
-  assert.equal((await c.tool({action:'connection_status'})).state,'complete');assert.equal(c.connectionBusy(),true);
-  await assert.rejects(c.tool({action:'repair_connection'}),/switched off/);enabled=true;testing=true;await assert.rejects(c.tool({action:'repair_connection'}),/testing mode/);assert.equal(repairs,0);
-  testing=false;assert.equal((await c.tool({action:'repair_connection'})).state,'complete');assert.equal(repairs,1);
 });
 
 test('dashboard restart waits for connection work even when chat is idle',async()=>{

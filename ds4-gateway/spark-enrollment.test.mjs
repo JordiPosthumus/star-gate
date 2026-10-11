@@ -1,7 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';
 import {createSparkEnrollment,inspectNewSpark} from './spark-enrollment.mjs';
 import {sparkIdentity} from './spark-discovery.mjs';
-import {createSparkSetupTools} from './spark-setup-transport.mjs';
 
 
 const details={target_id:'spark-new',host:'192.0.2.10',username:'owner'};
@@ -29,16 +28,6 @@ function discoveryFixture(t,extra={}){
  const options={...f.options,discovery:{candidate:async input=>{assert.deepEqual(input,discovered);sequence.push('candidate');return proof;}},inspect:async(ssh,opts)=>{assert.equal(ssh,'owner@'+details.host);sequence.push(opts.knownHosts?'pinned':'normal');assert.equal(opts.strict,true);return hardware;},promote:async input=>{sequence.push('promote');assert.equal(input.knownHosts,proof.knownHosts);},...extra};
  return {...f,proof,sequence,options,enrollment:createSparkEnrollment(options)};
 }
-test('discovery enrollment binds saved hardware and trust before exposing a target, and repeated IDs reuse the durable result',async t=>{
- const f=discoveryFixture(t),tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{enrollment:f.enrollment,transport:async()=>({state:'not_started'})});
- const result=await tools.tool({action:'enroll_discovered',...discovered});
- assert.deepEqual(f.sequence,['candidate','pinned','promote','normal']);assert.equal(result.target.identity,discovered.candidate_id);
- assert.deepEqual(result.target.discovery,{scan_id:discovered.scan_id,candidate_id:discovered.candidate_id});
- const restored=createSparkEnrollment({...f.options,discovery:{candidate:async()=>{throw Error('Must not rescan or reselect accepted enrollment');}}});
- assert.equal((await restored.enrollDiscovered(discovered)).state,'enrolled');assert.equal(f.sequence.length,4);
- await assert.rejects(restored.enrollDiscovered({...discovered,candidate_id:'b'.repeat(64)}),/different enrollment/);
- assert.equal((await tools.tool({action:'status'})).targets.length,1);
-});
 test('changed hardware or host key prevents promotion; an uncertain normal transport never saves a target',async t=>{
  for(const failure of ['identity','key','normal']){
   let promoted=0,calls=0;const f=discoveryFixture(t,{promote:async()=>{promoted++;},inspect:async()=>{calls++;if(failure==='key'||failure==='normal'&&calls===2)throw Error('SSH unverified');return failure==='identity'?{...hardware,machine_id:'b'.repeat(64)}:hardware;}});
@@ -46,18 +35,32 @@ test('changed hardware or host key prevents promotion; an uncertain normal trans
   assert.equal(promoted,failure==='normal'?1:0);assert.equal(fs.existsSync(path.join(f.directory,'targets.json')),false);assert.deepEqual(f.enrollment.targets,{});
  }
 });
-test('duplicate hardware, conflicting destinations, invalid IDs and disabled setup cannot enroll a discovered candidate',async t=>{
- const f=discoveryFixture(t,{targets:{prior:{ssh:'another-address',directory:'/srv/prior',identity:discovered.candidate_id}}});
- await assert.rejects(f.enrollment.enrollDiscovered(discovered),/hardware identity is already enrolled/);assert.deepEqual(f.sequence,['candidate']);
- const g=discoveryFixture(t),tools=createSparkSetupTools({ui_worker_management:true,spark_setup:{enabled:true}},{enrollment:g.enrollment,isEnabled:()=>false,isDiscoveryEnabled:()=>true});
- await assert.rejects(tools.tool({action:'enroll_discovered',...discovered}),/switched off/);assert.equal(g.sequence.length,0);
- for(const patch of [{host:details.host},{scan_id:'../escape'},{candidate_id:undefined},{target_id:'../escape'}])await assert.rejects(g.enrollment.enrollDiscovered({...discovered,...patch}),/no addresses or credentials/);
- assert.equal(g.sequence.length,0);
-});
 test('pinned inspection cannot accept a global/DNS key or reuse a previously connected control socket',async t=>{
  const f=fixture(t),knownHosts=path.join(f.directory,'receipt');let args;
  const observed=await inspectNewSpark('owner@'+details.host,{directory:f.directory,knownHosts,command:async(command,input)=>{assert.equal(command,'ssh');args=input;return {stdout:JSON.stringify(hardware)};}});
  assert.equal(sparkIdentity(observed),discovered.candidate_id);
  for(const option of ['UserKnownHostsFile='+knownHosts,'StrictHostKeyChecking=yes','GlobalKnownHostsFile=/dev/null','KnownHostsCommand=none','VerifyHostKeyDNS=no','UpdateHostKeys=no','ControlMaster=no','ControlPath=none'])assert.ok(args.includes(option));
  assert.equal(args.includes('StrictHostKeyChecking=accept-new'),false);assert.equal(fs.readdirSync(f.directory).length,0);
+});
+
+test('discovery enrollment binds saved hardware and trust before exposing a target, and repeated IDs reuse the durable result',async t=>{
+ // The chat tool layer that used to wrap this was deleted with genie-spark-setup.mjs;
+ // the enrollment contract itself is live and is exercised directly.
+ const f=discoveryFixture(t);
+ const result=await f.enrollment.enrollDiscovered(discovered);
+ assert.deepEqual(f.sequence,['candidate','pinned','promote','normal']);
+ assert.equal(result.target.identity,discovered.candidate_id);
+ assert.deepEqual(result.target.discovery,{scan_id:discovered.scan_id,candidate_id:discovered.candidate_id});
+ const restored=createSparkEnrollment({...f.options,discovery:{candidate:async()=>{throw Error('Must not rescan or reselect accepted enrollment');}}});
+ assert.equal((await restored.enrollDiscovered(discovered)).state,'enrolled');assert.equal(f.sequence.length,4);
+ await assert.rejects(restored.enrollDiscovered({...discovered,candidate_id:'b'.repeat(64)}),/different enrollment/);
+});
+test('duplicate hardware, conflicting destinations, invalid IDs and malformed discoveries cannot enroll',async t=>{
+ const f=discoveryFixture(t,{targets:{prior:{ssh:'another-address',directory:'/srv/prior',identity:discovered.candidate_id}}});
+ await assert.rejects(f.enrollment.enrollDiscovered(discovered),/hardware identity is already enrolled/);assert.deepEqual(f.sequence,['candidate']);
+ // Input validation lives on the enrollment service, so it is checked there rather
+ // than through the removed tool endpoint.
+ const g=discoveryFixture(t);
+ for(const patch of [{host:details.host},{scan_id:'../escape'},{candidate_id:undefined},{target_id:'../escape'}])await assert.rejects(g.enrollment.enrollDiscovered({...discovered,...patch}),/no addresses or credentials/);
+ assert.equal(g.sequence.length,0);
 });
