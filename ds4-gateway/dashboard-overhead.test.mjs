@@ -44,7 +44,11 @@ for(const [script,view] of [['current-jobs.js','view-activity']])test(`${script}
  get(view).hidden=true;const observers=[],events=new Map(),timers=[];let calls=0;
  const document={hidden:false,activeElement:null,getElementById:get,addEventListener:(name,callback)=>events.set(name,callback)};
  const context=vm.createContext({document,AbortSignal,setInterval:callback=>timers.push(callback),MutationObserver:class{constructor(callback){observers.push(callback);}observe(){}},fetch:async()=>{calls++;return {ok:true,json:async()=>({configured:false,available:false})};}});
- vm.runInContext(fs.readFileSync(new URL('./ui/'+script,import.meta.url),'utf8'),context);
+ // The page loads these as ES modules. This context has no module loader, so the
+ // import lines are stripped the same way request-history.test.mjs does; the
+ // polling contract under test lives entirely in the script body.
+ const source=fs.readFileSync(new URL('./ui/'+script,import.meta.url),'utf8').replace(/^import [^;]*;\n/gm,'');
+ vm.runInContext(source,context);
  timers.forEach(callback=>callback());await setImmediate();assert.equal(calls,0);
  get(view).hidden=false;observers.forEach(callback=>callback());await setImmediate();assert.equal(calls,1);
  document.hidden=true;timers.forEach(callback=>callback());await setImmediate();assert.equal(calls,1);

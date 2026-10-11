@@ -100,7 +100,11 @@ test('clean checkout: initialize, doctor, UI registration, exact forwarding, CLI
   }
   const initialized=await cli('scripts/setup.mjs',['--controls','--gateway-only']),configFile=path.join(checkout,'config.local.json');
   const c=JSON.parse(fs.readFileSync(configFile));assert.equal(fs.statSync(configFile).mode&0o777,0o600);assert.equal(c.nodes.length,0);assert.ok(!initialized.stdout.includes(c.api_key));
-  await assert.rejects(cli('scripts/setup.mjs',['--controls','--gateway-only']),/nothing overwritten/);assert.deepEqual(JSON.parse(fs.readFileSync(configFile)),c);
+  // Re-running setup must change nothing. It used to fail loudly; the simplified
+  // gateway-only setup now reports that it preserved the existing file and exits
+  // clean, so the guarantee is asserted on the file itself.
+  const second=await cli('scripts/setup.mjs',['--controls','--gateway-only']);
+  assert.match(second.stdout,/preserved/);assert.deepEqual(JSON.parse(fs.readFileSync(configFile)),c);
   const ports=new Set;while(ports.size<3)ports.add(await port());[c.port,c.continuity_door.core_port,c.ui_port]=ports;
   fs.writeFileSync(configFile,JSON.stringify(c));const checked=JSON.parse((await cli('scripts/doctor.mjs')).stdout);assert.ok(checked.ok);assert.equal(checked.workers,0);assert.ok(!fs.existsSync(path.join(checkout,'runtime')),'doctor must not create state');
   const backend=http.createServer((req,res)=>{if(req.url==='/v1/models')return res.end(JSON.stringify({data:[{id:c.model,context_length:c.context_length}]}));const chunks=[];req.on('data',x=>chunks.push(x));req.on('end',()=>{received=Buffer.concat(chunks).toString();res.writeHead(200,{'content-type':'text/event-stream'});res.end('data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');});});

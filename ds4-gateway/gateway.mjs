@@ -1388,6 +1388,22 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       const onData=chunk=>{
         if(mode)return;
         pieces.push(chunk);size+=chunk.length;
+        // A client that declared no length has no exact-length rewrite available
+        // — that is the whole premise of this branch — so there is nothing to
+        // wait for. Stream immediately and let the transform hold only the
+        // unfinished model token. Buffering here instead stalled every chunked
+        // upload until the model value completed, which for a pretty-printed or
+        // large streamed body means holding back bytes the engine could already
+        // have been reading.
+        const goChunked=()=>{
+          mode='chunked';rewrite.removeListener('data',onData);
+          upstream=issue(null);
+          upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
+          for(const piece of pieces)writePiece(piece);
+          pieces.length=0;
+          rewrite.pipe(upstream);
+        };
+        if(clientLength==null){goChunked();return;}
         if(state.settled&&clientLength!=null){
           mode='exact';rewrite.removeListener('data',onData);
           upstream=issue(null,null,clientLength+state.delta);
@@ -1398,14 +1414,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           // after the settled substitution it is a pass-through.
           rewrite.pipe(upstream);
         }
-        else if(state.settled||size>rewriteBufferBytes){
-          mode='chunked';rewrite.removeListener('data',onData);
-          upstream=issue(null);
-          upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
-          for(const piece of pieces)writePiece(piece);
-          pieces.length=0;
-          rewrite.pipe(upstream);
-        }
+        else if(state.settled||size>rewriteBufferBytes){goChunked();}
       };
       rewrite.on('data',onData);
       rewrite.once('error',e=>{if(upstream)upstream.destroy(e);else requestBody.destroy(e);});
