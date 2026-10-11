@@ -163,7 +163,7 @@ export class AffinityStore {
       for (const [key, item] of Object.entries(data.sessions)) {
         if (!/^[a-f0-9]{64}$/.test(key) || typeof item.node !== 'string') throw new Error('Invalid affinity entry');
       }
-      validateGenieCapabilities(data.genie_capabilities);
+      data.genie_capabilities=validateGenieCapabilities(data.genie_capabilities);
       this.data = data;
     } catch (e) { this.close(); throw e; }
   }

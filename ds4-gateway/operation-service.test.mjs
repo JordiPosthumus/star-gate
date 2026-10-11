@@ -10,13 +10,10 @@ import {createOperationService,operationToolView} from './operation-service.mjs'
 import {operationLabel,operationProgress,operationChanges,operationQualification} from './ui/server-operations.js';
 import http from 'node:http';
 
-
-import {hourglassReportSummary} from './hourglass-report.mjs';
-
 const hash=v=>createHash('sha256').update(v).digest('hex');
 const python=execFileSync('python3',['-c','import sys; print(sys.executable)'],{encoding:'utf8'}).trim();
 async function waitFor(check){for(let i=0;i<150;i++){const v=await check();if(v)return v;await new Promise(r=>setTimeout(r,30));}throw new Error('Fixture status did not arrive');}
-async function rig(t,{trial=false,trialPolicy,maintenance={native_url:'http://127.0.0.1:8001'},readTrialReport=null}={}){
+async function rig(t,{}={}){
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'sg-operations-ui-')),directory=path.join(root,'operations');
   const library=path.join(root,'records');fs.mkdirSync(path.join(library,'approved'),{recursive:true});
   const record=path.join(library,'approved','fixture.json');fs.writeFileSync(record,'{"kind":"approved","worker_id":"fixture"}');
@@ -25,15 +22,11 @@ async function rig(t,{trial=false,trialPolicy,maintenance={native_url:'http://12
   const config={ui_worker_management:true,control_socket:'/fixture.sock',server_records_directory:library,
     genie_chat:{python,inspection:{workers:{fixture:{ssh:['fixture.invalid'],container:'fixture-container'}}}},
     server_operations:{enabled:true,workers:{fixture:{native_url:'http://127.0.0.1:8001',qualification:{}}}}};
-  if(trial)config.hourglass_console={url:'http://127.0.0.1:4534',targets:[{model:'fixture-measurement',worker_id:'fixture',route:'direct',maintenance}]};
-  if(trialPolicy)config.server_operations.workers.fixture.trial_cache_capacity_policy=trialPolicy;
   const preparedInputs=[];
-  const service=createOperationService(config,{directory,isTesting:()=>testing,isEnabled:()=>enabled,readTrialReport,
-    trialReview:async target=>({fixture_review:target.model}),prepare:async(_python,input)=>{
+  const service=createOperationService(config,{directory,isTesting:()=>testing,isEnabled:()=>enabled,prepare:async(_python,input)=>{
     preparedInputs.push(input);
     preparations++;assert.equal(input.enrollment.ssh,'fixture.invalid');assert.deepEqual(input.enrollment.cache_capacity_policy,{max_loss_percent:0});
-    return {plan:{worker_id:'fixture',record_file:record,record_revision:input.record_revision,execution:{path:executor,sha256:hash(fs.readFileSync(executor))},
-      ...(input.proposal.trial?{trial:{hourglass:{url:'http://127.0.0.1:4534'}}}:{})},
+    return {plan:{worker_id:'fixture',record_file:record,record_revision:input.record_revision,execution:{path:executor,sha256:hash(fs.readFileSync(executor))}},
       review:{before:{image:'retained',command:['PRIVATE_COMMAND']},after:{image:input.proposal.image,command:input.proposal.command},checks:['fixture only'],scope:'Disposable fixture, not serving qualification'}};
   }});
   const server=createDashboard(()=>({version:1,devices:[]}));
@@ -46,82 +39,6 @@ async function rig(t,{trial=false,trialPolicy,maintenance={native_url:'http://12
   const post=async(route,body,headers={})=>fetch(base+route,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
   return {service,server,base,id,proposal,folder,post,finish,preparedInputs,setEnabled:v=>{enabled=v;},setTesting:v=>{testing=v;},preparations:()=>preparations};
 }
-
-test('trial proposal freezes its enrolled measurement and does not start it',async t=>{
-  const r=await rig(t,{trial:true});
-  await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  assert.equal((await r.service.tool({action:'status',id:r.id})).state,'awaiting_approval');
-  assert.deepEqual(r.preparedInputs[0].enrollment.trial,{fixture_review:'fixture-measurement'});
-  assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-  assert.match(operationChanges({trial:{benchmark_version:'4.1.0'}})[0],/restore and qualify the original/);
-});
-
-test('trial cache allowance is installation supplied and explicitly distinguished from adoption',async t=>{
-  const r=await rig(t,{trial:true,trialPolicy:{max_loss_percent:4}});
-  const rejected=await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true,trial_cache_capacity_policy:{max_loss_percent:99}}});
-  assert.equal(rejected.state,'rejected');assert.equal(r.preparations(),0);
-  await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  assert.deepEqual(r.preparedInputs[0].enrollment.trial_cache_capacity_policy,{max_loss_percent:4});
-  assert.deepEqual(r.preparedInputs[0].enrollment.cache_capacity_policy,{max_loss_percent:0});
-  assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-  const review=operationChanges({trial:{benchmark_version:'4.1.0',adoption_cache_capacity_policy:{max_loss_percent:0}},cache_capacity_policy:{max_loss_percent:4}}).join(' ');
-  assert.match(review,/Trial KV cache capacity/);assert.match(review,/Normal adoption allowance remains 0%/);assert.match(review,/Missing measurements prevent measurement/);
-});
-
-test('trial without an enrolled direct measurement fails before native preparation',async t=>{
-  const r=await rig(t);await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  assert.equal((await r.service.tool({action:'status',id:r.id})).state,'prepare_failed');
-  assert.equal(r.preparations(),0);assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-});
-
-test('trial rejects a missing or different native maintenance binding before preparation',async t=>{
-  for(const maintenance of [true,{}, {native_url:'http://127.0.0.1:8002'}, {native_url:'http://127.0.0.1:8001',docker_socket:'/other.sock'}]){
-    const r=await rig(t,{trial:true,maintenance});
-    await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-    assert.equal((await r.service.tool({action:'status',id:r.id})).state,'prepare_failed');
-    assert.equal(r.preparations(),0);assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-  }
-});
-
-test('completed trial retrieves its exact report once and exposes it without adopting its configuration',async t=>{
-  const job='e'.repeat(32);let reads=0;
-  const r=await rig(t,{trial:true,readTrialReport:async(url,id)=>{
-    reads++;assert.equal(url,'http://127.0.0.1:4534');assert.equal(id,job);
-    return {report_revision:'a'.repeat(64),private_path:'PRIVATE',summary:hourglassReportSummary({format:'hourglass-public-report-v1',model:'fixture',run_key:hash(job).slice(0,24),state:'final',is_current_run:false,score_version:'total-points-v1',hourglass_score:22})};
-  }});
-  await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  r.service.store.write(r.id,'runner-result.json',{state:'restored',serving:'previous',trial:{state:'completed',job_id:job,candidate_signature_sha256:'b'.repeat(64)}});
-  const [a,b]=await Promise.all([r.service.tool({action:'status',id:r.id}),r.service.tool({action:'status',id:r.id})]);
-  assert.equal(reads,1);assert.deepEqual(a,b);
-  assert.equal(a.evidence.trial.report.summary.score.value,22);
-  assert.equal(a.evidence.trial.report.association.approved_configuration_revision,null);
-  assert.deepEqual(a.evidence.trial.report.association.trial,{operation_id:r.id,job_id:job,candidate_signature_sha256:'b'.repeat(64)});
-  assert.doesNotMatch(JSON.stringify(a),/PRIVATE/);
-  assert.deepEqual(r.service.trialReports().reports,[a.evidence.trial.report]);
-  await r.service.tool({action:'status',id:r.id});assert.equal(reads,1);
-  assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false,'Reading a report cannot submit an operation');
-});
-
-test('Hourglass stopped-at-window outcome exposes its final report without relabelling the native state',async t=>{
-  const job='e'.repeat(32);let reads=0;
-  const r=await rig(t,{trial:true,readTrialReport:async()=>{reads++;return {report_revision:'a'.repeat(64),summary:hourglassReportSummary({format:'hourglass-public-report-v1',model:'fixture',run_key:hash(job).slice(0,24),state:'final',is_current_run:false,score_version:'total-points-v1',hourglass_score:28.722222,active_seconds:3600.054,window_seconds:3600})};}});
-  await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  r.service.store.write(r.id,'runner-result.json',{state:'restored',serving:'previous',trial:{state:'stopped',job_id:job,candidate_signature_sha256:'b'.repeat(64)}});
-  const row=await r.service.tool({action:'status',id:r.id});assert.equal(reads,1);
-  assert.equal(row.evidence.trial.state,'stopped');assert.equal(row.evidence.trial.report_state,'available');
-  assert.equal(row.evidence.trial.report.summary.score.value,28.722222);
-  assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-});
-
-test('missing or wrong-job trial reports stay unavailable without inventing a zero score',async t=>{
-  let wrong=false;
-  const r=await rig(t,{trial:true,readTrialReport:async()=>{if(!wrong)throw Error('fixture transport');return {report_revision:'a'.repeat(64),summary:hourglassReportSummary({format:'hourglass-public-report-v1',model:'fixture',run_key:'wrong',state:'final',is_current_run:false,score_version:'total-points-v1',hourglass_score:0})};}});
-  await r.service.tool({action:'propose',proposal:{...r.proposal,trial:true}});await r.service.store.idle();
-  r.service.store.write(r.id,'runner-result.json',{state:'restored',serving:'previous',trial:{state:'completed',job_id:'e'.repeat(32),candidate_signature_sha256:'b'.repeat(64)}});
-  for(const value of[false,true]){wrong=value;const row=await r.service.tool({action:'status',id:r.id});assert.equal(row.state,'restored');assert.equal(row.evidence.trial.report,null);assert.equal(row.evidence.trial.report_state,'unavailable');}
-  assert.deepEqual(r.service.trialReports().reports,[]);
-  assert.equal(fs.existsSync(path.join(r.folder,'launch-intent.json')),false);
-});
 
 test('candidate cache rejection stays visible during restoration without claiming it has returned',async t=>{
   const r=await rig(t);await r.service.tool({action:'propose',proposal:r.proposal});await r.service.store.idle();
@@ -162,15 +79,14 @@ test('returned operation describes assisted completion without claiming an autom
   const row={state:'submitted',runner:{state:'restored',process_alive:false,
     original_result:{state:'requires_reconciliation',private_error:'PRIVATE'},
     progress:{detail:'Old waiting text',heartbeat_at:1},
-    result:{state:'restored',operator_completion:true,readmission:{state:'readmitted'},
-      trial:{state:'qualification_failed',job_id:null}}}};
+    result:{state:'restored',operator_completion:true,readmission:{state:'readmitted'}}}};
   assert.equal(operationLabel(row),'Previous version restored');
   assert.match(operationProgress(row),/returned to gateway traffic/);assert.match(operationProgress(row),/operator assistance/);
   assert.doesNotMatch(operationProgress(row),/Old waiting/);
   const view=operationToolView(row);assert.equal(view.state,'restored');
   assert.equal(view.return_followup.original_outcome,'requires_reconciliation');
   assert.equal(view.return_followup.operator_completion,true);
-  assert.equal(view.evidence.trial.state,'qualification_failed');assert.doesNotMatch(JSON.stringify(view),/PRIVATE/);
+  assert.doesNotMatch(JSON.stringify(view),/PRIVATE/);
 });
 
 test('operation evidence gives Genie the exact UTC return time without removing numeric timestamps',()=>{

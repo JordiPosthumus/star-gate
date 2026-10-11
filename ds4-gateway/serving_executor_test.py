@@ -55,54 +55,6 @@ class EntryTest(unittest.TestCase):
         self.assertTrue(self.f.docker.old['State']['Running'])
         self.assertTrue((self.f.folder / 'qualification-previous/result.json').exists())
 
-    def test_prepared_measured_trial_runs_native_http_and_restores_original_record(self):
-        self.measured_trial()
-
-    def test_explicit_trial_allowance_measures_lower_capacity_but_never_adopts_it(self):
-        self.measured_trial(4)
-
-    def measured_trial(self, trial_loss=None):
-        import hourglass_native_test as native_fixture
-        f = self.f
-        f.docker.native_request = lambda *args: self.fail('Preparation must not run inference')
-        native = native_fixture.NativeAdapterTest('test_serving_identity_includes_full_configuration_startup_and_model')
-        native.setUp(); self.addCleanup(native.doCleanups)
-        native.state['model_configs'][0]['model'] = CONTRACT['model']
-        native.state['jobs']['done'] = [{'id': 'e' * 32, 'model': 'fixture', 'state': 'completed'}]
-        p = native.plan
-        f.control.worker['url'] = p['hourglass']['endpoint']
-        prepared = {'url': p['hourglass']['url'], 'controller': 'fixture', 'payload': p['native_request'],
-            'review': {'model_id': CONTRACT['model'], 'model': 'fixture', 'window_seconds': 3600, 'question_count': 1,
-                **{k: p['native_request'][k] for k in ['models_revision', 'hardware_revision']},
-                **{k: p['hourglass'][k] for k in ['endpoint', 'metric', 'benchmark_version', 'scoring_policy']}}}
-        proposal = {'id': f.folder.name, 'worker_id': 'fixture', 'image': f.plan['profile']['create']['Image'],
-            'command': f.plan['profile']['create']['Cmd'], 'trial': True}
-        enrollment = {**f.plan['target'], 'worker_id': 'fixture', 'container': 'engine', 'native_url': f.plan['profile']['native_url'],
-            'records_directory': str(self.rig.library), 'qualification': f.plan['qualification'], 'trial': prepared}
-        if trial_loss is not None:
-            enrollment['trial_cache_capacity_policy']={'max_loss_percent':trial_loss}
-            proposal['trial_cache_capacity_policy']={'max_loss_percent':99}
-            f.apis['candidate'].cache_tokens=482000
-        result = prepare(proposal, enrollment, f.folder, f.plan['record_revision'], docker=f.docker, control=f.control)
-        self.assertEqual(result['plan']['cache_capacity_policy'],{'max_loss_percent':trial_loss or 0})
-        self.assertEqual(result['review']['trial']['adoption_cache_capacity_policy'],{'max_loss_percent':0})
-        self.assertEqual(f.docker.calls, [])
-        self.assertFalse(any(row[0] == 'POST' for row in native.calls))
-        self.assertEqual(result['review']['trial']['outcome'], 'restore_original')
-        f.plan = result['plan']; self.rig.approve()
-        outcome = self.execute()
-        self.assertEqual(outcome['state'], 'restored')
-        self.assertEqual(outcome['serving'], 'previous')
-        self.assertEqual(outcome['trial']['state'], 'completed')
-        self.assertEqual(sum(row[0] == 'POST' for row in native.calls), 1)
-        lock = next(body for route, body in f.control.calls if route == '/maintenance-lock')
-        self.assertEqual(lock['minimum_other_llms'], 1)
-        self.assertTrue(f.docker.old['State']['Running'])
-        self.assertFalse(f.control.worker['drained'])
-        artifact = self.rig.library / outcome['publication']['artifact']
-        self.assertTrue((artifact / 'trial-measurement/acceptance.json').exists())
-        self.assertTrue((artifact / 'qualification-candidate/result.json').exists())
-        self.assertEqual(self.rig.git('diff', '--cached', '--name-only'), 'other.txt')
 
     def test_read_only_preparation_feeds_entry_and_archives_exact_executable(self):
         f = self.f
@@ -113,8 +65,7 @@ class EntryTest(unittest.TestCase):
         proposal = {'id':f.folder.name,'worker_id':'fixture','image':f.plan['profile']['create']['Image'],'command':command,
             'target':{'ssh':'untrusted.invalid'}, 'cache_capacity_policy':{'max_loss_percent':99}}
         enrollment = {**f.plan['target'],'worker_id':'fixture','container':'engine','native_url':f.plan['profile']['native_url'],
-            'records_directory':str(self.rig.library),'qualification':f.plan['qualification'],
-            'trial_cache_capacity_policy':{'max_loss_percent':4}}
+            'records_directory':str(self.rig.library),'qualification':f.plan['qualification']}
         approval_before = (f.folder / 'approved.json').read_bytes()
         result = prepare(proposal,enrollment,f.folder,f.plan['record_revision'],docker=f.docker)
         self.assertEqual(f.docker.calls,[]); self.assertEqual(f.control.calls,[])

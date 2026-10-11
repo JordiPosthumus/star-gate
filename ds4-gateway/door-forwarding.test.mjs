@@ -10,7 +10,7 @@ import {createDoor} from './door.mjs';
 import {workerControl} from './worker-client.mjs';
 const listen=s=>new Promise(r=>s.listen(0,'127.0.0.1',()=>r(s.address().port)));
 async function setup(t,profiles){
- const dir=fs.mkdtempSync(path.join(os.tmpdir(),'hg-forward-')),records=[[],[]],received=[0,0];
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'door-forward-')),records=[[],[]],received=[0,0];
  const key=path.join(dir,'backend.key');fs.writeFileSync(key,'backend-secret',{mode:0o600});
  const servers=[0,1].map(i=>http.createServer((req,res)=>{
   if(req.url==='/v1/models')return res.end(JSON.stringify({data:[{id:'native',context_length:262144}]}));
@@ -30,7 +30,7 @@ async function setup(t,profiles){
  const door=createDoor({host:'127.0.0.1',port:0,api_key:'ingress-secret',continuity_door:{enabled:true,core_port:addr.port,control_socket:path.join(dir,'door.sock'),health_interval_ms:60000}});await door.start();
  t.after(async()=>{await door.close();await core.close();for(const s of servers){s.closeAllConnections();await new Promise(r=>s.close(r))}fs.rmSync(dir,{recursive:true,force:true})});
  const send=(body,route='m3',partial=false,testing=false)=>new Promise((resolve,reject)=>{
-  const q=http.request({host:'127.0.0.1',port:door.server.address().port,path:(testing?'/testing':'')+'/v1/chat/completions',method:'POST',headers:{authorization:'Bearer ingress-secret','content-type':'application/json','x-dsg-model':route,'x-session-affinity':'same-hourglass-run'}},r=>{const chunks=[];r.on('data',c=>chunks.push(c));r.on('error',reject);r.on('end',()=>resolve({status:r.statusCode,headers:r.headers,body:Buffer.concat(chunks).toString()}))});q.on('error',reject);
+  const q=http.request({host:'127.0.0.1',port:door.server.address().port,path:(testing?'/testing':'')+'/v1/chat/completions',method:'POST',headers:{authorization:'Bearer ingress-secret','content-type':'application/json','x-dsg-model':route,'x-session-affinity':'same-consumer-run'}},r=>{const chunks=[];r.on('data',c=>chunks.push(c));r.on('error',reject);r.on('end',()=>resolve({status:r.statusCode,headers:r.headers,body:Buffer.concat(chunks).toString()}))});q.on('error',reject);
   if(!partial)return q.end(body);
   q.write(body.slice(0,20));const selected=route==='spark'?0:1;const before=received[selected];const deadline=Date.now()+3000;
   void(async()=>{while(received[selected]===before&&Date.now()<deadline)await delay(5);try{assert.ok(received[selected]>before,'upload must reach backend before client finishes');q.end(body.slice(20))}catch(e){q.destroy();reject(e)}})();
@@ -38,7 +38,7 @@ async function setup(t,profiles){
  return {send,records,config,door,core};
 }
 const payload={model:'reviewed',messages:[{role:'user',content:'Synthetic héllo; nested model must remain reviewed.'}],temperature:0,top_p:0.95,top_k:20,min_p:0,presence_penalty:0,frequency_penalty:0,repetition_penalty:1,seed:0,stop:['STOP'],max_tokens:262144,tool_choice:'auto',tools:[{type:'function',function:{name:'check',parameters:{type:'object',properties:{}}}}],chat_template_kwargs:{enable_thinking:true,preserve_thinking:false,reasoning_effort:'xhigh'},stream:false};
-test('Hourglass via Door and core preserves bytes except model alias, credentials, JSON and SSE',async t=>{
+test('Door via core preserves bytes except model alias, credentials, JSON and SSE',async t=>{
  const r=await setup(t);
  for(const stream of [false,true]){
   const body=JSON.stringify({...payload,stream},null,2)+'\n',reply=await r.send(body,'m3',true),got=r.records[1].at(-1);
@@ -49,7 +49,7 @@ test('Hourglass via Door and core preserves bytes except model alias, credential
  const continuation={model:'reviewed',messages:[...payload.messages,{role:'assistant',content:null,reasoning_content:'test reasoning',tool_calls:[{id:'t',type:'function',function:{name:'check',arguments:'{}'}}]},{role:'tool',tool_call_id:'t',content:'ok'}]};
  const body=JSON.stringify(continuation);await r.send(body);assert.equal(r.records[1].at(-1).body.toString(),body.replace('"model":"reviewed"','"model":"native"'));assert.equal(r.records[1].length,3);assert.equal(r.records[0].length,0);
 });
-test('Hourglass pinned route survives pause and shared session history; errors are not retried',async t=>{
+test('A pinned route survives pause and shared session history; errors are not retried',async t=>{
  const r=await setup(t);await r.send(JSON.stringify(payload),'spark');
  await workerControl(r.config.control_socket,'/drain-workers',{workers:['m3']});const waiting=r.send(JSON.stringify(payload));await delay(50);assert.equal(r.records[0].length,1);assert.equal(r.records[1].length,0);
  await workerControl(r.config.control_socket,'/resume-workers',{workers:['m3']});assert.equal((await waiting).headers['x-ds4-node'],'m3');

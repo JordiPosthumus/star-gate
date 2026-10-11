@@ -49,10 +49,10 @@ class OperationTest(unittest.TestCase):
         self.published.append(which)
         return {'state': 'recorded', 'scope': 'Fixture publisher, not a real configuration-library update.'}
 
-    def execute(self, measurement=None):
+    def execute(self):
         return ServingOperation(self.plan, self.folder, driver=self.driver, maintenance=self.maintenance,
             candidate_qualifier=self.qualifiers['candidate'], previous_qualifier=self.qualifiers['previous'],
-            publish=self.publisher, progress=lambda *args: self.events.append(args), sleep=lambda _: None, measurement=measurement).run()
+            publish=self.publisher, progress=lambda *args: self.events.append(args), sleep=lambda _: None).run()
 
     def test_apply_full_qualification_publish_and_readmit(self):
         result = self.execute()
@@ -179,7 +179,7 @@ class OperationTest(unittest.TestCase):
         self.assertEqual(self.control.calls, []); self.assertEqual(self.docker.calls, [])
 
     def test_additional_recorded_success_checks_cannot_be_silently_ignored(self):
-        self.record['restoration']['change_classes']['serving_flags']['success_checks'].append('hourglass_score')
+        self.record['restoration']['change_classes']['serving_flags']['success_checks'].append('extended_score')
         self.record_file.write_text(json.dumps(self.record))
         self.plan['profile']['record_revision'] = self.plan['record_revision'] = hashlib.sha256(self.record_file.read_bytes()).hexdigest()
         with self.assertRaisesRegex(ValueError, 'every success check'): self.execute()

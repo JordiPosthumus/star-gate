@@ -27,11 +27,10 @@ test('a Genie proposal prepares evidence but cannot approve or launch it',async 
   assert.equal(r.store.read(p.id,'approved.json'),null);assert.deepEqual(ready.review.after,p.command);
 });
 
-test('measured trial is explicit and part of the saved proposal identity',async t=>{
-  const r=rig(t),p={...r.input(),trial:true};r.store.propose(p);await r.store.idle();
-  assert.equal(r.store.read(p.id,'proposal.json').trial,true);
-  assert.throws(()=>r.store.propose({...p,trial:false}),/another proposal/);
-  assert.throws(()=>r.store.propose({...r.input(),trial:'true'}),/Specify a configured worker/);
+test('a proposal accepts only its exact fields and rejects extras',async t=>{
+  const r=rig(t),p=r.input();r.store.propose(p);await r.store.idle();
+  assert.throws(()=>r.store.propose({...p,extra:true}),/another proposal|Specify a configured worker/);
+  assert.throws(()=>r.store.propose({...r.input(),unexpected:'true'}),/Specify a configured worker/);
   assert.equal(r.calls.launch,0);
 });
 

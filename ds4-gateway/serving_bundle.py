@@ -15,9 +15,7 @@ from operation_runner import read_bytes, save
 
 MODULES = ('operation_runner', 'docker_profile', 'docker_profile_remote',
     'operation_maintenance', 'serving_qualification', 'serving_records',
-    'hourglass_operation', 'hourglass_native', 'serving_trial', 'serving_operation', 'serving_executor')
-MEASUREMENT_MODULES = ('operation_runner', 'docker_profile', 'docker_profile_remote',
-    'operation_maintenance', 'hourglass_operation', 'hourglass_native', 'hourglass_executor')
+    'serving_operation', 'serving_executor')
 
 LOADER = '''
 def execute(plan, folder, progress):
@@ -38,23 +36,15 @@ def execute(plan, folder, progress):
 '''
 
 
-def build_executor(folder, *, source_directory=None, kind='serving'):
-    if kind not in ('serving', 'hourglass'):
-        raise ValueError('Unknown enrolled executor kind')
-    modules = MODULES if kind == 'serving' else MEASUREMENT_MODULES
-    loader = LOADER if kind == 'serving' else LOADER.replace("['serving_executor']", "['hourglass_executor']")
-    if kind == 'hourglass':
-        loader = loader.replace('def execute(plan, folder, progress):', 'def _invoke(action, plan, folder, progress):').replace(
-            "sys.modules['hourglass_executor'].execute(plan, folder, progress)",
-            "getattr(sys.modules['hourglass_executor'], action)(plan, folder, progress)")
-        for action in ['execute', 'inspect_reconciliation', 'reconcile']:
-            loader += f'\ndef {action}(plan, folder, progress):\n    return _invoke({action!r}, plan, folder, progress)\n'
+def build_executor(folder, *, source_directory=None):
+    modules = MODULES
+    loader = LOADER
     folder = Path(folder).resolve()
     directory = Path(source_directory) if source_directory is not None else Path(__file__).parent
     sources = {name: read_bytes(directory / (name + '.py')).decode('utf-8') for name in modules}
     for name, source in sources.items():
         compile(source, name + '.py', 'exec')
-    label = 'serving' if kind == 'serving' else 'measurement'
+    label = 'serving'
     data = (f'# Frozen Star Gate {label} executor. The approved hash covers every embedded module.\n'
         + '_SOURCES = ' + repr(sources) + '\n' + loader).encode('utf-8')
     if len(data) > 2 * 1024 * 1024:
