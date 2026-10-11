@@ -1413,6 +1413,24 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       requestBody.pipe(rewrite);
       res.once('close',()=>rewrite.destroy());
     }
+    else if(rewriteRequired){
+      // Any rewrite the exact-length specialization above does not own lands
+      // here: a serving profile, an engine-dialect effort alias, or both. This
+      // branch must apply rewriteBody(), which composes every transform.
+      //
+      // It previously piped the ORIGINAL body instead, so a request whose only
+      // required rewrite was a reasoning-effort alias — or any request carrying
+      // one alongside a model alias — reached the engine unmodified: the model
+      // alias was dropped too, and a dialect that names its top effort
+      // differently answered 400. The exact-length path cannot cover these
+      // cases, because an effort substitution has no fixed-size relationship to
+      // the original body the way a single model-string swap does.
+      const rewrite=rewriteBody();
+      rewrite.on('error',e=>{if(job.upstream)job.upstream.destroy(e);else requestBody.destroy(e);});
+      const upstream=issue(null);
+      upstream.once('close',()=>{requestBody.unpipe(rewrite);rewrite.destroy();});
+      requestBody.pipe(rewrite).pipe(upstream);
+    }
     else{const upstream=issue(null);requestBody.pipe(upstream);}
   }
 
