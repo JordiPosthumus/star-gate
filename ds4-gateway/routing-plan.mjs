@@ -89,7 +89,8 @@ export function completionEstimate({job, worker, service, sessionReadySeconds = 
 // Eligibility is supplied by the existing gateway's capability/ownership rules.
 // This module must not infer model equivalence or replace those protections.
 export function chooseRoute({job, workers, currentWorkerId = null, samples = [], outputModel = {},
-  marginSeconds = DEFAULT_SWITCHING_MARGIN_SECONDS, sessionReadySeconds = {}, eligibility = snapshotEligibility}) {
+  marginSeconds = DEFAULT_SWITCHING_MARGIN_SECONDS, sessionReadySeconds = {}, eligibility = snapshotEligibility,
+  fastWorkerIds = [], homeIsWarmCache = false}) {
   if (!nonnegative(marginSeconds)) throw new Error('Switching margin must be a finite, non-negative number of seconds.');
   if (workers.some(worker => typeof worker.id !== 'string' || !worker.id)
     || new Set(workers.map(worker => worker.id)).size !== workers.length)
@@ -117,6 +118,50 @@ export function chooseRoute({job, workers, currentWorkerId = null, samples = [],
     .sort((a, b) => a.completionSeconds - b.completionSeconds || a.workerId.localeCompare(b.workerId));
   const base = {marginSeconds, candidates, currentWorkerId};
   if (!eligible.length) return {...base, action: 'unavailable', workerId: null, reason: 'no_eligible_worker'};
+  // Use timing whenever every eligible comparison is available. Missing timing
+  // falls back to actual dispatch availability, not a permanent home lock.
+  if (eligible.some(candidate => candidate.completionSeconds === null)) {
+    const fast = eligible.filter(candidate => fastWorkerIds.includes(candidate.workerId));
+    const pool = fast.length ? fast : eligible;
+    const state = candidate => workers.find(worker => worker.id === candidate.workerId);
+    const ready = pool.filter(candidate => state(candidate).canStartRequest === true);
+    // A missing home forecast alone must not hold independent work on a busy
+    // home: an eligible, completely idle lane that can start now is known
+    // ready while the incumbent is not, and a queued request carries no cache
+    // to lose. An established conversation home is a real cache reason to
+    // stay, and it must say so instead of hiding behind missing timing.
+    // Scope: the peer search runs over the compared pool (fast-filtered when
+    // routing_fast_workers is configured), so a fast list naming the home but
+    // not the peer bounds the rescue. Peers are taken in incumbent input
+    // order; measured speed ranking of idle peers arrives with the v2
+    // calculation. An untimeable busy home may also reflect a telemetry
+    // glitch, so occasional labelled hops are expected and bounded.
+    const homeBusy = !!home?.eligible && home.completionSeconds === null
+      && (((state(home).running?.length ?? 0) > 0)
+        || (state(home).queue ?? []).some(queued => queued.id !== job.id && usableJob(queued)));
+    const idlePeer = homeBusy && state(home).canStartRequest !== false && homeIsWarmCache !== true
+      ? ready.find(candidate => candidate.workerId !== home.workerId
+        && (state(candidate).running?.length ?? 0) === 0
+        && !(state(candidate).queue ?? []).some(queued => queued.id !== job.id && usableJob(queued)))
+      : null;
+    if (idlePeer) return {...base, action: currentWorkerId ? 'reassign' : 'place',
+      workerId: idlePeer.workerId, reason: 'idle_lane_home_timing_unavailable'};
+    const keepHome = home?.eligible && pool.includes(home)
+      && (state(home).canStartRequest !== false || !ready.length);
+    if (keepHome) return {...base, action:'stay', workerId:home.workerId,
+      reason:home?.completionSeconds === null && homeIsWarmCache ? 'cache_affinity_keep_home'
+        : home?.completionSeconds === null && candidates.some(row => !row.eligible && row.reason === 'same_session_work') ? 'same_session_keep_home'
+        : fast.length ? 'mixed_evidence_keep_home' : fastWorkerIds.length ? 'overflow_no_fast_lane' : 'current_timing_unavailable'};
+    const load = candidate => {
+      const worker = state(candidate);
+      return ((worker.running?.length ?? 0) + (worker.queue ?? []).filter(queued => queued.id !== job.id && usableJob(queued)).length)
+        / (Number.isSafeInteger(worker.capacity) && worker.capacity > 0 ? worker.capacity : 1);
+    };
+    const best = [...(ready.length ? ready : pool)].sort((a,b)=>load(a)-load(b)||(fast.length ? a.workerId.localeCompare(b.workerId) : 0))[0];
+    return {...base, action:currentWorkerId ? 'reassign' : 'place', workerId:best.workerId,
+      reason:home?.eligible && pool.includes(home) && ready.length ? 'available_capacity_fallback'
+        : fast.length ? 'fast_lane_unknown_competitor' : fastWorkerIds.length ? 'overflow_no_fast_lane' : 'timing_unavailable_existing_order'};
+  }
   if (home?.eligible) {
     if (home.completionSeconds === null) return {...base, action: 'stay', workerId: home.workerId, reason: 'current_timing_unavailable'};
     const other = timed.find(candidate => candidate.workerId !== home.workerId);
@@ -130,7 +175,8 @@ export function chooseRoute({job, workers, currentWorkerId = null, samples = [],
   // Eligibility recovery is explicit and is not a claim of a 30-second saving.
   const best = timed[0] ?? eligible[0];
   return {...base, action: currentWorkerId ? 'reassign' : 'place', workerId: best.workerId,
-    reason: currentWorkerId ? 'current_worker_ineligible' : timed.length ? 'earliest_estimated_completion' : 'timing_unavailable_existing_order'};
+    reason: fastWorkerIds.length && eligible.length===1 && !fastWorkerIds.includes(best.workerId) ? 'overflow_no_fast_lane'
+      : currentWorkerId ? 'current_worker_ineligible' : timed.length ? 'earliest_estimated_completion' : 'timing_unavailable_existing_order'};
 }
 
 // Offline transaction preview: every choice immediately updates the COPY seen

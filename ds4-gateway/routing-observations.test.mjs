@@ -407,6 +407,27 @@ test('a lane with no basis and no row still abstains rather than inventing progr
    currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
  assert.equal(busy.candidates[0].completionSeconds,null);
  assert.equal(busy.candidates[0].reason,'running_progress_unavailable');
+ assert.equal(busy.candidates[0].basisReasons.basis_absent,1,'the absent basis is named, not only the catch-all');
+ assert.equal(busy.candidates[0].runningReasons.request_progress_unavailable,1,'the estimator failure is named');
+});
+test('the decision record names a basis-less large body and its capture cause',()=>{
+ // Phase 1.1 regression: the first probe read estimate.reason, which the
+ // estimator sets only on its two progress-validation early returns, so an
+ // ordinary failure rendered as 'unknown' and DG-15 (>8 MiB capture limit)
+ // could not be told apart from a missing fit or speed. The record must name
+ // the basis failure, the estimator failure, the capture cause and the class.
+ let now=1000;const monitor=new RoutingObservations({enabled:true,now:()=>now});
+ const active={...structuredClone(job),id:'active',dispatched:1000,requestBytes:9*1024*1024,
+   thinking:{result:{status:'unavailable',reason:'capture_limit'}}};
+ const native={connected:true,source:'vllm',at:now,running:1,waiting:0};
+ const busy=monitor.evaluate({job,workers:[{...worker,capacity:1,running:[active],queue:[],turnReservations:[],native}],
+   currentWorkerId:null,marginSeconds:30,eligibility:()=>({eligible:true})});
+ const row=busy.candidates[0];
+ assert.equal(row.completionSeconds,null);
+ assert.equal(row.basisReasons.basis_absent,1,'absent basis is named separately from the estimator failure');
+ assert.equal(row.runningReasons.request_progress_unavailable,1,'the estimator failure is named');
+ assert.equal(row.captureReasons.capture_limit,1,'the capture-limit cause is named');
+ assert.equal(row.basislessOver8MiB,1,'a basis-less body over 8 MiB is counted');
 });
 test('synthetic untracked work never exceeds the lane capacity',()=>{
  // The planner treats running.length > capacity as 'capacity_mismatch' and

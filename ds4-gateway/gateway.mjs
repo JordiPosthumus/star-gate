@@ -28,7 +28,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { RequestedThinkingObserver } from './requested-thinking.mjs';
 import {requestUserExcerpt} from './request-preview.mjs';
-import {QueuedBodyBudget,QueuedRequestBody} from './queued-request-body.mjs';
+import {QueuedBodyBudget,QueuedRequestBody,ROUTING_BODY_WAIT_MS} from './queued-request-body.mjs';
 import { Dataset } from './dataset.mjs';
 import { clientMetadata, CLIENT_METADATA_HEADER } from './client-metadata.mjs';
 import { RoutingShadow } from './routing-shadow.mjs';
@@ -357,6 +357,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   if(!Number.isSafeInteger(conversationTurnIdleMs)||conversationTurnIdleMs<0||conversationTurnIdleMs>2147483647)throw new Error('conversation_turn_idle_ms must be a whole millisecond count from 0 to 2147483647');
   if(config.routing_time_enabled!==undefined&&typeof config.routing_time_enabled!=='boolean')throw new Error('routing_time_enabled must be boolean');
   const timeRouting=config.routing_time_enabled===true;
+  const configuredFastWorkers=config.routing_fast_workers??[];
+  const fastWorkerIds=Array.isArray(configuredFastWorkers)?[...configuredFastWorkers]:configuredFastWorkers;
+  if(!Array.isArray(fastWorkerIds)||fastWorkerIds.some(id=>typeof id!=='string'||!id)||new Set(fastWorkerIds).size!==fastWorkerIds.length)
+    throw new Error('routing_fast_workers must be an array of unique worker IDs');
   const initial = workerConfigs(config.nodes);
   if(config.media_jobs!==undefined&&(!config.media_jobs||typeof config.media_jobs!=='object'||typeof config.media_jobs.enabled!=='boolean'))throw new Error('media_jobs.enabled must be a boolean');
   const store = new AffinityStore(config.state_file);
@@ -370,7 +374,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const makeNode = n => ({ ...n, drained: store.data.drained?.[n.id] === true, archived: store.data.archived?.[n.id] === true, quarantine:store.data.quarantined?.[n.id] ?? null, inferenceFailures:0, transportFailures:0, healthy: false, failures: 0, slots: [{}], get active(){return oldestActive(this);}, queue: [], completed: 0, failed: 0, protected:0, observationLimited:0, probing: false, healthProbeDeferred:0,
     managementPath:n.ssh?{transport:'ssh_tunnel',state:'pending',reason:null,attempts:0,route_count:sshTargets(n).length,changed_at:new Date().toISOString(),last_verified_at:null}:{transport:'local',state:'local',reason:null,attempts:0,route_count:0,changed_at:new Date().toISOString(),last_verified_at:null} });
   let definitions;
-  try { definitions = store.data.workers === undefined ? initial : workerConfigs(store.data.workers); }
+  try {
+    definitions = store.data.workers === undefined ? initial : workerConfigs(store.data.workers);
+    if(fastWorkerIds.some(id=>![...initial,...definitions].some(worker=>worker.id===id)))
+      throw new Error('routing_fast_workers contains an unknown worker ID');
+  }
   catch (e) { store.close(); throw e; }
   const serviceConfig={...config,recovery:structuredClone(config.recovery),media_jobs:structuredClone(config.media_jobs),genie_chat:structuredClone(config.genie_chat)};
   try { restoreSparkServices(serviceConfig,store.data.spark_services??{},definitions); restorePairEnrollments(serviceConfig,store.data.pair_recovery_enrollments??{},definitions); restoreOmlxEnrollments(serviceConfig,store.data.omlx_recovery_enrollments??{},definitions); }
@@ -581,21 +589,31 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       manual_execution:manual,manual_identity:identity,manual_stale:!!saved&&manual===null,
       running:fresh?native.running:null,waiting:fresh?native.waiting:null,
       effective_dispatch:timeRouting?Math.min(requestCapacity(node),execution??requestCapacity(node)):requestCapacity(node),
-      mismatch:execution===null?null:execution!==requestCapacity(node)};
+      mismatch:execution===null?null:execution!==requestCapacity(node),
+      // An engine that does not publish its execution concurrency (oMLX/vLLM)
+      // leaves `execution` null, so the configured admission count is trusted
+      // unverified. Surface that rather than let queue depth masquerade as
+      // execution capacity; a human must validate the number.
+      unvalidated:execution===null&&requestCapacity(node)>1};
   }
   function dispatchCapacity(node){return timeRouting?routingCapacity(node).effective_dispatch:requestCapacity(node);}
   function hasCapacity(node){return activeCount(node)<dispatchCapacity(node);}
 
   function evaluateRoutingTime(node,job,reason){
-    if(!routingObservations.enabled||job.cancelled||job.dispatched||shuttingDown)return;
+    if(!routingObservations.enabled||job.cancelled||job.dispatched||job.routingInputPending||shuttingDown)return;
     return routingObservations.attempt(()=>{
       const workers=[node,...nodes.filter(candidate=>candidate!==node)].map(candidate=>({...routingWorker(candidate),
         capacity:Math.min(requestCapacity(candidate),routingCapacity(candidate).engine_execution??requestCapacity(candidate)),
         running:activeJobs(candidate).filter(active=>active!==job).map(active=>({...active,slotIndex:candidate.slots.indexOf(active.slot)})),queue:candidate.queue,
+        canStartRequest:canStartNow(candidate,job,[...candidate.queue.filter(queued=>queued!==job),...parkedFor(candidate),job]),
         conversationTurns:conversationTurns(),turnIdleSeconds:conversationTurnIdleMs/1000,
         native:routingTelemetry?.snapshot(candidate.id),
         turnReservations:candidate.slots.flatMap((slot,index)=>slot.active!==job&&slot.turnAllocation?[{...slot.turnAllocation,slot:index,until:Math.max(0,(slot.turnAllocation.until-performance.now())/1000)}]:[])}));
-      const result=routingObservations.evaluate({job,workers,currentWorkerId:timeRouting&&!job.routingPlaced&&['new','none'].includes(job.affinity)?null:node.id,marginSeconds:routingMargin(),
+      const currentWorkerId=timeRouting&&!job.routingPlaced&&['new','none'].includes(job.affinity)?null:node.id;
+      // An established conversation's durable home is a real cache reason to stay;
+      // it must be visible to the planner so a stay says 'cache', not 'unknown timing'.
+      const homeIsWarmCache=job.affinity==='existing'&&!!job.key&&store.get(job.key)?.node===node.id;
+      const result=routingObservations.evaluate({job,workers,currentWorkerId,marginSeconds:routingMargin(),fastWorkerIds,homeIsWarmCache,
         eligibility:(_request,worker)=>{
           const target=nodes.find(candidate=>candidate.id===worker.id);
           const ok=target.healthy&&!target.drained&&!target.quarantine&&!target.recovering&&!target.removed&&allowsWorker(job.modelRoute,target)
@@ -909,7 +927,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     evaluateShadow(node,job,wasAdmitted?'worker_free':'admission');evaluateRoutingTime(node,job,'admission');
     if(timeRouting){
       reconsiderRouting(job,'admission');
-      // Give already-arriving body bytes one event-loop turn for observation.
+      // Supported uploads get a bounded chance to provide routing input first.
       // Slow/oversized uploads still dispatch with labelled unknown estimates.
       setImmediate(()=>{if(!shuttingDown&&!job.cancelled&&job.node)schedule(job.node);});
     }else schedule(node);
@@ -969,7 +987,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     // Release before checking other slots, matching the dispatcher's original order.
     if(release)releaseTurns(node,slot);
     const choice=queueChoice({queue,allocation:slot.turnAllocation,turns:conversationTurns(),now:performance.now(),
-      blocked:job=>job.routingCommitBlocked||!!job.key&&(nodes.some(n=>activeJobs(n).some(active=>active.key===job.key))||
+      blocked:job=>job.routingInputPending||job.routingCommitBlocked||!!job.key&&(nodes.some(n=>activeJobs(n).some(active=>active.key===job.key))||
         node.slots.some(other=>other!==slot&&other.turnAllocation?.key===job.key&&other.turnAllocation.used<conversationTurns()))});
     if(choice.clearAllocation)releaseTurns(node,slot);
     return choice.job;
@@ -1088,7 +1106,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       if(job.previewFromRequest)observeJobPreview(job,requestUserExcerpt(body));
     },{route:req.url,model:node.backend === 'openai' ? undefined : node.probeModel ?? config.model,contextLength:node.contextLength});
     const observeBody = chunk => {
-      requestBytes+=chunk.length;job.thinking.accept(chunk);
+      requestBytes+=chunk.length;job.requestBytes=requestBytes;job.thinking.accept(chunk);
       if(captureLimit&&!captureOverflow){
         if(captureBytes+chunk.length<=captureLimit){captureChunks.push(chunk);captureBytes+=chunk.length;}
         else{captureOverflow=true;captureChunks=[];}
@@ -1587,7 +1605,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
         pumpWaiting();
       }
     };
-    job.cleanup = () => { clearJobPreview(job);job.queueTimer?.cancel();job.queuedBody?.dispose();req.off('aborted', cancel); res.off('close', cancel); req.off('error', cancel); };
+    job.cleanup = () => { clearTimeout(job.routingInputTimer);job.routingInputPending=false;clearJobPreview(job);job.queueTimer?.cancel();job.queuedBody?.dispose();req.off('aborted', cancel); res.off('close', cancel); req.off('error', cancel); };
     req.on('aborted', cancel); req.on('error', cancel); res.on('close', cancel);
     job.queueTimer = deadlineTimer(() => {
       detach(job);
@@ -1597,10 +1615,19 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       job.cleanup(); req.resume();pumpWaiting();
     }, job.queueTimeoutMs);
     if((job.previewFromRequest||routingObservations.enabled)&&(!req.headers['content-encoding']||req.headers['content-encoding']==='identity')){
+      const releaseRoutingInput=()=>{
+        if(!job.routingInputPending)return;
+        job.routingInputPending=false;clearTimeout(job.routingInputTimer);
+        // The observer can finish in its constructor, before admit() sets node.
+        queueMicrotask(()=>{if(!job.cancelled&&!job.dispatched&&!shuttingDown&&job.node){
+          reconsiderRouting(job,'input_observation_ready');schedule(job.node);
+        }});
+      };
+      if(timeRouting){job.routingInputPending=true;job.routingInputTimer=setTimeout(releaseRoutingInput,ROUTING_BODY_WAIT_MS);job.routingInputTimer.unref?.();}
       job.queuedBody=new QueuedRequestBody(req,{budget:queuedBodyBudget,onBody:body=>{
         if(!job.cancelled&&job.previewFromRequest)observeJobPreview(job,requestUserExcerpt(body));
         observeRoutingBody(job,body);
-      }});
+      },onReady:releaseRoutingInput});
     }
     if(node)admit(job,node);else park(job,null,waitReason??'no_ready_worker');
   });
@@ -2150,6 +2177,10 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
         } while(performance.now()<deadline);
         startup.complete=true;startup.completed_at=new Date().toISOString();
         log('startup_probe_barrier',{unavailable:startup.unavailable,allowance_ms:allowance});
+        const unvalidated=nodes.filter(n=>!n.drained&&!n.quarantine&&routingCapacity(n).unvalidated)
+          .map(n=>({id:n.id,configured_capacity:requestCapacity(n)}));
+        if(unvalidated.length)log('routing_capacity_unvalidated',{workers:unvalidated,
+          note:'engine execution concurrency is not detectable; configured capacity needs human validation'});
       }
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(gatewayPort(config), gatewayHost(config), resolve); });
       if (control) {

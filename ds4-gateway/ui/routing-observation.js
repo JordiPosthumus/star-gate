@@ -5,7 +5,11 @@ export function routingObservationText(value) {
     if(value.reason==='ownership_write_failed')return 'Stayed: saving the new assignment failed; original queue preserved.';
     if(value.action==='move')return `Moved to ${value.destination}; estimated saving ${Math.round(value.savingSeconds)}s, margin ${value.marginSeconds}s.`;
     if(value.action==='place')return `Assigned to ${value.destination}; ${value.reason==='earliest_estimated_completion'?'earliest estimated completion':'timing unavailable; existing routing order used'}.`;
-    if(value.action==='reassign')return `Reassigned to ${value.destination}; previous worker was ineligible.`;
+    if(value.action==='reassign')return value.reason==='idle_lane_home_timing_unavailable'
+      ? `Reassigned to ${value.destination}; previous worker had running work but no usable completion estimate.`
+      : `Reassigned to ${value.destination}; previous worker was ineligible.`;
+    if(value.reason==='cache_affinity_keep_home')return 'Stayed: this conversation\u2019s cache lives on the assigned worker; no measured faster route was available.';
+    if(value.reason==='same_session_keep_home')return 'Stayed: earlier requests of this conversation are still ahead of it; order is preserved.';
     if(value.reason==='saving_does_not_exceed_margin')return `Stayed: estimated saving does not exceed ${value.marginSeconds}s.`;
     return 'Stayed: no sufficiently faster eligible route is established.';
   }

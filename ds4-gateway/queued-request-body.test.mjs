@@ -67,3 +67,20 @@ test('opt-out stops early reads and parsing but preserves an already consumed pr
   req.end('"private"}');await turn();assert.equal(budget.used,prefix);
   assert.equal((await bytes(queue.stream())).toString(),'{"task":"private"}');assert.equal(budget.used,0);
 });
+
+test('routing readiness fires once after inspection or read-ahead exhaustion',async()=>{
+  for(const full of [true,false]){
+    const req=new PassThrough(),budget=new QueuedBodyBudget(64),events=[];
+    const queue=new QueuedRequestBody(req,{budget,limit:32,onBody:()=>events.push('body'),onReady:()=>events.push('ready')});
+    if(full)req.end('{"ok":true}');else req.write('x'.repeat(48));
+    await turn();assert.deepEqual(events,full?['body','ready']:['ready']);
+    if(!full)req.end();await bytes(queue.stream());queue.dispose();
+    assert.equal(events.filter(x=>x==='ready').length,1);assert.equal(budget.used,0);
+  }
+});
+
+test('routing readiness releases immediately when another upload owns the shared budget',()=>{
+  const req=new PassThrough(),budget=new QueuedBodyBudget(0);let ready=0;
+  const queue=new QueuedRequestBody(req,{budget,onReady:()=>ready++});
+  assert.equal(ready,1);queue.dispose();req.destroy();assert.equal(ready,1);
+});

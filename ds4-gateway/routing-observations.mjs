@@ -446,7 +446,7 @@ export class RoutingObservations {
       this.samples = this.samples.slice(-4096); this.save();
     });
   }
-  evaluate({job, workers, currentWorkerId, marginSeconds, eligibility}) {
+  evaluate({job, workers, currentWorkerId, marginSeconds, eligibility, fastWorkerIds = [], homeIsWarmCache = false}) {
     return this.attempt(() => {
       const outputModel = {fit: fitOutputLengths(this.outputs)};
       const normalized = workers.map(worker => {
@@ -509,7 +509,28 @@ export class RoutingObservations {
           }
           const estimate = remainingServiceEstimate({job: request, worker, fleet: workers, samples: rateSamples,
             concurrency, outputModel, progress});
-          return {id: active.id, key: active.key, slotIndex:active.slotIndex, remainingSeconds: estimate.seconds,progressEvidence:progress?.evidence??'unavailable'};
+          // Phase 1.1: name the ACTUAL failure. `remainingServiceEstimate` sets
+          // `reason` only on its two progress-validation early returns; ordinary
+          // estimation failures carry `unavailableReason` from workEstimate, and a
+          // missing output fit is itself reported as 'decode_speed_unavailable', so
+          // it is split out here. When progress is absent we also record WHY the
+          // dispatch basis could not stand in (absent / identity / stale), so a
+          // basis-less request is distinguishable from a fit/speed failure.
+          let progressReason = null;
+          if (estimate.seconds === null) {
+            progressReason = estimate.reason
+              ?? (estimate.unavailableReason === 'decode_speed_unavailable' && estimate.output?.tokens == null
+                    ? 'output_fit_unavailable' : estimate.unavailableReason)
+              ?? null;
+          }
+          const basisReason = progress ? null
+            : !basis ? 'basis_absent'
+            : basis.identity !== worker.identity ? 'basis_identity_mismatch'
+            : this.now() < basis.at ? 'basis_stale' : 'progress_malformed';
+          return {id: active.id, key: active.key, slotIndex:active.slotIndex, remainingSeconds: estimate.seconds,
+            progressEvidence:progress?.evidence??'unavailable', progressReason, basisReason,
+            captureReason: active.thinking?.result?.reason ?? null,
+            bodyBytes: Number.isSafeInteger(active.requestBytes) ? active.requestBytes : null};
         })};});
       // Unmatched native work is not free capacity. Its unknown remaining time
       // makes timing unavailable without changing actual gateway admissions.
@@ -550,7 +571,7 @@ export class RoutingObservations {
           if ((worker.native.waiting ?? 0) > 0) {
             const taken = new Set(worker.running.map((active, index) => active.slotIndex ?? index));
             let slot = 0; while (taken.has(slot) && slot < worker.capacity) slot++;
-            worker.running.push({remainingSeconds: null, progressEvidence: 'unavailable', slotIndex: slot});
+            worker.running.push({remainingSeconds: null, progressEvidence: 'unavailable', progressReason: 'engine_waiting_untracked', synthetic: 'waiting', slotIndex: slot});
           }
           continue;
         }
@@ -568,10 +589,10 @@ export class RoutingObservations {
         const taken = new Set(worker.running.map((active, index) => active.slotIndex ?? index));
         const free = [];
         for (let slot = 0; slot < worker.capacity && free.length < room; slot++) if (!taken.has(slot)) free.push(slot);
-        for (let i = 0; i < Math.min(surplus, room); i++) worker.running.push({remainingSeconds: seconds, progressEvidence: 'estimated', slotIndex: free[i]});
+        for (let i = 0; i < Math.min(surplus, room); i++) worker.running.push({remainingSeconds: seconds, progressEvidence: 'estimated', progressReason: seconds === null ? 'engine_surplus_unrated' : 'engine_surplus_estimated', synthetic: 'surplus', slotIndex: free[i]});
       }
       const decision = chooseRoute({job: this.request(job, workers), workers: normalized, currentWorkerId,
-        samples: this.samples, outputModel, marginSeconds, eligibility});
+        samples: this.samples, outputModel, marginSeconds, eligibility, fastWorkerIds, homeIsWarmCache});
       // Record what the planner was actually given, so a candidate that reads
       // 'capacity_mismatch' can be explained from the decision record itself
       // instead of by guesswork: this is the tracked running count, the capacity
@@ -587,10 +608,38 @@ export class RoutingObservations {
       const summary = {mode: this.state.mode, at: this.now(), action: decision.action, reason: decision.reason,
         source: currentWorkerId, destination: decision.workerId, marginSeconds,
         savingSeconds: decision.savingSeconds ?? null,
-        candidates: decision.candidates.map(row => ({workerId: row.workerId, eligible: row.eligible,
-          completionSeconds: row.completionSeconds, waitingSeconds: row.waitingSeconds, reason: row.reason,
-          runningCount: row.runningCount ?? null, capacity: row.capacity ?? null,
-          inputEvidence: row.service?.input.evidence ?? null, speedEvidence: row.service?.decode.evidence ?? null}))};
+        candidates: decision.candidates.map(row => {
+          // Phase 1 probe: expose WHY each running entry on this lane could not be
+          // timed. `progressReason` comes straight from remainingServiceEstimate
+          // and is otherwise discarded; `synthetic` marks the two entries the
+          // router invents (engine queueing, engine surplus). Bounded counts only.
+          const lane = planned.get(row.workerId);
+          const running = lane?.running ?? [];
+          const runningReasons = {}, basisReasons = {}, captureReasons = {};
+          let runningUnavailable = 0, runningSynthetic = 0, basislessOver8MiB = 0, basislessUnknownSize = 0;
+          for (const entry of running) {
+            if (entry.synthetic) runningSynthetic++;
+            const timed = Number.isFinite(entry.remainingSeconds) && entry.remainingSeconds >= 0;
+            if (!timed) runningUnavailable++;
+            const key = entry.progressReason ?? (timed ? 'timed' : 'unknown');
+            runningReasons[key] = (runningReasons[key] ?? 0) + 1;
+            if (entry.basisReason) basisReasons[entry.basisReason] = (basisReasons[entry.basisReason] ?? 0) + 1;
+            if (entry.captureReason) captureReasons[entry.captureReason] = (captureReasons[entry.captureReason] ?? 0) + 1;
+            // DG-15 signal: an untimed, non-synthetic running request whose body
+            // crossed the 8 MiB capture limit is the leading explanation for a
+            // basis-less vLLM lane.
+            if (!timed && !entry.synthetic) {
+              if (entry.bodyBytes == null) basislessUnknownSize++;
+              else if (entry.bodyBytes > 8 * 1024 * 1024) basislessOver8MiB++;
+            }
+          }
+          return {workerId: row.workerId, eligible: row.eligible,
+            completionSeconds: row.completionSeconds, waitingSeconds: row.waitingSeconds, reason: row.reason,
+            runningCount: row.runningCount ?? null, capacity: row.capacity ?? null,
+            inputEvidence: row.service?.input.evidence ?? null, speedEvidence: row.service?.decode.evidence ?? null,
+            runningUnavailable, runningSynthetic, runningReasons, basisReasons, captureReasons,
+            basislessOver8MiB, basislessUnknownSize};
+        })};
       this.state.evaluations++; this.state.last = summary;
       return summary;
     });

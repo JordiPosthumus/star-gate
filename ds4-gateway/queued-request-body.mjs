@@ -1,6 +1,8 @@
 import {Readable} from 'node:stream';
 import {THINKING_CAPTURE_BYTES} from './requested-thinking.mjs';
 
+export const ROUTING_BODY_WAIT_MS = 100;
+
 // Read-ahead limits only. Neither limit rejects or truncates an upload. Once
 // exhausted, the original IncomingMessage keeps its ordinary backpressure until
 // dispatch drains this prefix. Nothing is written to disk.
@@ -16,8 +18,8 @@ export class QueuedBodyBudget {
 }
 
 export class QueuedRequestBody {
-  constructor(req,{budget,onBody,limit=THINKING_CAPTURE_BYTES}={}){
-    this.req=req;this.budget=budget;this.onBody=onBody;this.limit=limit;
+  constructor(req,{budget,onBody,onReady,limit=THINKING_CAPTURE_BYTES}={}){
+    this.req=req;this.budget=budget;this.onBody=onBody;this.onReady=onReady;this.limit=limit;
     this.chunks=[];this.bytes=0;this.ended=false;this.disposed=false;
     this.output=null;this.demand=false;this.notified=false;
     this.readable=()=>this.output?this.pull():this.capture();
@@ -39,19 +41,24 @@ export class QueuedRequestBody {
     // Let Node deliver end for a body exactly filling the read-ahead budget.
     this.req.read(0);
     if(this.req.readableEnded){this.ended=true;this.inspect();}
+    // Exhaustion releases routing's short wait; it never rejects the upload.
+    if(this.bytes>=this.limit||!this.budget.available)this.ready();
   }
+  ready(){const notify=this.onReady;this.onReady=null;notify?.();}
   inspect(){
     if(this.notified||this.disposed||this.inspectionStopped)return;
     this.notified=true;
     try{this.onBody?.(JSON.parse(Buffer.concat(this.chunks,this.bytes).toString('utf8')));}
     catch{/* Optional observation never changes the request or its admission. */}
     this.onBody=null;
+    this.ready();
   }
-  stopInspection(){this.inspectionStopped=true;this.onBody=null;this.budget.waiters.delete(this.wake);}
+  stopInspection(){this.inspectionStopped=true;this.onBody=null;this.budget.waiters.delete(this.wake);this.ready();}
   stream(){
     if(this.output)return this.output;
     this.budget.waiters.delete(this.wake);
     this.onBody=null;
+    this.ready();
     const owner=this;
     this.output=new Readable({
       read(){owner.demand=true;owner.pull();},
@@ -75,6 +82,7 @@ export class QueuedRequestBody {
   dispose(){
     if(this.disposed)return;
     this.disposed=true;this.onBody=null;
+    this.ready();
     this.req.off('readable',this.readable);this.req.off('end',this.end);this.req.off('error',this.error);
     this.budget.waiters.delete(this.wake);
     this.chunks=[];const bytes=this.bytes;this.bytes=0;this.budget.release(bytes);

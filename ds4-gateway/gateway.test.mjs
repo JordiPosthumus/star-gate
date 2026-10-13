@@ -41,7 +41,7 @@ async function backend(id) {
     const chunks = [];
     req.on('data', c => { chunks.push(c); b.receivedBytes += c.length; });
     req.on('end', () => {
-      const body = Buffer.concat(chunks); const p = JSON.parse(body.toString());
+      const body = Buffer.concat(chunks); const p = JSON.parse((b.acceptGzip&&req.headers['content-encoding']==='gzip'?gunzipSync(body):body).toString());
       b.records.push({ body, headers: req.headers, payload: p }); b.active++; b.peak = Math.max(b.peak, b.active);
       let ended = false;
       res.on('close', () => { b.active--; if (!ended) b.aborts++; });
@@ -3152,4 +3152,182 @@ test('a handover write error after rename restores durable ownership before forw
  const response=await r.request(JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}]}),'post-rename');
  assert.equal(response.headers['x-ds4-node'],'spark1');assert.equal(r.backends[1].records.length,0);
  assert.equal(JSON.parse(fs.readFileSync(r.config.state_file,'utf8')).sessions[key].node,'spark1');assert.equal(r.gateway.store.get(key).node,'spark1');
+});
+
+function partialRoutingRequest(r,body,key,headers={}){
+ let request;
+ const response=new Promise((resolve,reject)=>{
+  request=http.request({host:'127.0.0.1',port:r.address.port,path:'/v1/chat/completions',method:'POST',agent:false,
+   headers:{authorization:'Bearer none','content-type':'application/json','x-session-affinity':key,...headers}},res=>{
+    const chunks=[];res.on('data',c=>chunks.push(c));res.on('error',reject);
+    res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}));
+   });
+  request.on('error',reject);request.write(body.subarray(0,64));
+ });
+ response.catch(()=>{});
+ return {request,response,end:()=>request.end(body.subarray(64))};
+}
+
+test('routing input wait reads a fragmented text body before choosing, including successive turns',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,routing_fast_workers:['spark2']});seedRouting(r);
+ const key='fragmented-existing',digestKey=createHash('sha256').update(key).digest('hex');r.gateway.store.set(digestKey,'spark1');
+ for(let turn=0;turn<3;turn++){
+  const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'x'.repeat(1024*1024)}],max_tokens:12000,wait_for_release:true,turn}));
+  const upload=partialRoutingRequest(r,body,key);t.after(()=>upload.request.destroy());
+  await until(()=>r.nodes.some(n=>n.queue.some(j=>j.key===digestKey&&j.routingInputPending)));
+  assert.equal(r.nodes.reduce((n,w)=>n+w.slots.filter(s=>s.active).length,0),0,'upload wait books no execution slot');
+  upload.end();
+  try{
+   await until(()=>r.backends[1].releases?.length===turn+1);
+   const active=r.nodes[1].slots.find(s=>s.active).active;
+   assert.ok(active.routingInput.inputTokens>0);assert.ok(active.routingProgressBasis?.inputTokens>0,'dispatch receives a usable input basis');
+   if(turn===0)assert.equal(active.routingDecision.reason,'saving_exceeds_margin');
+  }finally{r.backends[1].releases?.[turn]?.();}
+  const response=await upload.response;
+  assert.equal(response.status,200);assert.equal(response.headers['x-ds4-node'],'spark2');
+  assert.deepEqual(r.backends[1].records.at(-1).body,body);
+  if(turn===0)assert.ok(r.gateway.stats().routing_time.last.candidates.filter(c=>c.eligible).every(c=>Number.isFinite(c.completionSeconds)),'parsed input makes both forecasts available');
+ }
+ assert.equal(r.backends[0].records.length,0);assert.equal(r.backends[1].records.length,3);
+ assert.equal(r.gateway.currentJobsStatus().queued_body.buffered_bytes,0);
+});
+
+test('routing input wait times out into fast fallback and streams before the upload ends',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,routing_fast_workers:['spark2']});
+ r.gateway.store.set(createHash('sha256').update('slow-upload').digest('hex'),'spark1');
+ const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'slow upload'.repeat(100)}]}));
+ const upload=partialRoutingRequest(r,body,'slow-upload');t.after(()=>upload.request.destroy());
+ try{await until(()=>r.nodes[1].slots.some(s=>s.active));}catch(error){upload.request.destroy();throw error;}
+ assert.equal(upload.request.writableEnded,false);assert.equal(r.backends[0].receivedBytes,0);
+ assert.equal(r.nodes[1].slots.find(s=>s.active).active.routingDecision.reason,'fast_lane_unknown_competitor');
+ upload.end();assert.equal((await upload.response).status,200);
+ assert.deepEqual(r.backends[1].records[0].body,body);assert.equal(r.backends[0].records.length,0);
+});
+
+test('routing input wait cancellation frees the buffer without dispatching or delaying another request',async t=>{
+ const r=await rig(t,1,{routing_time_enabled:true});
+ const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'x'.repeat(2000)}]}));
+ const upload=partialRoutingRequest(r,body,'cancel-before-input');t.after(()=>upload.request.destroy());
+ await until(()=>r.nodes[0].queue.some(j=>j.routingInputPending));
+ upload.request.destroy();await assert.rejects(upload.response);
+ await until(()=>r.nodes[0].queue.length===0);await delay(130);
+ assert.equal(r.backends[0].receivedBytes,0);assert.equal(r.gateway.currentJobsStatus().queued_body.buffered_bytes,0);
+ assert.equal((await r.request('{"messages":[{"role":"user","content":"next"}]}','next')).status,200);
+ assert.equal(r.backends[0].records.length,1);
+});
+
+test('routing input wait does not block unrelated ready work behind the uploading head',async t=>{
+ const r=await rig(t,1,{routing_time_enabled:true});
+ const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'x'.repeat(2000)}]}));
+ const upload=partialRoutingRequest(r,body,'uploading');t.after(()=>upload.request.destroy());
+ await until(()=>r.nodes[0].queue.some(j=>j.routingInputPending));
+ const second=await r.request('{"messages":[{"role":"user","content":"ready"}]}','ready');
+ assert.equal(second.status,200);assert.equal(r.backends[0].records[0].payload.messages[0].content,'ready');
+ assert.equal(upload.request.writableEnded,false);upload.end();assert.equal((await upload.response).status,200);
+});
+
+test('routing unknown fallback covers maintenance reassignment and unsupported multimodal input',async t=>{
+ const r=await rig(t,3,{routing_time_enabled:true,routing_fast_workers:['spark3']});
+ r.nodes[0].drained=true;r.gateway.store.set(createHash('sha256').update('maintenance-home').digest('hex'),'spark1');
+ const body=JSON.stringify({messages:[{role:'user',content:[{type:'text',text:'image'},{type:'image_url',image_url:{url:'https://example.invalid/fixture.png'}}]}],max_tokens:12000});
+ const result=await r.request(body,'maintenance-home');assert.equal(result.status,200);assert.equal(result.headers['x-ds4-node'],'spark3');
+ assert.equal(r.backends[1].records.length,0);assert.equal(r.backends[2].records[0].body.toString(),body);
+ assert.equal(r.gateway.stats().routing_time.last.reason,'mixed_evidence_keep_home');
+ assert.equal(r.gateway.stats().routing_time.errors,0);
+});
+
+test('an untimeable busy home keeps an established conversation only for an explicit cache reason',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,workerConcurrency:2});
+ const first=await r.request('{"messages":[{"role":"user","content":"establish"}]}','conv');
+ assert.equal(first.status,200);assert.equal(first.headers['x-ds4-node'],'spark1');
+ // Park spark2 so the held multimodal generation lands on the warm lane,
+ // where its missing forecast makes the home untimeable while it runs.
+ r.nodes[1].drained=true;
+ const held=r.request(JSON.stringify({messages:[{role:'user',content:[{type:'text',text:'image'},{type:'image_url',image_url:{url:'https://example.invalid/fixture.png'}}]}],max_tokens:16,wait_for_release:true}),'held');
+ try{
+  await until(()=>r.backends[0].releases?.length===1);
+  r.nodes[1].drained=false;
+  const second=await r.request('{"messages":[{"role":"user","content":"next turn"}]}','conv');
+  assert.equal(second.status,200);assert.equal(second.headers['x-ds4-node'],'spark1');
+  assert.equal(r.gateway.stats().routing_time.last.reason,'cache_affinity_keep_home');
+  assert.equal(r.backends[1].records.length,0);assert.equal(r.backends[0].records.length,3);
+ }finally{r.backends[0].releases?.splice(0).forEach(release=>release());await held;}
+});
+
+test('routing body cap falls back without truncating a large upload',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,routing_fast_workers:['spark2']});
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(THINKING_CAPTURE_BYTES+2048)}],max_tokens:262144});
+ const response=await r.request(body,'over-cap');assert.equal(response.status,200);assert.equal(response.headers['x-ds4-node'],'spark2');
+ assert.equal(r.backends[0].records.length,0);assert.equal(r.backends[1].records[0].body.toString(),body);
+ assert.equal(r.gateway.currentJobsStatus().queued_body.buffered_bytes,0);
+});
+
+test('routing fallback forwards compressed input untouched without inventing its token size',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,routing_fast_workers:['spark2']});r.backends[1].acceptGzip=true;
+ const body=gzipSync(Buffer.from(JSON.stringify({model:'deepseek-v4-flash',messages:[{role:'user',content:'x'.repeat(5000)}],max_tokens:12000})));
+ const response=await r.request(body,'compressed',{headers:{'content-encoding':'gzip'}});
+ assert.equal(response.status,200);assert.equal(response.headers['x-ds4-node'],'spark2');
+ assert.deepEqual(r.backends[1].records[0].body,body);assert.equal(r.backends[0].records.length,0);
+ assert.equal(r.gateway.stats().routing_time.last.candidates.find(c=>c.workerId==='spark2').completionSeconds,null);
+});
+
+test('routing input wait preserves the original queue deadline',async t=>{
+ const r=await rig(t,1,{routing_time_enabled:true,queue_timeout_ms:50});
+ const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'x'.repeat(2000)}]}));
+ const upload=partialRoutingRequest(r,body,'short-deadline');
+ try{
+  const response=await upload.response;assert.equal(response.status,504);assert.equal(r.backends[0].receivedBytes,0);
+  assert.equal(r.gateway.currentJobsStatus().queued_body.buffered_bytes,0);
+ }finally{upload.request.destroy();}
+});
+
+test('fragmented upload regression routes using the completed input instead of the pre-body home',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true});seedRouting(r);
+ r.gateway.store.set(createHash('sha256').update('regression').digest('hex'),'spark1');
+ const body=Buffer.from(JSON.stringify({messages:[{role:'user',content:'x'.repeat(10000)}],max_tokens:12000}));
+ const upload=partialRoutingRequest(r,body,'regression');
+ try{await delay(25);upload.end();const response=await upload.response;
+  assert.equal(response.headers['x-ds4-node'],'spark2');assert.equal(r.backends[0].records.length,0);
+  assert.deepEqual(r.backends[1].records[0].body,body);
+ }finally{upload.request.destroy();}
+});
+
+test('fast fallback waits for an active slow-home turn to finish before moving its successor',async t=>{
+ const r=await rig(t,2,{routing_time_enabled:true,routing_fast_workers:['spark2']});
+ r.nodes[1].drained=true;
+ const active=r.request(JSON.stringify({wait_for_release:true}),'same-conversation');
+ await until(()=>r.backends[0].releases?.length===1);
+ r.nodes[1].drained=false;seedRouting(r);
+ const body=JSON.stringify({messages:[{role:'user',content:'x'.repeat(4000)}],max_tokens:12000});
+ const successor=r.request(body,'same-conversation');
+ try{
+  await until(()=>r.nodes[0].queue.length===1);await delay(130);
+  assert.equal(r.backends[1].records.length,0);assert.equal(r.backends[0].aborts,0);
+ }finally{r.backends[0].releases[0]();}
+ await active;const response=await successor;
+ assert.equal(response.headers['x-ds4-node'],'spark2');assert.equal(r.backends[0].records.length,1);
+ assert.equal(r.backends[1].records[0].body.toString(),body);assert.ok(r.backends.every(b=>b.aborts===0));
+});
+
+
+test('replacement workers use spare capacity for queued independent conversations without replay',async t=>{
+ const r=await rig(t,3,{routing_time_enabled:true,routing_fast_workers:['spark1'],workerConcurrency:[1,2,2]});
+ r.nodes[0].drained=true;r.nodes[2].drained=true;
+ const pending=[];
+ const submit=(key)=>{r.gateway.store.set(createHash('sha256').update(key).digest('hex'),'spark2');const promise=r.request(JSON.stringify({wait_for_release:true}),key);promise.catch(()=>{});pending.push(promise);return promise;};
+ try{
+  submit('running-one');submit('running-two');await until(()=>r.backends[1].active===2);
+  r.nodes[2].drained=false;
+  submit('waiting-one');submit('waiting-two');
+  await until(()=>r.backends[2].active===2,1500);
+  assert.equal(r.backends[1].active,2);assert.equal(r.backends[2].peak,2);
+  assert.equal(r.backends[0].records.length,0);
+  assert.equal(r.backends[1].records.length,2);assert.equal(r.backends[2].records.length,2);
+  assert.ok(r.nodes[2].slots.filter(s=>s.active).every(s=>s.active.routingDecision.reason==='available_capacity_fallback'));
+  assert.ok(r.backends.every(b=>b.aborts===0));
+ }finally{
+  for(let i=0;i<8;i++){for(const b of r.backends)for(const release of b.releases?.splice(0)??[])release();await delay(30);}
+  await Promise.all(pending);
+ }
+ assert.ok(r.backends.every(b=>b.aborts===0));
 });

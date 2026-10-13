@@ -161,3 +161,99 @@ test('prediction retains slot identity and one reservation for a running convers
  const b=completionEstimate({job:job('B',2,{key:'B'}),worker:node,service});assert.equal(b.waitingSeconds,0);assert.equal(b.bookings[0].slot,0);
  const a=completionEstimate({job:job('A3',3,{key:'A'}),worker:node,service});assert.equal(a.waitingSeconds,50);assert.deepEqual(a.bookings.map(b=>b.slot),[1,1]);
 });
+
+test('explicit fast fallback covers new, reassigned, and existing slow homes with unknown input',()=>{
+ const slow=worker('slow'),fast=worker('fast');
+ for(const currentWorkerId of [null,'slow','removed']){
+  const result=chooseRoute({job:job('candidate',1,{inputTokens:null}),workers:[slow,fast],currentWorkerId,
+   samples:[...speeds(slow),...speeds(fast,4000,40)],outputModel,fastWorkerIds:['fast']});
+  assert.equal(result.workerId,'fast');assert.equal(result.reason,'fast_lane_unknown_competitor');
+  assert.ok(result.candidates.every(c=>c.completionSeconds===null));
+ }
+});
+
+test('unknown fast work never hands a supported request to a timeable slow worker',()=>{
+ const slow=worker('slow'),fast=worker('fast',{capacity:2,running:[{remainingSeconds:null}]});
+ const options={job:job('candidate'),workers:[slow,fast],samples:[...speeds(slow),...speeds(fast)],outputModel,fastWorkerIds:['fast']};
+ const result=chooseRoute(options);assert.equal(result.workerId,'fast');assert.equal(result.reason,'fast_lane_unknown_competitor');
+ assert.ok(Number.isFinite(result.candidates[0].completionSeconds));
+ assert.equal(chooseRoute({...options,currentWorkerId:'fast'}).reason,'mixed_evidence_keep_home');
+ const overflow=chooseRoute({...options,workers:[slow,{...fast,eligible:false}]});
+ assert.equal(overflow.workerId,'slow');assert.equal(overflow.reason,'overflow_no_fast_lane');
+});
+
+test('fast fallback ranks eligible normalized loads and cannot override same-session eligibility',()=>{
+ const slow=worker('slow'),one=worker('one',{capacity:8,running:[{remainingSeconds:null}]}),two=worker('two',{capacity:2});
+ const options={job:job('candidate',1,{inputTokens:null}),workers:[slow,one,two],fastWorkerIds:['one','two']};
+ assert.equal(chooseRoute(options).workerId,'two');
+ const result=chooseRoute({...options,eligibility:(_j,w)=>({eligible:w.id==='slow',reason:'same_session_work'})});
+ assert.equal(result.workerId,'slow');assert.equal(result.reason,'overflow_no_fast_lane');
+});
+
+test('valid cache-aware timing and the switching margin survive the fast fallback policy',()=>{
+ const slow=worker('slow'),fast=worker('fast');
+ const options={job:job('candidate',1,{inputTokens:250000,cache:{slow:{identity:slow.identity,evidence:'estimated',reusableTokens:249500}}}),
+  workers:[slow,fast],currentWorkerId:'slow',samples:[...speeds(slow,1000,25),...speeds(fast,4000,100)],outputModel,fastWorkerIds:['fast'],marginSeconds:30};
+ assert.equal(chooseRoute(options).reason,'saving_does_not_exceed_margin');
+ const cold=chooseRoute({...options,job:{...options.job,cache:{}}});
+ assert.equal(cold.workerId,'fast');assert.equal(cold.reason,'saving_exceeds_margin');
+ assert.ok(cold.savingSeconds>30);
+});
+
+test('waiting home yields to a ready eligible peer despite old preferred IDs or missing timing',()=>{
+ for(const fastWorkerIds of [['retired'],['home','peer'],[]]){
+  const home=worker('home',{capacity:2,canStartRequest:false,running:[{remainingSeconds:null},{remainingSeconds:null}]}),peer=worker('peer',{capacity:2,canStartRequest:true});
+  const result=chooseRoute({job:job('candidate'),workers:[home,peer],currentWorkerId:'home',fastWorkerIds});
+  assert.equal(result.workerId,'peer');assert.equal(result.reason,'available_capacity_fallback');
+ }
+});
+test('a missing home forecast alone cannot hold independent work on a busy home while a peer idles',()=>{
+ const busy=()=>worker('busy',{capacity:2,running:[{remainingSeconds:null}],queue:[job('candidate')]});
+ const idle=()=>worker('idle',{capacity:2,canStartRequest:true});
+ const moved=chooseRoute({job:job('candidate'),workers:[busy(),idle()],currentWorkerId:'busy'});
+ assert.equal(moved.action,'reassign');assert.equal(moved.workerId,'idle');
+ assert.equal(moved.reason,'idle_lane_home_timing_unavailable');
+ const timedPeer=chooseRoute({job:job('candidate'),workers:[busy(),idle()],currentWorkerId:'busy',samples:speeds(idle()),outputModel});
+ assert.equal(timedPeer.workerId,'idle');assert.equal(timedPeer.reason,'idle_lane_home_timing_unavailable');
+ const placed=chooseRoute({job:job('candidate'),workers:[busy(),idle()]});
+ assert.equal(placed.action,'place');assert.equal(placed.workerId,'idle');
+ const pinned=chooseRoute({job:job('candidate'),workers:[busy(),idle()],currentWorkerId:'busy',fastWorkerIds:['busy','idle']});
+ assert.equal(pinned.workerId,'idle');assert.equal(pinned.reason,'idle_lane_home_timing_unavailable');
+});
+test('the idle-peer rescue is scoped to the configured pool',()=>{
+ const busy=worker('busy',{capacity:2,canStartRequest:true,running:[{remainingSeconds:null}],queue:[job('candidate')]});
+ const outsider=worker('outsider',{capacity:2,canStartRequest:true});
+ const result=chooseRoute({job:job('candidate'),workers:[busy,outsider],currentWorkerId:'busy',fastWorkerIds:['busy']});
+ assert.equal(result.action,'stay');assert.equal(result.workerId,'busy');
+ assert.equal(result.reason,'mixed_evidence_keep_home');
+});
+test('same-session confinement and cache warmth keep the home with explicit reasons',()=>{
+ const busy=worker('busy',{capacity:2,canStartRequest:true,running:[{remainingSeconds:null,key:'sess'}]});
+ const idle=worker('idle',{capacity:2,canStartRequest:true});
+ const confined=chooseRoute({job:job('turn2',2,{key:'sess'}),workers:[busy,idle],currentWorkerId:'busy',
+  eligibility:(_job,w)=>({eligible:w.id==='busy',reason:w.id==='busy'?null:'same_session_work'})});
+ assert.equal(confined.action,'stay');assert.equal(confined.workerId,'busy');
+ assert.equal(confined.reason,'same_session_keep_home');
+ const warm=chooseRoute({job:job('candidate'),workers:[busy,idle],currentWorkerId:'busy',homeIsWarmCache:true});
+ assert.equal(warm.action,'stay');assert.equal(warm.reason,'cache_affinity_keep_home');
+ const stranded=chooseRoute({job:job('candidate'),workers:[busy,worker('peer',{capacity:2,canStartRequest:true,running:[{remainingSeconds:null}]})],currentWorkerId:'busy'});
+ assert.equal(stranded.action,'stay');assert.equal(stranded.reason,'current_timing_unavailable');
+});
+test('a warm home that cannot start still yields to a ready peer despite missing timing',()=>{
+ const full=worker('busy',{capacity:1,canStartRequest:false,running:[{remainingSeconds:null}]});
+ const idle=worker('idle',{capacity:2,canStartRequest:true});
+ const result=chooseRoute({job:job('candidate'),workers:[full,idle],currentWorkerId:'busy',homeIsWarmCache:true});
+ assert.equal(result.workerId,'idle');assert.equal(result.reason,'available_capacity_fallback');
+});
+test('old preferred IDs never override a complete finish-time comparison',()=>{
+ const home=worker('home',{running:[{remainingSeconds:120}]}),peer=worker('peer');
+ const result=chooseRoute({job:job('candidate'),workers:[home,peer],currentWorkerId:'home',fastWorkerIds:['retired'],samples:[...speeds(home),...speeds(peer)],outputModel});
+ assert.equal(result.workerId,'peer');assert.equal(result.reason,'saving_exceeds_margin');
+});
+test('capacity fallback preserves immediately usable homes and rejects unavailable destinations',()=>{
+ // Without an idle ready peer, an untimeable home that can start is still kept.
+ for(const [homeReady,peerReady,peerEligible] of [[false,false,true],[false,true,false]]){
+  const home=worker('home',{canStartRequest:homeReady,running:[{remainingSeconds:null}]}),peer=worker('peer',{canStartRequest:peerReady,eligible:peerEligible});
+  assert.equal(chooseRoute({job:job('candidate'),workers:[home,peer],currentWorkerId:'home',fastWorkerIds:['home','peer']}).workerId,'home');
+ }
+});
