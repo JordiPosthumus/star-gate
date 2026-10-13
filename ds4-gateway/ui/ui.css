@@ -68,7 +68,7 @@
 .rate-inline{font-weight:500;white-space:nowrap}
 .rate-inline.decode{color:var(--accent)}.rate-inline.prefill{color:#78aee8}
 .cache-chip{color:var(--muted);white-space:nowrap}
-.cache-chip.warn{color:#efba62}
+.cache-chip.warn{color:#efba62}button.cache-chip{border:0;background:none;padding:0;font:inherit;cursor:pointer;text-decoration:underline;text-underline-offset:2px}button.cache-chip:hover{color:var(--text)}
 .request-chip{border:1px solid var(--line);border-radius:9px;padding:1px 7px;font-size:10px;color:var(--muted);white-space:nowrap}
 .device-details{margin:6px 0 4px;font-size:12px}
 .device-details>summary{cursor:pointer;color:var(--muted);font-size:11px;padding:4px 0;list-style:none}
@@ -204,3 +204,16 @@
 .routing-math-sub-label{padding-left:14px!important;color:var(--muted)}
 .routing-math-ok{color:var(--accent)}
 .routing-math-no{color:var(--muted)}
+
+/* Card rows align across cards: each card is a subgrid of 11 shared row tracks
+   (one per .device child, in device() markup order). #devices raises specificity
+   over the theme's .devices .device rules. HAZARD: never add container-type or
+   any size containment to .device — containment on a subgrid item silently
+   severs track sharing and every card reflows independently (root cause of the
+   2026-10 misalignment; the old @container device-card switch was removed). */
+#devices{grid-template-rows:repeat(11,auto);row-gap:0;align-items:stretch}
+#devices .device{display:grid;grid-template-rows:subgrid;grid-row:span 11;margin-bottom:12px}
+
+/* Fixed chip row so a cache/cap chip cannot shift rows below it (browser-agnostic; no subgrid needed). */
+#devices .device .device-live{grid-template-rows:24px 20px 20px}
+#devices .device-live .device-chips{grid-column:1;grid-row:3;display:flex;align-items:center;flex-wrap:wrap;gap:5px 10px;min-height:20px}

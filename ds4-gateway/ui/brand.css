@@ -65,10 +65,12 @@ button:disabled{opacity:.4;cursor:default}input:focus-visible,select:focus-visib
 .genie-action-ledger{margin:13px 0 10px;padding:9px 11px 3px;border:1px solid var(--line);border-radius:6px;background:var(--bg)}.genie-ledger-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:3px}.genie-ledger-heading h3{margin:0;font-size:11px}.genie-ledger-heading p{display:inline;margin:0 0 0 8px;font-size:8px}.genie-ledger-heading>div{display:flex;align-items:baseline;min-width:0}.genie-ledger-heading label{margin:0}.genie-ledger-heading select{max-width:170px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:4px 6px;font:inherit;font-size:9px}.genie-action-items{list-style:none;margin:0;padding:0;max-height:320px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.genie-action-items:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.genie-action-items li{display:grid;grid-template-columns:62px minmax(120px,.65fr) minmax(0,2fr);gap:9px;padding:5px 0;border-top:1px solid var(--line);align-items:baseline}.genie-action-items time{color:var(--muted);font-size:8px}.genie-action-items strong{font-size:9px}.genie-action-items span{min-width:0;color:var(--muted);font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.genie-action-items li[data-level="good"] strong{color:var(--accent)}.genie-action-items li[data-level="attention"] strong{color:var(--error)}.genie-action-items li[data-level="pending"] strong{color:var(--orange)}@media(max-width:650px){.genie-ledger-heading{align-items:flex-start;flex-direction:column}.genie-action-items li{grid-template-columns:58px 1fr}.genie-action-items li span{grid-column:1/-1;white-space:normal}}
 :root{--bg:#111213;--panel:#1a1c1d;--line:#343a39;--text:#eceee7;--muted:#a2aaa4;--accent:#d7efa9;--orange:#e9ac7e;--radius:10px;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace}
 .brand{font-size:18px;letter-spacing:-.4px}.brand-mark{display:inline;color:var(--accent);background:none;border-radius:0;font-size:20px;margin-right:0}.brand .muted{font-size:13px}.intro{gap:23px;padding:26px 0}.intro-copy{flex:1}.gate-art{width:148px;height:auto;display:block;border-radius:3px}.eyebrow{font-size:9px;letter-spacing:1.8px}h1{font-size:clamp(23px,3vw,37px);letter-spacing:-1.9px;font-weight:650}h1 span{font-weight:400}.intro-copy>p:last-child{font-size:11px;max-width:640px}.read-only{font-size:10px;flex-shrink:0}.read-only small{line-height:1.6}.label{font-size:9px;letter-spacing:.8px}.rate{font-size:39px;letter-spacing:-2.3px}.overview strong{font-size:27px}.button{border-radius:5px;font-size:11px}.badge{border-radius:4px;font-size:9px}.section-heading h2{font-size:14px;color:var(--text)}.section-heading p,.section-heading>span{font-size:10px}.device-name{font-size:16px}.device-number{border-radius:4px;font-size:11px}.metric-note{font-size:10px}.chart-caption{font-size:9px}.cache span,.cache-note,.device-foot{font-size:9px}.cache strong{font-size:20px}.prompt-note{font-size:10px}.table-wrap{border-radius:7px}table{font-size:10px}th{font-size:9px}footer,details{font-size:10px}@media(max-width:750px){.gate-art{width:100px}.intro{gap:16px}h1{font-size:25px;letter-spacing:-1.5px}.eyebrow{font-size:8px}.intro-copy>p:last-child{font-size:10px}.brand .muted{font-size:11px}.header-right{gap:12px}.connection{font-size:10px}.rate{font-size:34px}}@media(max-width:450px){.gate-art{width:80px}.intro{gap:13px}.intro-copy h1{font-size:21px}.intro-copy .eyebrow{letter-spacing:1px}.header-right{width:100%;justify-content:space-between}.overview strong{font-size:24px}.device-foot{flex-wrap:wrap}}
-/* Per-server routing is a compact operational control beside the live state. */
-.device{container:device-card / inline-size}.device-top{display:grid;grid-template-columns:minmax(0,1fr);gap:10px 14px;align-items:center}.device-status{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:7px;min-width:0;max-width:100%}.device-name{min-width:0}.device-name-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Per-server routing is a compact operational control beside the live state.
+   Do NOT give .device a container-type (or any size containment): containment on
+   a subgrid item silently severs the shared row tracks and every card reflows
+   independently again. The old @container header switch was removed for this. */
+.device-top{display:grid;grid-template-columns:minmax(0,1fr);gap:10px 14px;align-items:center}.device-name{min-width:0}.device-name-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .server-verdict{font-size:9px;line-height:1.2;padding:6px 8px;border:1px solid var(--line);border-radius:4px;color:var(--muted);white-space:nowrap}.server-verdict[data-level="ok"]{color:var(--accent);border-color:#4b6143}.server-verdict[data-level="busy"]{color:#dbe8cb;border-color:#526643}.server-verdict[data-level="warn"]{color:#ffd0a9;border-color:#80543e;background:#2f241f}.server-verdict[data-level="bad"]{color:var(--error);border-color:#63473e}.server-verdict[data-level="paused"]{color:#c8cfc9}.metric-stale .rate,.metric-stale .chart{opacity:.48}.metric-stale .metric-note{color:#bdc4bd}
-@container device-card (min-width:780px){.device-top{grid-template-columns:minmax(0,1fr) auto}.device-identity{justify-content:flex-start}.device-status{justify-content:flex-end;flex-wrap:nowrap}}
 @media(max-width:750px){.device-top{align-items:flex-start}.server-verdict{white-space:normal;text-align:left}}
 .worker-routing{display:inline-flex;position:relative;flex:0 0 auto}
 .routing-toggle{position:relative;display:inline-grid;place-items:center;width:29px;height:29px;padding:0;border:1px solid #526643;border-radius:4px;background:#202622;color:var(--accent);cursor:pointer}
@@ -144,8 +146,8 @@ button:disabled{opacity:.4;cursor:default}input:focus-visible,select:focus-visib
 /* Fleet cards share structure while inactive media stays collapsed. */
 .device .device-top{min-height:30px;display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:8px}
 .device .device-identity{justify-content:flex-start;gap:8px;width:auto}
-.device .device-name-text{font-size:14px;line-height:1.35;white-space:normal;overflow-wrap:anywhere}
-.device-header-status,.device-header-actions{display:flex;align-items:center;justify-content:flex-end;min-width:0}
+.device .device-name-text{font-size:14px;line-height:1.35}
+.device-header-status,.device-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:0}
 .device .request-chip{display:inline-flex;justify-content:center;align-items:center;height:24px;min-width:38px;padding:0 7px;white-space:nowrap;font-size:11px;font-variant-numeric:tabular-nums}
 .device .device-engine{display:flex;align-items:center;justify-content:space-between;min-height:24px;margin:4px 0 4px 18px}.device-engine .remaining-estimate{margin-left:auto}
 .device .engine-chip{display:inline-flex;align-items:center;height:20px;border:1px solid var(--line);border-radius:5px;padding:0 7px;font-size:10px;color:var(--accent)}
@@ -174,8 +176,9 @@ button:disabled{opacity:.4;cursor:default}input:focus-visible,select:focus-visib
 .timeline-segment:focus-visible{outline:none}.timeline-segment:focus-visible rect{stroke:var(--text);stroke-width:1;vector-effect:non-scaling-stroke}
 .timeline-tooltip{position:fixed;z-index:1000;max-width:min(340px,calc(100vw - 16px));padding:8px 10px;background:#101512;color:var(--text);border:1px solid var(--line);border-radius:6px;font:11px/1.5 ui-monospace,monospace;box-shadow:0 4px 18px #0008;pointer-events:none}
 .timeline-tooltip[hidden]{display:none}
+/* An empty footer must stay a grid item: display:none would drop it from the
+   subgrid flow and let Details slip up a track on cards without power controls. */
 .device-footer{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;margin-top:8px}
-.device-footer:empty{display:none}
 .device-footer .fleet-native-media{grid-column:1;min-width:0;margin:0;padding:0;border:0}
 .device-footer .device-power{grid-column:2;display:grid;grid-template-columns:repeat(3,auto);gap:5px;margin:0}
 .device-footer .power-status{grid-column:1/-1;min-width:0;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px}
@@ -193,17 +196,18 @@ button:disabled{opacity:.4;cursor:default}input:focus-visible,select:focus-visib
 #media-engines .media-engine-tab[aria-selected=true]{border-color:var(--accent);background:#293222}
 .media-engine-count{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border:1px solid var(--line);border-radius:5px;font-size:10px;font-variant-numeric:tabular-nums}
 
-/* Keep a readable 4 / 2 / 1 column rhythm instead of an orphaned fourth card. */
-.devices{grid-template-columns:repeat(4,minmax(0,1fr))}
+/* Cards flow into as many columns as fit (330px floor) and auto-fit collapses
+   empty trailing tracks, so three servers fill the row three-abreast and a
+   fourth returns it to four-abreast — no reserved dead slot. */
+.devices{grid-template-columns:repeat(auto-fit,minmax(min(330px,100%),1fr))}
 @media(max-width:1250px){.devices{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:650px){.devices{grid-template-columns:minmax(0,1fr)}}
 
-.devices .device{display:flex;flex-direction:column;min-height:430px}
-.device>.device-footer{margin-top:auto;padding-top:8px}
-.devices:not(:has(.engine-chip,.remaining-estimate)) .device-engine{display:none}
+.devices .device{min-height:430px}
+.device>.device-footer{padding-top:8px}
+.devices:not(:has(.engine-chip)) .device-engine{display:none}
 @media(max-width:650px){.devices .device{min-height:0}}
 
-.device-footer:empty+.device-details{margin-top:auto}
 
 /* Fleet card archive control: sits beside the pause/play toggle in the card
    header. Kept text-only and small so the compact card face stays uncluttered. */

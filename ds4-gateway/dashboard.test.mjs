@@ -286,7 +286,10 @@ test('activity bar retains measured history when endpoint metrics disconnect or 
     assert.match(bar,/phase-decode/,'retain the observed generation interval');
     assert.match(bar,/phase-working/,'gateway work is busy even when its native phase is unknown');
     assert.doesNotMatch(bar,/phase-idle-off|phase-prefill/,'do not invent idle or prompt processing');
-    assert.doesNotMatch(html,/class="device-minicharts"/,'disconnected live-speed charts remain hidden');
+    // Offline cards keep an EMPTY minicharts container so every card renders the
+    // same 11 children for the shared subgrid rows; no chart may appear in it.
+    const charts=html.slice(html.indexOf('<div class="device-minicharts"'));
+    assert.match(charts,/^<div class="device-minicharts"><\/div>/,'disconnected live-speed charts remain hidden');
   }
 });
 
@@ -392,7 +395,15 @@ test('excluded routing states are explicit; quarantine offers checked readmissio
   assert.match(source,/\$\('devices'\)\.addEventListener\('click',handleWorkerClick\)/);
   assert.match(source,/Verify and readmit.*small test response/);
   const css=fs.readFileSync(new URL('./ui/brand.css',import.meta.url),'utf8');
-  assert.match(css,/\.device\{container:device-card \/ inline-size\}/);assert.match(css,/\.device-status\{display:flex/);assert.match(css,/@container device-card \(min-width:780px\)/);assert.match(css,/\.routing-toggle\{[^}]*width:29px;height:29px/);
+  // Fleet cards share one row track per section via subgrid (ui.css). Two
+  // invariants keep that true: nothing may put containment on .device (it
+  // silently severs subgrid track sharing), and an empty footer must remain a
+  // grid item or Details slips up a track on cards without power controls.
+  const faceCss=fs.readFileSync(new URL('./ui/ui.css',import.meta.url),'utf8');
+  assert.match(faceCss,/grid-template-rows:subgrid;grid-row:span 11/);
+  assert.doesNotMatch(css,/\.device\{[^}]*container:/);assert.doesNotMatch(css,/device-footer:empty\{display:none\}/);
+  assert.match(css,/\.devices\{grid-template-columns:repeat\(auto-fit/);
+  assert.match(css,/\.routing-toggle\{[^}]*width:29px;height:29px/);
   assert.match(css,/content:attr\(data-tooltip\)/);assert.doesNotMatch(css,/\.worker-routing\{margin:/);
 });
 
