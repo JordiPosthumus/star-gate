@@ -575,11 +575,17 @@ function renderRoutingMath(s,now){
     }).join(''):'<tr class="routing-math-sub"><td class="routing-math-sub-label muted" colspan="5">No measurement at any concurrency on this lane yet.</td></tr>';
     return `<tr class="routing-math-group"><td><b>${esc(row.workerId)}</b></td><td>${esc(row.phase)}</td><td class="muted">${rate(row.tokensPerSecond)}</td><td class="muted">${secs(row.tokensPerSecond?1000/row.tokensPerSecond:null)}</td><td class="muted">pooled · ${fmt(row.samples)} rows</td></tr>${detail}`;
   }).join('');
-  const liveRows=Array.isArray(g?.routing_capacity)?g.routing_capacity.map(row=>`<tr><td>${esc(row.id)}</td><td>${row.connected?'<span class="routing-math-ok">connected</span>':'<span class="routing-math-no">unavailable</span>'}</td><td>${esc(row.source??'—')}</td><td>${esc(row.live_rate_scope??'—')}</td><td>${esc(row.phase??'—')}</td><td>${row.running===null?'—':fmt(row.running)}</td><td>${row.waiting===null?'—':fmt(row.waiting)}</td><td class="muted">${esc(row.error??'')}</td></tr>`).join(''):'';
-  $('lb-speeds').innerHTML=panel('Measured speed — how fast each server goes, at each concurrency',
-    `${speedRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Rate</th><th scope="col">Per 1k</th><th scope="col">Rows</th><th scope="col">Note</th></tr></thead><tbody>${speedRows}</tbody></table>
-<p class="routing-math-line">One line per <b>concurrency level</b>, because that is the unit the estimator compares on: a server asked to run two requests at once can be far slower per request than the same server running one. “Per 1k” is 1000 tokens ÷ that rate — reading only, not a stored measurement. The pooled row is the mean across every level and is <b>not</b> comparable between servers measured at different loads; the per-level lines are. A lane that only ever ran one request shows only concurrency 1, which is honest, not missing data.</p>`
-      :'<p class="routing-math-line muted">No measured speed row is in use yet. vLLM lanes report through their request histograms; other engines report per-request rates.</p>'}
+  const archivedIds=Array.isArray(g?.archived)?g.archived:[];
+  const liveRows=Array.isArray(g?.routing_capacity)?g.routing_capacity.filter(row=>!archivedIds.includes(row.id)).map(row=>`<tr><td>${esc(row.id)}</td><td>${row.connected?'<span class="routing-math-ok">connected</span>':'<span class="routing-math-no">unavailable</span>'}</td><td>${esc(row.source??'—')}</td><td>${esc(row.live_rate_scope??'—')}</td><td>${esc(row.phase??'—')}</td><td>${row.running===null?'—':fmt(row.running)}</td><td>${row.waiting===null?'—':fmt(row.waiting)}</td><td class="muted">${esc(row.error??'')}</td></tr>`).join(''):'';
+  const v2Lanes=(Array.isArray(g?.routing_v2?.lanes)?g.routing_v2.lanes:[]).filter(l=>!archivedIds.includes(l.workerId));
+  const v2Rows=v2Lanes.map(l=>`<tr><td><b>${esc(l.workerId)}</b></td><td>${rate(l.soloTokensPerSecond)}</td><td>${rate(l.prefillTokensPerSecond)}</td><td>${rate(l.decodeTokensPerSecond)}</td><td class="muted">${fmt(l.samples)}</td><td class="muted">${l.measured?'fresh':l.samples?'stale':'never measured'}</td></tr>`).join('');
+  $('lb-speeds').innerHTML=panel('Measured speed — what placement sees right now (Routing v2)',
+    `${v2Rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Solo</th><th scope="col">Prefill</th><th scope="col">Decode</th><th scope="col">Samples</th><th scope="col">State</th></tr></thead><tbody>${v2Rows}</tbody></table>
+<p class="routing-math-line"><b>Solo</b> is the blended fallback price used while a phase class is not trusted yet. <b>Prefill</b> and <b>Decode</b> appear once a lane holds at least three fresh samples of that phase; they reset when measurement semantics change. These are the numbers the balancer uses today.</p>`
+      :'<p class="routing-math-line muted">No v2 lane measurements yet.</p>'}
+<details class="analytics-collection"><summary>Legacy time-based estimator (historical)</summary>${speedRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Rate</th><th scope="col">Per 1k</th><th scope="col">Rows</th><th scope="col">Note</th></tr></thead><tbody>${speedRows}</tbody></table>
+<p class="routing-math-line">One line per <b>concurrency level</b>, because that is the unit the estimator compares on: a server asked to run two requests at once can be far slower per request than the same server running one. “Per 1k” is 1000 tokens ÷ that rate — reading only, not a stored measurement. The pooled row is the mean across every level and is <b>not</b> comparable between servers measured at different loads; the per-level lines are. A lane that only ever ran one request shows only concurrency 1, which is honest, not missing data. This estimator no longer steers placement; the table above does.</p>`
+      :'<p class="routing-math-line muted">No measured speed row is in use yet. vLLM lanes report through their request histograms; other engines report per-request rates.</p>'}</details>
 ${liveRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Endpoint</th><th scope="col">Live</th><th scope="col">Source</th><th scope="col">Rate scope</th><th scope="col">Phase</th><th scope="col">Running</th><th scope="col">Waiting</th><th scope="col">Error</th></tr></thead><tbody>${liveRows}</tbody></table>
 <p class="routing-math-line">Live endpoint readings are separate from the fitted rows above. Poll-interval throughput includes queueing and is not the same quantity as per-request engine work.</p>`:''}`,true);
 
@@ -1027,11 +1033,11 @@ function render(s) {
   $('connection').textContent = s.demo ? '◉ Demo telemetry' : stale ? 'Status unavailable' : '● Live telemetry';
   $('warning').hidden = !s.gateway_error && !s.telemetry_error;
   $('warning').textContent = [s.gateway_error,s.telemetry_error].filter(Boolean).join(' · ');
-  $('model').textContent = s.demo ? `${g?.model || 'Model gateway'} · illustrative data · no real model servers connected` : `${g?.model || 'Model gateway'} · ${g?.workers?.some(w=>(w.max_concurrent_requests??1)>1)?'configured concurrent request capacity':'one active gateway request per model server'} · session-affinity routing`;
+  $('model').textContent = s.demo ? `${g?.model || 'Model gateway'} · illustrative data` : `${g?.model || 'Model gateway'}`;
   const door=s.continuity_door,waiting=knownWaiting(g,door);
   const fleetWorkers=(g?.workers??[]).filter(w=>s.devices.some(d=>d.id===w.id));
   const fleetCount=fleetAvailability(fleetWorkers,mediaWorkerIds(fleetWorkers,now,s.devices));
-  $('available').textContent = g&&!stale ? `${g.draining?0:fleetCount.available} / ${fleetCount.total}` : '—'; $('active').textContent = fmt(g?.active); $('queued').textContent = g?fmt(waiting.total):'—';
+  $('active').textContent = fmt(g?.active); $('queued').textContent = g?fmt(waiting.total):'—';
   $('queued').title=door?.holding?`${fmt(waiting.core)} admitted in the gateway core + ${fmt(waiting.held)} held safely at the Continuity Door. Pi/Hermes work not yet sent to Star Gate is not visible here.`:'Requests known to Star Gate and not yet dispatched. Pi/Hermes work not yet sent to Star Gate is not visible here.';
   const cap=capacity(g,stale),scales=rateScales(s.devices,s.rate_peaks,now);
   renderCapacityPanel(g,cap,stale,door,s.continuity_door_error);
@@ -1393,6 +1399,8 @@ function wireWorkerControls() {
   };
   $('worker-rows').addEventListener('click',handleWorkerClick);
   $('devices').addEventListener('click',handleWorkerClick);
+  $('help-toggle')?.addEventListener('click',()=>{try{$('help-dialog').showModal();}catch{/* already open */}});
+  $('help-close')?.addEventListener('click',()=>$('help-dialog').close());
   $('archive-toggle')?.addEventListener('click',()=>{
     showArchived=!showArchived;
     renderArchiveToggle(archivedWorkers.length);

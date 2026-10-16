@@ -220,3 +220,11 @@ button.request-chip:focus-visible{outline:2px solid var(--accent,#7aa2f7);outlin
 /* Fixed chip row so a cache/cap chip cannot shift rows below it (browser-agnostic; no subgrid needed). */
 #devices .device .device-live{grid-template-rows:24px 20px 20px}
 #devices .device-live .device-chips{grid-column:1;grid-row:3;display:flex;align-items:center;flex-wrap:wrap;gap:5px 10px;min-height:20px}
+
+/* Help dialog: reference methodology, opened from the header ? button */
+.help-toggle{font-size:13px;min-width:28px}
+dialog#help-dialog{max-width:680px;max-height:80vh;overflow:auto;padding:20px 24px;border:1px solid var(--line,#333);border-radius:12px;background:var(--panel,#161616);color:var(--text,#e6e6e6)}
+dialog#help-dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog#help-dialog .help-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+dialog#help-dialog h2{margin:0;font-size:15px}
+dialog#help-dialog p{font-size:12px;line-height:1.55;color:var(--muted,#9a9a9a);margin:8px 0}

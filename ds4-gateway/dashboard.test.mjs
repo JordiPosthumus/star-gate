@@ -734,16 +734,18 @@ test('dashboard serves local assets and a downloadable read-only snapshot', asyn
     await r.arrayBuffer();
   }
 });
-test('dashboard names model servers and explains gateway-only concurrency and availability', async t => {
+test('dashboard names model servers and keeps measurement methodology behind the help dialog', async t => {
   const { url } = await fixture(t);
   const html = await (await fetch(url)).text();
   const js = await (await fetch(url+'/ui.js')).text();
-  assert.match(html,/ROUTING SERVER GROUPS/);assert.match(html,/ACTIVE REQUESTS/);assert.match(html,/WAITING IN STAR GATE/);assert.match(html,/Queues still inside Pi, Hermes or another client/);
-  assert.match(html,/Manage servers/);assert.match(html,/not necessarily a separate physical machine/);
-  assert.match(html,/Direct clients are outside this limit/);
+  assert.match(html,/ACTIVE</);assert.match(html,/WAITING</);
+  assert.doesNotMatch(html,/ROUTING SERVER GROUPS/);
+  assert.match(html,/id="help-toggle"/);assert.match(html,/id="help-dialog"/);
+  assert.match(html,/How to read these numbers/);
   assert.match(html,/Available means healthy and enabled, including busy servers/);
   assert.match(html,/Warm cache slots retain sessions/);
-  assert.match(js,/one active gateway request per model server/);
+  assert.match(html,/Manage servers/);assert.match(html,/not necessarily a separate physical machine/);
+  assert.doesNotMatch(js,/session-affinity routing/);
   assert.doesNotMatch(html+js,/AVAILABLE SPARKS|AVAILABLE WORKERS|active generation per Spark|active gateway request per worker/);
 });
 
