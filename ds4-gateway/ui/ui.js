@@ -132,10 +132,12 @@ function renderHardwareFleet(s, now) {
   const rows = (s.hardware_machines ?? []).filter(m => m.hardware && m.hardware.configured !== false);
   const ceiling = Number.isFinite(s.hardware_clock_ceiling_mhz) ? s.hardware_clock_ceiling_mhz : null;
   if (!rows.length) {
-    status.textContent = 'No machine hardware telemetry is configured.';
-    container.innerHTML = '<p class="machine-empty">Add a hardware_telemetry entry carrying its own SSH alias to observe a machine\'s temperature and clock read-only.</p>';
+    // No telemetry configured: the whole section goes away rather than nagging
+    // about hardware_telemetry entries the owner deliberately does not run.
+    container.closest('section')?.setAttribute('hidden', '');
     return;
   }
+  container.closest('section')?.removeAttribute('hidden');
   const cards = rows.map(m => {
     const h = m.hardware, cur = h.current ?? {};
     const temps = h.temperature_current?.temperatures ?? [];
@@ -512,6 +514,9 @@ function renderArchiveToggle(count){
 function renderRoutingMath(s,now){
   const status=$('lb-status');if(!status)return;
   const g=s?.gateway,rt=g?.routing_time;
+  const archivedIds=Array.isArray(g?.archived)?g.archived:[];
+  const v2=g?.routing_v2&&typeof g.routing_v2==='object'?g.routing_v2:null;
+  const v2LanesAll=(Array.isArray(v2?.lanes)?v2.lanes:[]).filter(l=>!archivedIds.includes(l.workerId));
   const num=value=>Number.isFinite(value)?fmt(Math.round(value*100)/100):'—';
   const secs=value=>Number.isFinite(value)?`${fmt(Math.round(value*10)/10)}s`:'—';
   const rate=value=>Number.isFinite(value)?`${fmtWhole(value)} t/s`:'—';
@@ -524,38 +529,35 @@ function renderRoutingMath(s,now){
     return;
   }
   const mode=rt.mode==='active'?'active':rt.enabled?'observation only':'off';
-  status.textContent=`Time-based routing is ${mode}${Number.isFinite(rt.errors)&&rt.errors>0?` · ${fmt(rt.errors)} internal error${rt.errors===1?'':'s'}`:''}.`;
-  const margin=Number.isFinite(rt.margin_seconds)?rt.margin_seconds:null;
+  status.textContent=`Placement is ${esc(g?.placement_policy??'time-based routing')} · ${mode}${Number.isFinite(rt.errors)&&rt.errors>0?` · ${fmt(rt.errors)} internal error${rt.errors===1?'':'s'}`:''}.`;
 
-  // 1. Parameters: the rule and every setting the router obeys.
+  // 1. Placement: the rule v2 actually applies, not the legacy margin rule.
   const fit=rt.fit;
   const fitLine=fit&&Number.isFinite(fit.mu)
     ?`Fitted output length: mean ${num(fit.mu)} tokens · sigma ${num(fit.sigma)} · ${fmt(fit.sampleCount)} completed samples`
     :'Fitted output length: not enough completed samples yet';
-  $( 'lb-parameters').innerHTML=panel('Parameters — the rule and the settings the router obeys',
-    `<p class="routing-math-rule">Move a queued request only when the other server finishes earlier by more than the margin: <b>T_other + ${margin===null?'margin':fmt(margin)+'s'} &lt; T_current</b>.</p>
-<p class="routing-math-line">Mode <b>${esc(mode)}</b>${g?.placement_policy?` · placement <b>${esc(g.placement_policy)}</b>`:''}${g?.capacity_basis?` · capacity basis <b>${esc(g.capacity_basis)}</b>`:''}${g?.config_revision!==undefined?` · revision ${esc(String(g.config_revision))}`:''}</p>
-<p class="routing-math-line">${esc(fitLine)}</p>
+  $('lb-parameters').innerHTML=panel('Placement — the rule the router obeys now',
+    `<p class="routing-math-rule">Every queued request is priced on every eligible lane: <b>predicted finish = prompt ÷ prefill speed + expected output ÷ decode speed</b>, with the solo blend standing in where a phase class is not trusted yet. The warm home keeps the request unless another lane finishes it sooner by more than the cost of re-prefilling the conversation there; an armed unmeasured lane earns one bounded probe.</p>
+<p class="routing-math-line">Placement <b>${esc(g?.placement_policy??'—')}</b>${g?.capacity_basis?` · capacity basis <b>${esc(g.capacity_basis)}</b>`:''}${v2&&Number.isFinite(v2.hysteresis_seconds)?` · stickiness margin ${fmt(v2.hysteresis_seconds)}s`:''}${v2&&Number.isFinite(v2.sample_ttl_seconds)?` · samples expire after ${fmt(v2.sample_ttl_seconds)}s`:''}</p>
 <ul class="routing-math-counters">${[
-      stat('Margin',margin===null?'—':`${fmt(margin)}s`,'Extra predicted savings required before any queued request is moved.'),
-      stat('Mode',mode,'active means the router may move queued work; observation only means it records but never moves.'),
-      stat('Placement',g?.placement_policy??'—','The configured placement policy the core applies.'),
-      stat('Capacity basis',g?.capacity_basis??'—','Where concurrent-slot capacity comes from.'),
-    ].join('')}</ul>`,true);
+      stat('Placement',g?.placement_policy??'—','completion_time_v2: the measured-speed planner below makes every placement decision.'),
+      stat('Decisions',v2?.decisions_enabled?'enabled':'disabled','Whether the planner may move queued work, not only score it.'),
+      stat('Stickiness margin',v2&&Number.isFinite(v2.hysteresis_seconds)?`${fmt(v2.hysteresis_seconds)}s`:'—','Minimum extra predicted saving a move must promise beyond the re-prefill cost.'),
+      stat('Fleet output median',v2&&Number.isFinite(v2.fleet_output_median_tokens)?`${fmt(Math.round(v2.fleet_output_median_tokens))} tok`:'—','Expected output length used to weight decode time when pricing a request.'),
+    ].join('')}</ul>${fit&&Number.isFinite(fit.mu)?`<details class="analytics-collection"><summary>Historical — legacy estimator fit</summary><p class="routing-math-line">${esc(fitLine)}</p></details>`:''}`,true);
 
-  // 2. Efficacy: is the router actually seeing enough to decide anything?
-  const speedSamples=Number.isFinite(rt.speedSamples)?rt.speedSamples:0;
-  const parked=Number.isFinite(rt.unverifiedSavedSpeedSamples)?rt.unverifiedSavedSpeedSamples:0;
-  const outputs=Number.isFinite(rt.outputSamples)?rt.outputSamples:0;
-  const healthy=outputs>=32&&speedSamples>0;
-  $( 'lb-efficacy').innerHTML=panel('Efficacy — is the router seeing enough to decide?',
-    `<p class="routing-math-line">${healthy?'The router has both output-length and measured speed evidence.':outputs<32?'Waiting for more completed outputs before the length fit is usable.':'No speed sample is in use yet, so completion times stay unknown and no queued request can be moved.'}</p>
+  // 2. Evidence: how much the v2 planner actually knows right now.
+  const measuredLanes=v2LanesAll.filter(l=>l.soloSamples>0);
+  const prefillTrusted=v2LanesAll.filter(l=>l.prefillTokensPerSecond!==null).length;
+  const decodeTrusted=v2LanesAll.filter(l=>l.decodeTokensPerSecond!==null).length;
+  const totalSamples=v2LanesAll.reduce((sum,l)=>sum+(Number.isFinite(l.samples)?l.samples:0),0);
+  $('lb-efficacy').innerHTML=panel('Evidence — how much the planner knows',
+    `<p class="routing-math-line">${measuredLanes.length?`${fmt(measuredLanes.length)} of ${fmt(v2LanesAll.length)} live lanes measured · ${fmt(totalSamples)} samples banked · phase classes trusted: prefill on ${fmt(prefillTrusted)}, decode on ${fmt(decodeTrusted)}. Until a class is trusted, the solo blend prices that activity.`:'No live lane is measured yet; placement falls back to eligibility order until the first requests complete.'}${v2?.storage_error?` <span class="routing-math-no">${esc(v2.storage_error)}</span>`:''}</p>
 <ul class="routing-math-counters">${[
-      stat('Evaluations',fmt(rt.evaluations),'Times the router scored candidates for a request.'),
-      stat('Internal errors',fmt(rt.errors),'Exceptions swallowed inside observation. Any non-zero value means measurements were lost.'),
-      stat('Output-length samples',fmt(outputs),'Completed single-choice outputs feeding the length fit.'),
-      stat('Speed samples in use',fmt(speedSamples),'Rows the estimator may use right now. Only these produce a completion time.'),
-      stat('Parked speed samples',fmt(parked),'Saved rows kept but withheld: a model name alone does not prove the engine behind an endpoint survived.'),
+      stat('Banked samples',fmt(totalSamples),'Level-1 completion records across all lanes; the raw solo price source.'),
+      stat('Measured lanes',`${fmt(measuredLanes.length)} / ${fmt(v2LanesAll.length)}`,'Lanes with at least one banked sample.'),
+      stat('Prefill classes',fmt(prefillTrusted),'Lanes with three fresh prefill samples; those lanes price prompts exactly.'),
+      stat('Decode classes',fmt(decodeTrusted),'Lanes with three fresh decode samples; those lanes price generation exactly.'),
     ].join('')}</ul>`,true);
 
   // 3. Per-worker measured speeds, one row per server/phase so a lane's numbers
@@ -575,9 +577,8 @@ function renderRoutingMath(s,now){
     }).join(''):'<tr class="routing-math-sub"><td class="routing-math-sub-label muted" colspan="5">No measurement at any concurrency on this lane yet.</td></tr>';
     return `<tr class="routing-math-group"><td><b>${esc(row.workerId)}</b></td><td>${esc(row.phase)}</td><td class="muted">${rate(row.tokensPerSecond)}</td><td class="muted">${secs(row.tokensPerSecond?1000/row.tokensPerSecond:null)}</td><td class="muted">pooled · ${fmt(row.samples)} rows</td></tr>${detail}`;
   }).join('');
-  const archivedIds=Array.isArray(g?.archived)?g.archived:[];
   const liveRows=Array.isArray(g?.routing_capacity)?g.routing_capacity.filter(row=>!archivedIds.includes(row.id)).map(row=>`<tr><td>${esc(row.id)}</td><td>${row.connected?'<span class="routing-math-ok">connected</span>':'<span class="routing-math-no">unavailable</span>'}</td><td>${esc(row.source??'—')}</td><td>${esc(row.live_rate_scope??'—')}</td><td>${esc(row.phase??'—')}</td><td>${row.running===null?'—':fmt(row.running)}</td><td>${row.waiting===null?'—':fmt(row.waiting)}</td><td class="muted">${esc(row.error??'')}</td></tr>`).join(''):'';
-  const v2Lanes=(Array.isArray(g?.routing_v2?.lanes)?g.routing_v2.lanes:[]).filter(l=>!archivedIds.includes(l.workerId));
+  const v2Lanes=v2LanesAll;
   const v2Rows=v2Lanes.map(l=>`<tr><td><b>${esc(l.workerId)}</b></td><td>${rate(l.soloTokensPerSecond)}</td><td>${rate(l.prefillTokensPerSecond)}</td><td>${rate(l.decodeTokensPerSecond)}</td><td class="muted">${fmt(l.samples)}</td><td class="muted">${l.measured?'fresh':l.samples?'stale':'never measured'}</td></tr>`).join('');
   $('lb-speeds').innerHTML=panel('Measured speed — what placement sees right now (Routing v2)',
     `${v2Rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Solo</th><th scope="col">Prefill</th><th scope="col">Decode</th><th scope="col">Samples</th><th scope="col">State</th></tr></thead><tbody>${v2Rows}</tbody></table>
@@ -589,19 +590,27 @@ function renderRoutingMath(s,now){
 ${liveRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Endpoint</th><th scope="col">Live</th><th scope="col">Source</th><th scope="col">Rate scope</th><th scope="col">Phase</th><th scope="col">Running</th><th scope="col">Waiting</th><th scope="col">Error</th></tr></thead><tbody>${liveRows}</tbody></table>
 <p class="routing-math-line">Live endpoint readings are separate from the fitted rows above. Poll-interval throughput includes queueing and is not the same quantity as per-request engine work.</p>`:''}`,true);
 
-  // 4. The last decision, with its candidates.
+  // 4. The last placement, as v2 actually decided it, with the legacy
+  // estimator's receipt kept below the fold for history.
+  const v2Last=v2?.last&&typeof v2.last==='object'?v2.last:null;
+  const v2Decision=v2Last
+    ?`<p class="routing-math-line"><b>Last placement</b> ${word(v2Last.action)} · ${word(v2Last.reason)} · ${esc(v2Last.currentWorkerId??'new request')} → ${esc(v2Last.destination??'—')}${Number.isFinite(v2Last.savingSeconds)?` · predicted saving ${secs(v2Last.savingSeconds)}`:' · no predicted saving'}</p>${Number.isFinite(v2Last.at)?`<p class="routing-math-line muted">Recorded ${esc(new Date(v2Last.at).toLocaleString())}${Number.isFinite(now)?` (${esc(age(v2Last.at,now))})`:''} · decided at the ${word(v2Last.decisionPoint)} point.</p>`:''}`
+    :'<p class="routing-math-line muted">No v2 placement recorded yet — the next queued request fills this in.</p>';
+  const v2Top=Array.isArray(v2Last?.top)?v2Last.top:[];
+  const v2TopRows=v2Top.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${secs(c.completionSeconds)}</td><td class="muted">${Number.isFinite(c.runningCount)&&Number.isFinite(c.capacity)?`${fmt(c.runningCount)} / ${fmt(c.capacity)}`:'—'}</td></tr>`).join('');
+  const v2TopBlock=v2TopRows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Lane</th><th scope="col">Predicted finish</th><th scope="col">Running / capacity</th></tr></thead><tbody>${v2TopRows}</tbody></table><p class="routing-math-line muted">Measured lanes only, soonest finish first. Unmeasured lanes appear here only when a probe sends them work.</p>`:'';
   const last=rt.last;
-  const decision=last
+  const legacyDecision=last
     ?`<p class="routing-math-line"><b>Last decision</b> ${word(last.action)} · ${word(last.reason)} · ${esc(last.source??'—')} → ${esc(last.destination??'—')}${Number.isFinite(last.savingSeconds)?` · predicted saving ${secs(last.savingSeconds)}`:' · no predicted saving'}${Number.isFinite(last.marginSeconds)?` · margin ${fmt(last.marginSeconds)}s`:''}</p>${
       Number.isFinite(last.at)?`<p class="routing-math-line muted">Recorded ${esc(new Date(last.at).toLocaleString())}${Number.isFinite(now)?` (${esc(age(last.at,now))})`:''}.</p>`:''}`
-    :'<p class="routing-math-line muted">No routing decision recorded yet.</p>';
+    :'<p class="routing-math-line muted">No legacy decision recorded.</p>';
   const candidates=Array.isArray(last?.candidates)?last.candidates:[];
   // Show the running count against the capacity the planner compared it with.
   // Without it a 'capacity_mismatch' row is unreadable — it looks like the lane
   // is over its limit when the numbers may be perfectly sane.
   const rows=candidates.map(c=>`<tr><td>${esc(c.workerId??'—')}</td><td>${c.eligible?'<span class="routing-math-ok">eligible</span>':'<span class="routing-math-no">excluded</span>'}</td><td>${secs(c.completionSeconds)}</td><td>${secs(c.waitingSeconds)}</td><td class="muted">${word(c.reason)}</td><td class="muted">${Number.isFinite(c.runningCount)&&Number.isFinite(c.capacity)?`${fmt(c.runningCount)} / ${fmt(c.capacity)}`:'—'}</td><td class="muted">${word(c.inputEvidence)} / ${word(c.speedEvidence)}</td></tr>`).join('');
-  $('lb-decision').innerHTML=panel('Last decision — the candidates and why each was scored as it was',
-    `${decision}${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th><th scope="col">Running / capacity</th><th scope="col">Input / speed evidence</th></tr></thead><tbody>${rows}</tbody></table>`:'<p class="routing-math-line muted">The last decision carried no candidate list.</p>'}`,true);
+  $('lb-decision').innerHTML=panel('Last placement — the lanes it priced and the one it chose',
+    `${v2Decision}${v2TopBlock}<details class="analytics-collection"><summary>Historical — time-based estimator receipt</summary>${legacyDecision}${rows?`<table class="catalogue-table routing-math-table"><thead><tr><th scope="col">Server</th><th scope="col">Eligible</th><th scope="col">Est. completion</th><th scope="col">Est. wait</th><th scope="col">Reason</th><th scope="col">Running / capacity</th><th scope="col">Input / speed evidence</th></tr></thead><tbody>${rows}</tbody></table>`:''}</details>`,true);
 
   // 5. Shadow: what the router would have done, without doing it.
   const shadow=g?.routing_shadow;

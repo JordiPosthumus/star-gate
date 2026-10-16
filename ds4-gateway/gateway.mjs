@@ -415,6 +415,11 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     probeAfterSeconds:config.routing_v2_probe_after_seconds??20,
     sampleTtlSeconds:config.routing_v2_sample_ttl_seconds??DEFAULT_SAMPLE_TTL_SECONDS});
   const routingV2Shadow={evaluations:0,errors:0,v2_moves:0,legacy_moves:0,legacy_abstentions:0,destination_disagreements:0,agree:0,disagree:0,last:null};
+  // Compact receipt of the most recent real v2 placement decision, for the
+  // dashboard's 'last placement' panel. Offers and diagnostics are excluded:
+  // they fire per-admission and would turn 'last' into a mirror of request
+  // volume instead of a record of actual placements. No job or session ids.
+  let routingV2Last=null;
   const routingTelemetry=routingObservations.enabled?new EndpointTelemetry({includeLegacy:true,fetcher:routingFetcher,onSample:(id,value)=>{
     const node=nodes.find(node=>node.id===id);if(node)routingObservations.observeNative(routingWorker(node),value,activeJobs(node));
   }}):null;
@@ -565,7 +570,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const mediaSetup=mediaJobs?createMediaSetup(serviceConfig,store,{directory:path.join(path.dirname(config.state_file),'media-setup'),workers:()=>nodes.map(definition),binding:(id,c)=>{const n=nodes.find(n=>n.id===id);return !!n&&recovery.binding(n,c);},isEnabled:()=>!draining&&capabilityStatus().media,isInspectionEnabled:()=>capabilityStatus().inspection,isAllowed:mediaHosts.allowed}):null;
   const rebalanceEnabled=()=>capabilityStatus().rebalance;
   const allocationStatus=slot=>slot.turnAllocation?{turns_used:slot.turnAllocation.used,remaining:Math.max(0,conversationTurns()-slot.turnAllocation.used),waiting_for_next_turn:!slot.active&&slot.turnAllocation.until>performance.now(),idle_remaining_ms:Math.max(0,Math.ceil(slot.turnAllocation.until-performance.now()))}:null;
-  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), pi_client_version:1,pi_client:piClientForDisplay(piClientReports.snapshot()), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},routing_v2:{...laneSpeeds.status(nodes.map(n=>n.id)),decisions_enabled:routingV2Enabled,shadow:routingV2Shadow},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
+  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), pi_client_version:1,pi_client:piClientForDisplay(piClientReports.snapshot()), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},routing_v2:{...laneSpeeds.status(nodes.map(n=>n.id)),decisions_enabled:routingV2Enabled,shadow:routingV2Shadow,last:routingV2Last},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
     genie_admission_version:1,genie_flexible_assignment:true,placement_policy:timeRouting?(routingV2Enabled?'completion_time_v2':'completion_time_v1'):'live_load_v1',capacity_basis:'configured_gateway_admissions',continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
       relocation:{completed:relocation.completed,rejected:relocation.rejected,offers:relocationOffers().length,genie_enabled:rebalanceEnabled(),genie_offers:genieRelocationOffers(),diagnostics:relocationDiagnostics(),last:relocation.last},
       waiting:waiting.length,oldest_wait_seconds:waiting.length?Math.max(0,(performance.now()-oldestQueued(waiting).createdMono)/1000):null,
@@ -647,6 +652,15 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       // 'one unknown poisons the comparison' failure class cannot occur.
       if(routingV2Enabled){
         const decision=laneSpeeds.evaluate({job,workers,currentWorkerId,homeIsWarmCache,eligibility});
+        if(decision&&reason!=='offer'&&reason!=='diagnostic'){
+          const top=(decision.candidates??[]).filter(row=>row.eligible&&!row.cold&&Number.isFinite(row.completionSeconds))
+            .sort((a,b)=>a.completionSeconds-b.completionSeconds||a.workerId.localeCompare(b.workerId))
+            .slice(0,4).map(row=>({workerId:row.workerId,completionSeconds:row.completionSeconds,
+              runningCount:row.runningCount??null,capacity:row.capacity??null}));
+          routingV2Last={at:decision.at??Date.now(),decisionPoint:reason,currentWorkerId:currentWorkerId??null,
+            action:decision.action,destination:decision.workerId??null,reason:decision.reason,
+            savingSeconds:decision.savingSeconds??null,top};
+        }
         return decision?{...decision,source:node.id,decision_point:reason}:null;
       }
       const result=routingObservations.evaluate({job,workers,currentWorkerId,marginSeconds:routingMargin(),fastWorkerIds,homeIsWarmCache,
