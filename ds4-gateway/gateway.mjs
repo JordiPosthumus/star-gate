@@ -33,6 +33,7 @@ import { Dataset } from './dataset.mjs';
 import { clientMetadata, CLIENT_METADATA_HEADER } from './client-metadata.mjs';
 import { RoutingShadow } from './routing-shadow.mjs';
 import {RoutingObservations,routingRequestMetadata,routingIdentity} from './routing-observations.mjs';
+import {LaneSpeeds,DEFAULT_SAMPLE_TTL_SECONDS} from './routing-v2.mjs';
 import {EndpointTelemetry} from './endpoint-telemetry.mjs';
 import { GenerationFaultObserver, verifyGeneration } from './generation-health.mjs';
 import { workerConfig, workerConfigs, workerFields, assertUniqueWorker, sshTargets, replaceSshFallbacks } from './worker-config.mjs';
@@ -358,6 +359,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   if(config.routing_time_enabled!==undefined&&typeof config.routing_time_enabled!=='boolean')throw new Error('routing_time_enabled must be boolean');
   const timeRouting=config.routing_time_enabled===true;
   const configuredFastWorkers=config.routing_fast_workers??[];
+  // Legacy-planner-only input: under routing_v2_enabled the measured ranking
+  // replaces the hand-typed fast list, and this setting is silently inert.
   const fastWorkerIds=Array.isArray(configuredFastWorkers)?[...configuredFastWorkers]:configuredFastWorkers;
   if(!Array.isArray(fastWorkerIds)||fastWorkerIds.some(id=>typeof id!=='string'||!id)||new Set(fastWorkerIds).size!==fastWorkerIds.length)
     throw new Error('routing_fast_workers must be an array of unique worker IDs');
@@ -395,6 +398,23 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     filename:path.join(path.dirname(config.state_file),'routing-estimates.json')});
   const routingMargin=()=>store.data.routing_switching_margin_seconds??config.routing_switching_margin_seconds??30;
   if(!Number.isFinite(routingMargin())||routingMargin()<0){store.close();throw new Error('Switching margin must be a finite non-negative number of seconds');}
+  // Routing v2 — stopwatch measurement plus one finish-estimate rule (Design C
+  // v2, docs/reports/lb-design-c2-offline.mjs). Measurement is ALWAYS on: it
+  // costs one EWMA update per finished request and builds each lane's number
+  // from real traffic before any cutover. Decisions are authoritative only
+  // when routing_v2_enabled; until then v2 runs as a passive comparison.
+  if(config.routing_v2_enabled!==undefined&&typeof config.routing_v2_enabled!=='boolean')throw new Error('routing_v2_enabled must be a boolean');
+  if(config.routing_v2_hysteresis_seconds!==undefined&&(!Number.isFinite(config.routing_v2_hysteresis_seconds)||config.routing_v2_hysteresis_seconds<0))throw new Error('routing_v2_hysteresis_seconds must be a non-negative number');
+  if(config.routing_v2_probe_after_seconds!==undefined&&(!Number.isFinite(config.routing_v2_probe_after_seconds)||config.routing_v2_probe_after_seconds<0))throw new Error('routing_v2_probe_after_seconds must be a non-negative number');
+  if(config.routing_v2_median_output_tokens!==undefined&&(!Number.isSafeInteger(config.routing_v2_median_output_tokens)||config.routing_v2_median_output_tokens<1))throw new Error('routing_v2_median_output_tokens must be a positive whole number');
+  if(config.routing_v2_sample_ttl_seconds!==undefined&&(!Number.isFinite(config.routing_v2_sample_ttl_seconds)||config.routing_v2_sample_ttl_seconds<0))throw new Error('routing_v2_sample_ttl_seconds must be a non-negative number');
+  const routingV2Enabled=timeRouting&&config.routing_v2_enabled===true;
+  const laneSpeeds=new LaneSpeeds(path.join(path.dirname(config.state_file),'lane-speeds.json'),{
+    medianOutputTokens:config.routing_v2_median_output_tokens??800,
+    hysteresisSeconds:config.routing_v2_hysteresis_seconds??10,
+    probeAfterSeconds:config.routing_v2_probe_after_seconds??20,
+    sampleTtlSeconds:config.routing_v2_sample_ttl_seconds??DEFAULT_SAMPLE_TTL_SECONDS});
+  const routingV2Shadow={evaluations:0,errors:0,v2_moves:0,legacy_moves:0,legacy_abstentions:0,destination_disagreements:0,agree:0,disagree:0,last:null};
   const routingTelemetry=routingObservations.enabled?new EndpointTelemetry({includeLegacy:true,fetcher:routingFetcher,onSample:(id,value)=>{
     const node=nodes.find(node=>node.id===id);if(node)routingObservations.observeNative(routingWorker(node),value,activeJobs(node));
   }}):null;
@@ -545,8 +565,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   const mediaSetup=mediaJobs?createMediaSetup(serviceConfig,store,{directory:path.join(path.dirname(config.state_file),'media-setup'),workers:()=>nodes.map(definition),binding:(id,c)=>{const n=nodes.find(n=>n.id===id);return !!n&&recovery.binding(n,c);},isEnabled:()=>!draining&&capabilityStatus().media,isInspectionEnabled:()=>capabilityStatus().inspection,isAllowed:mediaHosts.allowed}):null;
   const rebalanceEnabled=()=>capabilityStatus().rebalance;
   const allocationStatus=slot=>slot.turnAllocation?{turns_used:slot.turnAllocation.used,remaining:Math.max(0,conversationTurns()-slot.turnAllocation.used),waiting_for_next_turn:!slot.active&&slot.turnAllocation.until>performance.now(),idle_remaining_ms:Math.max(0,Math.ceil(slot.turnAllocation.until-performance.now()))}:null;
-  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), pi_client_version:1,pi_client:piClientForDisplay(piClientReports.snapshot()), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
-    genie_admission_version:1,genie_flexible_assignment:true,placement_policy:timeRouting?'completion_time_v1':'live_load_v1',capacity_basis:'configured_gateway_admissions',continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
+  const stats = () => ({ version: 1, genie_capabilities:capabilityStatus(), genie_thinking:genieThinking(), serving_profiles:profiles, conversation_turns:conversationTurns(),conversation_turn_idle_ms:conversationTurnIdleMs, model_routes:routes?Object.fromEntries([...routes].map(([name,workers])=>[name,[...workers]])):null, agent_api_version:1, maintenance_lock_version:1,client_watch_version:1,client_watch:clientWatch.snapshot(), pi_client_version:1,pi_client:piClientForDisplay(piClientReports.snapshot()), model: config.model, context_length: contextLimit(), queue_timeout_ms:queueTimeoutMs(), request_timeout_ms:config.request_timeout_ms??360000000, direct_reserve:{enabled:directReserveEnabled(),release_ms:directReserveMs(),reserved:nodes.filter(n=>directReserved(n)).map(n=>n.id)}, draining,startup:{...startup}, dataset:dataset.snapshot(), routing_shadow:shadow.snapshot(),routing_metrics:routingTelemetry?nodes.map(node=>{const metrics=routingTelemetry.snapshot(node.id);if(!metrics)return {id:node.id,url:node.url,metrics:null};const {request_rows,...display}=metrics;return {id:node.id,url:node.url,metrics:display};}):null,routing_time:{...routingObservations.snapshot(),margin_seconds:routingMargin()},routing_v2:{...laneSpeeds.status(nodes.map(n=>n.id)),decisions_enabled:routingV2Enabled,shadow:routingV2Shadow},recovery:{...recovery.status(),pair_enrollment:pairEnrollment.status(),omlx_enrollment:omlxEnrollment.status()},protections:visionProtection.status(),
+    genie_admission_version:1,genie_flexible_assignment:true,placement_policy:timeRouting?(routingV2Enabled?'completion_time_v2':'completion_time_v1'):'live_load_v1',capacity_basis:'configured_gateway_admissions',continuity:{schema:1,recent_rejections:rejections.slice(0,20),safe_retry_contract:true,queued_relocation:true,automatic_relocation:true,automatic_relocation_scope:automaticRelocationScope,automatic_affinity_rebalance_min_wait_ms:automaticAffinityWait,patient_wait:true,
       relocation:{completed:relocation.completed,rejected:relocation.rejected,offers:relocationOffers().length,genie_enabled:rebalanceEnabled(),genie_offers:genieRelocationOffers(),diagnostics:relocationDiagnostics(),last:relocation.last},
       waiting:waiting.length,oldest_wait_seconds:waiting.length?Math.max(0,(performance.now()-oldestQueued(waiting).createdMono)/1000):null,
       waiting_reasons:Object.fromEntries([...new Set(waiting.map(j=>j.waitReason))].map(reason=>[reason,waiting.filter(j=>j.waitReason===reason).length]))},
@@ -604,7 +624,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     return routingObservations.attempt(()=>{
       const workers=[node,...nodes.filter(candidate=>candidate!==node)].map(candidate=>({...routingWorker(candidate),
         capacity:Math.min(requestCapacity(candidate),routingCapacity(candidate).engine_execution??requestCapacity(candidate)),
-        running:activeJobs(candidate).filter(active=>active!==job).map(active=>({...active,slotIndex:candidate.slots.indexOf(active.slot)})),queue:candidate.queue,
+        running:activeJobs(candidate).filter(active=>active!==job).map(active=>({...active,slotIndex:candidate.slots.indexOf(active.slot),
+          elapsedSeconds:Number.isFinite(active.dispatchedMono)?Math.max(0,(performance.now()-active.dispatchedMono)/1000):undefined})),queue:candidate.queue,
         canStartRequest:canStartNow(candidate,job,[...candidate.queue.filter(queued=>queued!==job),...parkedFor(candidate),job]),
         conversationTurns:conversationTurns(),turnIdleSeconds:conversationTurnIdleMs/1000,
         native:routingTelemetry?.snapshot(candidate.id),
@@ -613,18 +634,55 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       // An established conversation's durable home is a real cache reason to stay;
       // it must be visible to the planner so a stay says 'cache', not 'unknown timing'.
       const homeIsWarmCache=job.affinity==='existing'&&!!job.key&&store.get(job.key)?.node===node.id;
-      const result=routingObservations.evaluate({job,workers,currentWorkerId,marginSeconds:routingMargin(),fastWorkerIds,homeIsWarmCache,
-        eligibility:(_request,worker)=>{
+      const eligibility=(_request,worker)=>{
           const target=nodes.find(candidate=>candidate.id===worker.id);
           const ok=target.healthy&&!target.drained&&!target.quarantine&&!target.recovering&&!target.removed&&allowsWorker(job.modelRoute,target)
             &&(target===node||target.queue.length+parkedFor(target).length<queueBound())
             &&(!job.genieFlexible||target===node||canStartNow(target,job,[...target.queue,...parkedFor(target),job].sort((a,b)=>a.sequence-b.sequence)));
           const conflict=target!==node&&conflictingSessionWork(job);
           return {eligible:ok&&!conflict,reason:conflict?'same_session_work':ok?null:'existing_worker_eligibility'};
-        }});
+      };
+      // v2 replaces only the CHOOSER: same snapshot, same eligibility, same
+      // durable commit path. Its estimate can never be null, so the legacy
+      // 'one unknown poisons the comparison' failure class cannot occur.
+      if(routingV2Enabled){
+        const decision=laneSpeeds.evaluate({job,workers,currentWorkerId,homeIsWarmCache,eligibility});
+        return decision?{...decision,source:node.id,decision_point:reason}:null;
+      }
+      const result=routingObservations.evaluate({job,workers,currentWorkerId,marginSeconds:routingMargin(),fastWorkerIds,homeIsWarmCache,
+        eligibility});
       if(result&&!timeRouting)job.routingObservation={...result,decision_point:reason};
+      if(timeRouting)recordRoutingV2Shadow({job,workers,currentWorkerId,homeIsWarmCache,eligibility,legacy:result??null,decisionPoint:reason});
       return result?{...result,source:node.id,decision_point:reason}:null;
     });
+  }
+  // Passive v2 comparison while the legacy planner is still authoritative:
+  // tallies what v2 would decide on the identical snapshot so a cutover rests
+  // on fleet evidence, not hope. Its errors never touch the live decision.
+  // Decision-point contexts only, once per point per request (round-2 fix):
+  // offers/diagnostics and repeated admission evaluations would otherwise
+  // over-weight the denominators and drown the real signal.
+  function recordRoutingV2Shadow({job,workers,currentWorkerId,homeIsWarmCache,eligibility,legacy,decisionPoint}){
+    if(routingV2Enabled)return;
+    if(decisionPoint==='offer'||decisionPoint==='diagnostic')return;
+    if(job.routingV2ShadowPoints?.has(decisionPoint))return;
+    (job.routingV2ShadowPoints??=new Set()).add(decisionPoint);
+    try{
+      const decision=laneSpeeds.evaluate({job,workers,currentWorkerId,homeIsWarmCache,eligibility});
+      const moved=decision.destination!=null&&decision.destination!==currentWorkerId&&['move','place','reassign'].includes(decision.action);
+      const legacyAction=legacy?.action??null,legacyDestination=legacy?.destination??null;
+      const legacyMoved=legacyDestination!=null&&legacyDestination!==currentWorkerId&&['move','place','reassign'].includes(legacyAction);
+      routingV2Shadow.evaluations++;
+      if(moved)routingV2Shadow.v2_moves++;
+      if(legacyMoved)routingV2Shadow.legacy_moves++;
+      // Legacy abstentions are v2's headline fix: the structurally-blind class
+      // (null comparisons, untimeable candidates) must be visible in the tally.
+      if(!legacy||legacyAction===null||legacyAction==='unchanged')routingV2Shadow.legacy_abstentions++;
+      if(moved&&legacyMoved&&decision.destination!==legacyDestination)routingV2Shadow.destination_disagreements++;
+      if(moved===!!legacyMoved)routingV2Shadow.agree++;else routingV2Shadow.disagree++;
+      routingV2Shadow.last={at:Date.now(),source:currentWorkerId,reason:decision.reason,
+        legacy:{action:legacyAction,destination:legacyDestination},v2:{action:decision.action,destination:decision.destination}};
+    }catch{routingV2Shadow.errors++;}
   }
   function observeRoutingBody(job,body){
     if(!routingObservations.enabled||job.cancelled)return;
@@ -642,7 +700,14 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     const destination=nodes.find(node=>node.id===decision.destination);
     if(expected&&(expected.destination!==decision.destination||expected.evidence_id!==relocationEvidence(job,source,destination)))
       throw new Error('Routing estimate changed; request was left in place');
+    // evaluate() is side-effect-free, so offers/diagnostics/shadow comparisons
+    // can never burn a cold lane's probe priority (round-1 P1-2/P1-5). Latches
+    // happen only where the choice is really committed: a cold-probe STAY in
+    // the branch below (the request dispatches there), or a committed move
+    // after the ownership guards (round-2: an aborted commit must not suppress
+    // a lane's probe priority).
     if(!destination||destination===source||!['move','place','reassign'].includes(decision.action)){
+      if(decision.reason==='cold_probe_bounded'&&destination===source)laneSpeeds.markProbed(decision.destination);
       job.routingLastComparison={...decision,mode:'active',applied:true};
       if(!job.routingDecision||!['move','reassign'].includes(job.routingDecision.action))job.routingDecision=job.routingLastComparison;
       return null;
@@ -658,6 +723,8 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       job.routingDecision={...decision,mode:'active',action:'stay',destination:source.id,reason:job.routingCommitBlocked?'ownership_recovery_required':'ownership_write_failed',applied:true};
       log('queue_relocation_persistence_failed',{request_id:job.id,source:source.id,destination:destination.id});return null;
     }
+    // The move is committed — only now does the probe latch (see above).
+    if(decision.reason==='cold_probe_bounded')laneSpeeds.markProbed(decision.destination);
     source.queue.splice(source.queue.indexOf(job),1);
     job.node=destination;job.fixedHome=null;job.affinity='rebalanced';job.routingPlaced=true;
     destination.queue.push(job);destination.queue.sort((a,b)=>a.sequence-b.sequence);
@@ -742,7 +809,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   }
   const queuedCount=source=>source.queue.filter(job=>!job.cancelled).length;
   function relocationDiagnostics() {
-    if(timeRouting)return {schema:1,policy:'completion_time_v1',sources:timeRoutingCandidates().map(job=>({source:job.node.id,request_id:job.id,...evaluateRoutingTime(job.node,job,'diagnostic')})),truncated:false};
+    if(timeRouting)return {schema:1,policy:routingV2Enabled?'completion_time_v2':'completion_time_v1',sources:timeRoutingCandidates().map(job=>({source:job.node.id,request_id:job.id,...evaluateRoutingTime(job.node,job,'diagnostic')})),truncated:false};
     const idle=nodes.filter(eligibleDestination).sort((a,b)=>store.count(a.id)-store.count(b.id)||a.id.localeCompare(b.id));
     const gateway_reason=shuttingDown?'gateway_stopping':draining?'gateway_draining':null;
     const sources=[];
@@ -1068,6 +1135,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
     if(!timeRouting)evaluateRoutingTime(node,job,'before_dispatch');
     job.dispatched = Date.now();
     job.dispatchedMono=performance.now();
+    job.startConcurrency=activeCount(node); // the crowd this request joined (v2 measurement input)
     if(routingObservations.enabled)routingObservations.started({job,worker:routingWorker(node),fleet:nodes.map(routingWorker),concurrency:activeCount(node)});
     if(routingObservations.enabled)node.routingWorkRevision=(node.routingWorkRevision??0)+1;
     clientWatch.observeRequest(job.watchId,job.id,'dispatched');
@@ -1170,6 +1238,23 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       observe(()=>shadow.finished(node.id,job.key,{outcome,finish_reason:observer.finish_reason,
         service_ms:performance.now()-job.dispatchedMono,usage:observer.usage,route:req.url,traffic_class:job.trafficClass,remaining_active:activeCount(node)-1}));
       if(routingObservations.enabled)routingObservations.complete({job,worker:routingWorker(node),usage:observer.usage,outcome,finishReason:observer.finish_reason});
+      // v2 measurement: the stopwatch the gateway already owns. One EWMA update
+      // per completed request — no probes, no synthetic load, no engine help.
+      // Tokens are COMPUTE tokens per the reviewed design: the cached prefix is
+      // subtracted so the rate is a machine property, not a cache-mix property.
+      // The engines do NOT count reasoning in completion_tokens (fleet data
+      // 2026-10-16: thinking-mode samples implied ~25 tok/s decodes; adding
+      // thinkingCharacters/4 converges them to the twins' honest ~165), so the
+      // observer's thinking characters are converted at ~4 chars/token and added.
+      if(outcome==='complete'&&Number.isSafeInteger(observer.usage?.prompt_tokens)&&Number.isSafeInteger(observer.usage?.completion_tokens)
+        &&observer.usage.prompt_tokens+observer.usage.completion_tokens>0){
+        const cached=Math.min(Number.isSafeInteger(observer.usage.cached_tokens)?observer.usage.cached_tokens:0,observer.usage.prompt_tokens);
+        const thinkingTokens=Number.isFinite(observer.thinkingCharacters)&&observer.thinkingCharacters>0?Math.round(observer.thinkingCharacters/4):0;
+        const completionTokens=observer.usage.completion_tokens+thinkingTokens;
+        laneSpeeds.record({worker:routingWorker(node),tokens:Math.max(0,observer.usage.prompt_tokens-cached)+completionTokens,
+          outputTokens:completionTokens,seconds:(performance.now()-job.dispatchedMono)/1000,
+          concurrency:Math.max(job.startConcurrency??1,activeCount(node))});
+      }
       job.cleanup();
       job.upstream=null;job.upstreamResponse=null;
       job.slot.active = null;
@@ -2210,7 +2295,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       clearInterval(waitingTimer);
       clearInterval(routingTimer);routingTelemetry?.close();
       for(const job of [...waiting]){detach(job);reject(job.req,job.res,503,'draining','Gateway is stopping; the waiting request was not dispatched. A compatible patient client may retry after DSG returns.',{...job,node:job.fixedHome,reason:'gateway_draining'});job.cleanup();}
-      clearInterval(recoveryTimer);pairEnrollment.close();omlxEnrollment.close();await Promise.all([pairEnrollment.idle(),omlxEnrollment.idle()]);await recovery.close();
+      clearInterval(recoveryTimer);pairEnrollment.close();omlxEnrollment.close();await Promise.all([pairEnrollment.idle(),omlxEnrollment.idle(),laneSpeeds.close().catch(()=>{})]);await recovery.close();
       if (control) await new Promise(resolve => control.close(resolve));
       await new Promise(resolve => { server.close(resolve); server.closeIdleConnections(); });
       clearInterval(healthTimer); agent.destroy(); tlsAgent.destroy(); store.close();await dataset.close();await routingObservations.close();

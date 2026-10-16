@@ -40,6 +40,16 @@ function speedAt(lane, concurrency) {
   const factor = Number.isFinite(measured) ? measured : SLOWDOWN_DEFAULT(concurrency);
   return lane.tps * factor;
 }
+// SHIPPED REFINEMENT (2026-10-15): the production module prices the incoming
+// request at its actual post-join concurrency (running.length + 1, capped at
+// capacity), not capacity-when-any-slot-is-free — this demo's expression was a
+// reviewed approximation; the shipped rule is the physically correct one and
+// ranks identical-capacity lanes identically while fixing cross-capacity mixes.
+// SHIPPED REFINEMENT (2026-10-15, round 2): "one bounded probe" became re-armable
+// probe priority — a probe whose request failed or never dispatched retries after
+// the idle threshold instead of starving the lane (see routing-v2.mjs header).
+// Also shipped: a full home overflows on any measured strict improvement (no
+// margin is owed when the home cannot serve the head at all).
 
 function pendingSeconds(lane) {
   const rate = speedAt(lane, Math.max(1, lane.running.length)) ?? 0;

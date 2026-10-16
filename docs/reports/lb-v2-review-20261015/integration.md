@@ -1,0 +1,73 @@
+All evidence is gathered. Here is the complete review artifact.
+
+---
+
+# LB v2 Review — Lane: gateway integration (ds4-gateway/gateway.mjs, ui/routing-observation.js)
+
+**Scope reviewed:** working-tree diff (`gateway.mjs` +58/−5, `ui/routing-observation.js` +19), plus surrounding unchanged code (`evaluateRoutingTime` :618-655, `reconsiderRouting` :679-720, `admit`/`placementChoice` :896-975, `finish()` :1170-1230, `stats()` :564-570, config validation :404-412), `routing-v2.mjs`, `routing-v2.test.mjs`, consumers (`current-jobs.js`, `dashboard.mjs`, `dataset.mjs`, `routing-observations.mjs`, `routing-plan.mjs`, `worker-activity.mjs`), and `config.local.json` (gitignored; `routing_v2_enabled:false` at :543, `routing_time_enabled:true` at :534 — so the shadow path is live today).
+
+**Execution note:** this session has no shell/execution tool, so I could not run `node --test`. All findings below are verified by reading; the supervisor should run: `node --test ds4-gateway/routing-v2.test.mjs`, `node --test ds4-gateway/gateway.test.mjs`, `node --test ds4-gateway/routing-observations.test.mjs`.
+
+## Review
+
+- **Correct — flag-off zero-change holds.** The `eligibility` extraction (gateway.mjs:632-639) is a pure refactor: the closure body is char-identical to the previous inline argument (diff confirms), it is still invoked lazily with the same `(job, worker)` contract the legacy planner uses (routing-plan.mjs:108 `eligibility(job, worker)`), and every read it performs is side-effect-free (`canStartNow` gateway.mjs:1037-1045 builds previews only; `conflictingSessionWork` is read-only). The shadow tally (gateway.mjs:649, 657-670) runs strictly *after* the legacy result exists, never touches `job` or `result`, and its entire body is wrapped in `try{...}catch{routingV2Shadow.errors++;}` — it cannot disturb the legacy decision. The one mutation it can cause (LaneSpeeds `probed`, see P1-2) is internal to LaneSpeeds.
+- **Correct — commit-path compatibility holds.** v2's receipt (routing-v2.mjs:248, 251, 253, 262-302) supplies `destination`, `action` ∈ {place, reassign, stay, unavailable, unchanged} (v2 never emits `move`; `reconsiderRouting` :687 accepts move/place/reassign and routes everything else to the stay bookkeeping branch), `reason`, `savingSeconds`, `marginSeconds` (=hysteresisSeconds). `reconsiderRouting` :683-689, :700, :708, :711 consumes exactly those fields; `relocationEvidence` (:694) is derived from job/source/destination ids, not decision content. `dataset.record('queue_relocation')` drops `reason` entirely (dataset.mjs:19-23 — schema has no reason field), so new reason strings cannot break evidence rows. No consumer validates reason strings or `planner:'v2'`: `current-jobs.js:19` passes the object to `routingObservationText` (v2 branch added), `dashboard.mjs:466-470` whitelists per-field and ignores unknown `stats()` keys, `dataset.mjs` doesn't persist the reason. `routingLastComparison`/`routingDecision` receive `{...decision, mode:'active', applied:true}` — shape-compatible.
+- **Correct — measurement hook mechanics.** `activeCount(node)` is slot-based (worker-activity.mjs:4-5); at gateway.mjs:1219 the finishing job's `slot.active` is not yet cleared (cleared at :1224), so concurrency is self-inclusive and ≥1 — exactly what `record()` requires (routing-v2.mjs:158-162) and consistent with the "(running+1)-th concurrent" estimator. `performance.now() − job.dispatchedMono` is same-epoch (both set from `performance.now()`, gateway.mjs:1112). Usage gating matches the `observer.usage` post-`jsonMetadata` state (:1181-1183 precede :1219). `record()` cannot throw into `finish()`: the gated sync path (lane()/ewma/pow) cannot throw; `save()`'s sync portion runs inside the async IIFE, so even a sync `JSON.stringify` failure becomes a rejected promise absorbed by the `.catch` at routing-v2.mjs:344; fs errors set `storageError` and measurement continues in memory (routing-v2.mjs:322-345). Request cleanup (`job.cleanup()`, slot clear, `finishTurn`, `pumpWaiting`, `schedule`) is unreachable by v2 errors.
+- **Correct — restart design.** Two clocks keep restart safe: persisted `lastAt`/`updatedAt` are wall time (routing-v2.mjs:76, 158), the monotonic clock is never persisted; corrupt files are preserved with a `.corrupt-*` backup and a surfaced notice (:118-130); measurements, slowdown curves and `probed` flags survive restarts (:126-133, :330). Flag flip requires a restart (`routingV2Enabled` is a construction-time const, gateway.mjs:408) — no hot-flip hazard. Config validation of all four `routing_v2_*` keys runs regardless of the flag (:404-407), catching typos before cutover.
+- **Fixed:** none — strict read-only mandate; no edits applied.
+
+### Findings
+
+- **Finding P1-1 — Running-work decay is dead in the live wiring: clock-unit mismatch between LaneSpeeds' default `now()` (seconds) and gateway `dispatchedMono` (ms).**
+  Location: routing-v2.mjs:63 (`Math.max(0,(at - entry.dispatchedMono)/1000)`), :78 (`now = () => performance.now() / 1000`), :92 (comment claims `now` "matches dispatchedMono for elapsed work" — it does not, units differ by 1000×); gateway.mjs:621 (running entries are `{...active}` — carry `dispatchedMono` in ms, no `elapsedSeconds`), :644 (evaluate called without `at`), :1112 (`dispatchedMono=performance.now()` ms).
+  Evidence: for any positive uptime, `performance.now()/1000 < performance.now()`, so `(at − dispatchedMono)/1000` is always negative → `elapsed` is identically 0 whenever the `dispatchedMono` branch is taken — which is always in the gateway, since nothing in gateway.mjs sets `elapsedSeconds` (grep: zero matches) or `expectedTotalTokens`. Only the module tests exercise decay, by passing `elapsedSeconds` directly (routing-v2.test.mjs S3/S4/crowded-home scenarios). Consequence: `pendingSeconds` (:200-207) charges every running request its **full** work with zero progress credit — a lane 95% through a batch of long generations is indistinguishable from a fresh batch, the reviewed "spare slot plus nearly finished work beats a just-started slow machine" behavior never occurs live, full homes look maximally bad (inflating `saving_exceeds_hysteresis` moves) and full destinations look maximally bad. The flag-off shadow tally is also collected under this broken clock, so the cutover evidence itself is skewed.
+  Remedy: in `evaluateRoutingTime`'s worker snapshot (gateway.mjs:621), supply `elapsedSeconds:(performance.now()−active.dispatchedMono)/1000` per running entry (one line, keeps the two clocks separate); add a gateway-level test with a mid-flight running entry asserting decay.
+
+- **Finding P1-2 — `evaluate()` latches the one-time cold-probe budget from non-committing read paths; the latch is persisted and permanent, killing the probe mechanism before cutover.**
+  Location: routing-v2.mjs:292-298 (inside `evaluate`: `if (probed) this.lane(probed.workerId).probed = true;`), :179 and :330 (latch set on measurement and serialized into `lane-speeds.json`), :123-125 (only reset by identity change).
+  Evidence: `evaluateRoutingTime` is invoked from paths whose result is discarded or read-only: the admission pre-check (gateway.mjs:969, return value unused), `timeRoutingOffers` (:726, reached from `stats()` :566 via `relocationOffers()`/`genieRelocationOffers()` and from the continuity payload :1762), `relocationDiagnostics` (:787 — runs on every `stats()` poll and continuity read), and the flag-off shadow (:649→:660). Any one of these evaluations that reaches the cold tail burns that lane's probe budget even though nothing was dispatched; dashboard polling alone can latch every cold lane. The flag-off shadow runs on the production config today (`routing_time_enabled:true`, `routing_v2_enabled:false`), so `probed:true` is already accumulating in persisted state that a later flip inherits; only identity changes or actual measurements clear it.
+  Impact: after cutover, the "one bounded probe" rule of Design C v2 is dead on arrival — cold lanes are only ever served by the `cold_only_capacity` fallback, and placement becomes order/poll-dependent.
+  Remedy: make `evaluate()` side-effect-free — book the probe only on the committing path (pass a `commit:true` from `reconsiderRouting` and latch there), or drop the boolean latch in favor of the idle-time rule already present (`lastAt===null || wall−lastAt ≥ probeAfterSeconds`, re-armed each evaluation).
+
+- **Finding P2-1 — v2 UI fallback line asserts "best measured estimated finish" for decisions that are neither measured nor best.**
+  Location: ui/routing-observation.js:23 (final v2 fallback); reachable combos: `stay`+`no_capacity` (routing-v2.mjs:290 — nothing has capacity), `stay`+`cold_probe_bounded`/`stay`+`cold_only_capacity` (:301-302 with `staying=true` — an unmeasured lane chosen by capacity/probe), `unavailable`+`no_eligible_worker` (:251 — no assigned worker, `destination` null). Consumer: current-jobs.js:19 feeds `job.routing_decision` straight into `routingObservationText`.
+  Remedy: add explicit lines for those four action/reason combos (e.g., "Stayed: no lane has a free slot", "Stayed: unmeasured lane chosen by available capacity", "Unassigned: no eligible worker").
+
+- **Finding P2-2 — Shadow tally is move/stay-only and never tallies the legacy-abstain cases that motivate v2.**
+  Location: gateway.mjs:649 (shadow gated on `result` being non-null), :661-666 (agree/disagree is a single binary axis; both planners moving to *different* destinations counts as agree).
+  Evidence: when the legacy planner returns null — exactly the structurally-blind class (planner exceptions, untimeable comparisons) — no tally occurs; destination disagreement is invisible.
+  Remedy: tally legacy-null evaluations separately and add a destination-mismatch counter alongside move/stay agreement.
+
+- **Finding P2-3 — `relocationDiagnostics` hardcodes `policy:'completion_time_v1'` while `placement_policy` will read `completion_time_v2`.**
+  Location: gateway.mjs:787 vs :565; both surface through `stats()` (:566) and the continuity payload (:1762).
+  Remedy: derive the label from `routingV2Enabled` the same way `placement_policy` does.
+
+- **Finding P2-4 — Zero gateway-level test coverage of the v2 wiring.**
+  Location: ds4-gateway/gateway.test.mjs (no matches for `routing_v2|laneSpeeds|lane-speeds`); the 15 module tests (routing-v2.test.mjs) use synthetic clocks and never cross the seams where P1-1 and P1-2 live.
+  Remedy: three rig tests — (a) a completed request lands in `stats().routing_v2.lanes` via the `finish()` hook; (b) flag-off shadow tallies agree/disagree without changing the committed destination; (c) a v2-mode decision commits through `reconsiderRouting` with a valid receipt.
+
+- **Finding P2-5 — `routing_fast_workers` becomes silently inert once v2 is authoritative.**
+  Location: gateway.mjs:644 (v2 branch never receives `fastWorkerIds`; it is passed only to the legacy evaluate at :647), while the config stays validated (:361-365).
+  Remedy: document it as legacy-only, or give v2 an explicit equivalent (e.g., tie-break preference) before cutover.
+
+### Answers to the seven verification points (condensed)
+
+1. **Flag-off zero-change:** yes, behavior-identical for decisions and commit (pure refactor; shadow fully try/caught). Only side effects while dormant: CPU (double eligibility evaluation per decision point), `lane-speeds.json` writes (intended — measurement is not flag-gated, gateway.mjs:1215-1220, and runs in *every* mode including non-time-routing), and the P1-2 `probed` latch pollution.
+2. **Commit-path compatibility:** satisfied for every named consumer; v2 never emits `move` (accepted), new reason strings reach no validating consumer (dataset drops `reason`); no crash path on `planner:'v2'`. Copy accuracy issues are P2-1.
+3. **Measurement hook:** concurrency is correct-at-that-instant and self-inclusive (slot cleared after record); gating is sound; `record()` cannot throw into cleanup; epoch math is correct. Residual quality note: concurrency is sampled once at completion, not averaged over the run — under staggered completions the last finisher of a crowd records level 1 despite running at 4, biasing solo-equivalent estimates downward; the EWMA absorbs some of this. Acceptable for a first cutover; worth a line in the design doc.
+4. **evaluate() mutation / double-evaluate:** `evaluate()` does not call `save()` (memory-only `probed` until the next `record()`), and `save()` never blocks the sync commit section — the only genuine hazard is the P1-2 latch. Double-evaluate (legacy + shadow per tick; admission evaluates twice: :969 + :971) is the pre-existing legacy pattern plus one pure pass — acceptable cost.
+5. **Shadow tally semantics:** internally consistent but too coarse for the cutover decision it is meant to justify (P2-2): no destination-disagreement axis, and legacy abstentions — v2's headline fix — are untallied.
+6. **UI v2 copy:** P2-1; the reassign/place branches are complete for reachable reasons (place+`available_capacity_fallback` is unreachable since it requires a non-null home); the stay/unavailable fallback is wrong for four reachable combos.
+7. **Restart ON vs OFF / flip safety:** restart-safe state (wall-clock persistence, corrupt-file recovery, probe budget persists); flip requires restart; two things make the later flip unsafe as-is: P1-1 (decisions would run on dead decay) and P1-2 (probe budget pre-burned by dormant polling and persisted). Also note `routingIdentity` (routing-observations.mjs:25-27) hashes capacity/context/aliases — operator edits to those reset every lane to cold at flip time (safe, but blind until traffic re-measures).
+
+### Verdict
+
+**SHIP-AFTER-FIXES.**
+
+Must-fix before merge (both small, both poison dormant-run state/evidence rather than live routing):
+1. P1-1 — supply `elapsedSeconds` (or an ms `at`) at the gateway.mjs:621 seam so running-work decay actually operates; add a decay test at the gateway level.
+2. P1-2 — make `evaluate()` side-effect-free; latch the cold probe only on the committing path (or use the re-armable idle-time rule).
+
+Should-fix before flipping the flag: P2-1 (UI copy), P2-2 (tally legacy-abstain + destination mismatch), P2-3 (diagnostics policy label), P2-4 (wiring tests), P2-5 (`routing_fast_workers` under v2).
+
+With `routing_v2_enabled=false` as shipped, live routing decisions are behavior-identical to HEAD — but because the dormant run already writes `probed` latches and skewed shadow evidence that a later cutover would inherit, this is not "safe to leave dormant untouched"; it is safe to merge only with the two P1 fixes applied.
