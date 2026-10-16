@@ -70,6 +70,9 @@
 .cache-chip{color:var(--muted);white-space:nowrap}
 .cache-chip.warn{color:#efba62}button.cache-chip{border:0;background:none;padding:0;font:inherit;cursor:pointer;text-decoration:underline;text-underline-offset:2px}button.cache-chip:hover{color:var(--text)}
 .request-chip{border:1px solid var(--line);border-radius:9px;padding:1px 7px;font-size:10px;color:var(--muted);white-space:nowrap}
+button.request-chip{appearance:none;background:none;font:inherit;cursor:pointer}
+button.request-chip:hover{border-color:var(--accent,#7aa2f7);color:var(--text,#e6e6e6)}
+button.request-chip:focus-visible{outline:2px solid var(--accent,#7aa2f7);outline-offset:1px}
 .device-details{margin:6px 0 4px;font-size:12px}
 .device-details>summary{cursor:pointer;color:var(--muted);font-size:11px;padding:4px 0;list-style:none}
 .device-details>summary::before{content:'▸ '}
