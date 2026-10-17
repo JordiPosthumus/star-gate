@@ -21,11 +21,15 @@
 #fleet-speed-value{border:0;padding:0;background:transparent;text-align:left;cursor:pointer;font-family:inherit}.temperature-reading{display:inline-flex;align-items:center;gap:3px;border:0;padding:0;background:transparent;color:inherit;font:inherit;cursor:pointer}.temperature-reading .hardware-mini-chart{width:16px;height:9px}.temperature-reading.stale{opacity:.5}.performance-dialog p{white-space:pre-line}
 
 .hardware-reading.accelerator>small{display:flex;justify-content:space-between;gap:3px;align-items:center}.hardware-reading.accelerator .temperature-reading{flex-shrink:0}
-/* Mini thermometers on the hardware machine cards. The fill column rises with
-   temperature; colour is the machine's own band: green below the 78 °C advisory
-   threshold, amber approaching the 85 °C worry line, red at or above it. */
-.machine .machine-values{align-items:center}
-.machine-thermo{width:12px;height:28px;flex-shrink:0;overflow:visible}
+/* Mini thermometers on the hardware machine cards. A tall fill column on the
+   left, degrees with MHz stacked to its right; colour is the machine's own
+   band: green below the 78 °C advisory threshold, amber approaching the
+   85 °C worry line, red at or above it. */
+.machine .machine-values{align-items:center;gap:16px;margin:8px 0 4px}
+.machine .machine-readings{display:grid;gap:2px;min-width:0}
+.machine .machine-readings .machine-clock{margin-left:2px;font-size:12px}
+.machine .machine-throttle{color:var(--orange)}
+.machine-thermo{width:14px;height:44px;flex-shrink:0;overflow:visible}
 .machine-thermo .thermo-tube{fill:none;stroke:#4a574e;stroke-width:1.2}
 .machine-thermo .thermo-fill,.machine-thermo .thermo-bulb{fill:#6fdc9c}
 .machine-thermo[data-band=warn] .thermo-fill,.machine-thermo[data-band=warn] .thermo-bulb{fill:#f1a878}
