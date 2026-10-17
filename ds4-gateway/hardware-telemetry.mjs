@@ -115,7 +115,10 @@ export function hardwareTelemetryConfig(raw={}){
 // machine that serves no route by itself still report temperature and clock.
 export function physicalMachineIds(raw={}){
   const config=hardwareTelemetryConfig(raw);
-  return [...config.workers].filter(([,value])=>!!value.ssh).map(([id])=>id);
+  // A machine is physical when it can be observed on its own: an entry carrying
+  // its own SSH alias, or a macos-local sample of this very host. Worker-keyed
+  // entries without either depend on a live registration and are not independent.
+  return [...config.workers].filter(([,value])=>!!value.ssh||value.adapter==='macos-local').map(([id])=>id);
 }
 
 export class MacSource{
@@ -184,7 +187,11 @@ export class HardwareTelemetry{
       // hardware_telemetry entry carries its own alias, so physical machines that
       // serve no route directly (idle ring members, the other half of a pair) can
       // still report temperature and clock read-only.
-      if(!active.has(id)&&!ssh){existing?.source.close();existing?.thermal?.close();this.sources.delete(id);this.status(id,'waiting','worker_not_registered');continue;}
+      // An SSH-keyed entry observes its machine regardless of gateway
+      // registration; macos-local samples this host and needs neither. Only
+      // worker-keyed entries without their own transport depend on a live
+      // registration and are released when it disappears.
+      if(!active.has(id)&&!ssh&&config.adapter!=='macos-local'){existing?.source.close();existing?.thermal?.close();this.sources.delete(id);this.status(id,'waiting','worker_not_registered');continue;}
       if(existing?.signature===signature)continue;existing?.source.close();existing?.thermal?.close();this.sources.delete(id);
       if(config.adapter==='nvidia-linux'){
         if(!SSH.test(ssh??'')||ssh.startsWith('-')){this.status(id,'disconnected','management_transport_unavailable');continue;}

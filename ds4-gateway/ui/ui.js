@@ -150,11 +150,21 @@ function renderHardwareFleet(s, now) {
     return { id: m.id, label: machineLabel(m.id), temp, clock, heat, throttle: h.temperature_current?.thermal_throttling, at };
   });
   cards.sort((a, b) => (Number.isFinite(b.temp) ? b.temp : -1) - (Number.isFinite(a.temp) ? a.temp : -1));
+  // Mini thermometer: tube fill rises from 30 °C to a full column at 85 °C.
+  // Colour is the machine's own temperature band — green below the 78 °C
+  // advisory threshold, amber approaching it, red at the 85 °C worry line —
+  // so the glyph answers 'should I worry?' at a glance.
+  const thermo = celsius => {
+    const band = !Number.isFinite(celsius) ? 'unknown' : celsius >= MACHINE_CRITICAL_C ? 'critical' : celsius >= MACHINE_WARN_C ? 'warn' : 'ok';
+    const f = Number.isFinite(celsius) ? Math.min(1, Math.max(.08, (celsius - 30) / 55)) : .08;
+    const h = +(15 * f).toFixed(1), y = +(19 - h).toFixed(1);
+    return { band, glyph: `<rect class="thermo-tube" x="3.5" y="1.5" width="5" height="18.5" rx="2.5"/><rect class="thermo-fill" x="5" y="${y}" width="2" height="${h}" rx="1"/><circle class="thermo-bulb" cx="6" cy="23" r="3.4"/>` };
+  };
   const attention = cards.filter(c => c.heat.key === 'warn' || c.heat.key === 'critical');
   const hottest = cards.find(c => Number.isFinite(c.temp));
   container.dataset.level = cards.some(c => c.heat.key === 'critical') ? 'critical' : attention.length ? 'warn' : 'ok';
   status.textContent = `${cards.length} machine${cards.length === 1 ? '' : 's'} reporting · hottest ${hottest ? `${hottest.label} at ${fmtWhole(hottest.temp)} °C` : 'unknown'}${ceiling ? ` · declared ceiling ${fmtWhole(ceiling)} MHz` : ''} · ${attention.length ? `${attention.length} needing attention` : 'all within advisory limits'}.`;
-  container.innerHTML = cards.map(c => `<div class="machine ${esc(c.heat.key)}" role="listitem" title="${esc(`${c.label}: ${c.heat.reason}`)}"><span class="machine-name">${esc(c.label)}</span><div class="machine-values"><strong>${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)}<span>°C</span>` : '—'}</strong><span class="machine-clock">${Number.isFinite(c.clock) ? `${fmtWhole(c.clock)}<span>MHz</span>` : '—'}</span></div><small>${esc(c.heat.label)}${c.throttle === true ? ' · throttle flagged' : ''}</small></div>`).join('');
+  container.innerHTML = cards.map(c => { const t = thermo(c.temp); return `<div class="machine ${esc(c.heat.key)}" role="listitem" title="${esc(`${c.label}: ${c.heat.reason}`)}"><span class="machine-name">${esc(c.label)}</span><div class="machine-values"><svg class="machine-thermo" viewBox="0 0 12 28" data-band="${t.band}" role="img" aria-label="temperature ${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)} degrees, ${t.band}` : 'unknown'}">${t.glyph}</svg><strong>${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)}<span>°C</span>` : '—'}</strong><span class="machine-clock">${Number.isFinite(c.clock) ? `${fmtWhole(c.clock)}<span>MHz</span>` : '—'}</span></div><small>${esc(c.heat.label)}${c.throttle === true ? ' · throttle flagged' : ''}</small></div>`; }).join('');
 }
 function telemetryStatus(d) {
   if (d.telemetry_configured === false) return 'Engine timings not configured';
