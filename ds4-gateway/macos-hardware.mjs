@@ -27,6 +27,14 @@ export function parseMacActivity(text){
   if(fields.length!==1)return null;
   const value=Number(fields[0][1]);return value<=100?value:null;
 }
+// macOS's own thermal verdict (NSProcessInfo.thermalState): 0 nominal, 1 fair,
+// 2 serious, 3 critical. Apple publishes no throttle temperature, so this —
+// not an invented number — is what the Mac card's colour must follow.
+export function parseMacThermalState(text){
+  if(typeof text!=='string'||text.length>64)return null;
+  const level=Number(text.trim());
+  return Number.isInteger(level)&&level>=0&&level<=3?level:null;
+}
 export async function sampleMacHardware({platform=process.platform,totalmem=os.totalmem,freemem=os.freemem,exec=run,signal,now=Date.now}={}){
   if(platform!=='darwin')throw new Error('macos_local_unavailable');
   const sample={time:now()},total=totalmem(),free=freemem();
@@ -38,7 +46,10 @@ export async function sampleMacHardware({platform=process.platform,totalmem=os.t
       const activity=parseMacActivity(stdout);if(activity!==null)Object.assign(sample,{accelerator_activity_pct:activity,accelerator_scope:'accelerator'});
     }catch{/* A driver query failure must not discard valid RAM observations. */}})(),
     (async()=>{try{const {stdout}=await exec(SMC_PYTHON,[SMC_SCRIPT],{encoding:'utf8',timeout:4000,maxBuffer:16384,signal});Object.assign(sample,parseMacSensors(stdout,sample.time));
-    }catch{/* No interpreter, permission or sensor means unknown, never an estimate. */}})()
+    }catch{/* No interpreter, permission or sensor means unknown, never an estimate. */}})(),
+    (async()=>{try{const {stdout}=await exec('/usr/bin/osascript',['-l','JavaScript','-e','ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState'],{encoding:'utf8',timeout:4000,maxBuffer:4096,signal});
+      const state=parseMacThermalState(stdout);if(state!==null)Object.assign(sample,{thermal_state:state});
+    }catch{/* No verdict available means the UI stays neutral, never guesses. */}})()
   ]);
   return sample;
 }

@@ -7,7 +7,7 @@ import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {HardwareTelemetry,hardwareTelemetryConfig,nvidiaLinuxCommand,parseNvidiaLinux,nvidiaThermalCommand,parseNvidiaThermal} from './hardware-telemetry.mjs';
 import {evidence} from './dataset.mjs';
-import {parseMacActivity,sampleMacHardware,parseMacSensors} from './macos-hardware.mjs';
+import {parseMacActivity,sampleMacHardware,parseMacSensors,parseMacThermalState} from './macos-hardware.mjs';
 import {MacSource} from './hardware-telemetry.mjs';
 
 test('unprivileged Mac samples expose occupied RAM and one driver activity reading, never guessed power',async()=>{
@@ -98,11 +98,22 @@ test('Mac SMC samples preserve system sensor identity, reject sentinels and isol
  const parsed=parseMacSensors(text,now);assert.equal(parsed.power_scope,'system');assert.equal(parsed.power_sensor,'smc_pstr');
  assert.deepEqual(parsed.temperatures.map(row=>row.scope),['gpu','cpu']);assert.ok(!JSON.stringify(parsed).includes('PRIVATE'));
  assert.deepEqual(parseMacSensors(JSON.stringify({schema:1,values:{PSTR:0,Tf14:151,Tf04:'65'}})),{});
+ // macOS's own thermal verdict: parsed strictly, garbage becomes absence.
+ assert.equal(parseMacThermalState('0'),0);assert.equal(parseMacThermalState('3\n'),3);
+ assert.equal(parseMacThermalState('4'),null);assert.equal(parseMacThermalState('nominal'),null);
  const calls=[];const sample=await sampleMacHardware({platform:'darwin',totalmem:()=>128,freemem:()=>32,now:()=>now,exec:async(file,args,options)=>{
-  calls.push({file,args,options});if(file==='/usr/sbin/ioreg')throw new Error('driver unavailable');return {stdout:text};
+  calls.push({file,args,options});if(file==='/usr/sbin/ioreg')throw new Error('driver unavailable');
+  if(file.endsWith('/osascript'))return {stdout:'1\n'};
+  return {stdout:text};
  }});
- assert.equal(calls.length,2);assert.equal(sample.memory_used_bytes,96);assert.equal(sample.power_watts,123.5);assert.equal(sample.temperatures[0].time,now);
+ assert.equal(calls.length,3);assert.equal(sample.memory_used_bytes,96);assert.equal(sample.power_watts,123.5);assert.equal(sample.temperatures[0].time,now);
+ assert.equal(sample.thermal_state,1,'Apple thermal verdict rides along when macOS answers');
  const smc=calls.find(call=>call.file.endsWith('/python3'));assert.equal(smc.options.maxBuffer,16384);assert.equal(smc.args.length,1);assert.ok(smc.args[0].endsWith('/macos-smc.py'));
+ const verdict=calls.find(call=>call.file.endsWith('/osascript'));assert.ok(verdict.args[3].includes('thermalState'));
+ const partial=await sampleMacHardware({platform:'darwin',totalmem:()=>128,freemem:()=>32,now:()=>now,exec:async(file)=>{
+  if(file.endsWith('/osascript'))throw new Error('no verdict');return {stdout:text};
+ }});
+ assert.equal(partial.thermal_state,undefined,'a failed verdict must be absent, never defaulted');
 });
 
 test('thermal observer preserves independent freshness and does not turn unsupported flags into false',()=>{

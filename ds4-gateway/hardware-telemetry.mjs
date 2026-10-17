@@ -56,6 +56,9 @@ const sampleShape=(raw,time=Date.now())=>{
     }
     if(temperatures.length)sample.temperatures=temperatures;
   }
+  // macOS's own thermal verdict (0 nominal – 3 critical) rides along with the
+  // SMC sample so the UI can colour the Mac by Apple's verdict, not a guess.
+  if(Number.isInteger(raw.thermal_state)&&raw.thermal_state>=0&&raw.thermal_state<=3)sample.thermal_state=raw.thermal_state;
   if(typeof raw.thermal_throttling==='boolean'&&raw.thermal_sensor==='nvidia_gpu')Object.assign(sample,{thermal_throttling:raw.thermal_throttling,thermal_sensor:'nvidia_gpu'});
   return Object.keys(sample).length>1?sample:null;
 };
@@ -168,13 +171,13 @@ export class HardwareTelemetry{
   }
   status(id,state,reason=null){const value=this.states.get(id);if(value){value.state=state;value.reason=reason;}}
   accept(id,sample){const value=this.states.get(id),safe=sampleShape(sample,this.options.now?.()??Date.now());if(!value||!safe){if(value)value.rejected++;return;}
-    const thermalOnly=Object.keys(safe).every(key=>['time','temperatures','thermal_throttling','thermal_sensor'].includes(key));
+    const thermalOnly=Object.keys(safe).every(key=>['time','temperatures','thermal_throttling','thermal_sensor','thermal_state'].includes(key));
     const previous=thermalOnly?value.temperature_at:value.last_sample_at;
     if(previous!==null&&safe.time<=previous){value.rejected++;return;}
     const row={sample_id:createHash('sha256').update(`dsg-hardware-v1\0${id}\0${safe.time}\0${this.sequence++}\0${JSON.stringify(safe)}`).digest('hex'),observed_at:this.options.now?.()??Date.now(),node:id,kind:'hardware',...safe};
     if(!thermalOnly){value.current=safe;value.last_sample_at=safe.time;value.series.push(safe);value.series=value.series.filter(item=>safe.time-item.time<HISTORY_MS).slice(-MAX_SAMPLES);value.state='connected';value.reason=null;}
     if((safe.temperatures||typeof safe.thermal_throttling==='boolean')&&(value.temperature_at===null||safe.time>value.temperature_at)){
-      const thermal={time:safe.time,...(safe.temperatures?{temperatures:safe.temperatures}:{}),...(typeof safe.thermal_throttling==='boolean'?{thermal_throttling:safe.thermal_throttling,thermal_sensor:safe.thermal_sensor}:{})};
+      const thermal={time:safe.time,...(safe.temperatures?{temperatures:safe.temperatures}:{}),...(typeof safe.thermal_throttling==='boolean'?{thermal_throttling:safe.thermal_throttling,thermal_sensor:safe.thermal_sensor}:{}),...(safe.thermal_state!==undefined?{thermal_state:safe.thermal_state}:{})};
       value.temperature_at=safe.time;value.temperature_current=thermal;value.temperature_state='connected';value.temperature_reason=null;
       value.temperature_series.push(thermal);value.temperature_series=value.temperature_series.filter(item=>safe.time-item.time<HISTORY_MS).slice(-MAX_SAMPLES);
     }

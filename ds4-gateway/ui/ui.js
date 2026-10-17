@@ -118,13 +118,27 @@ function hardwareMarkup(h,now){
 // measured GPU against operator-set reference thresholds; they never gate, cap,
 // throttle or command a machine. Thresholds are named here so the console states
 // its own rule rather than implying a hardware limit.
-const MACHINE_WARN_C = 78, MACHINE_CRITICAL_C = 85, MACHINE_STALE_MS = 120000;
-function machineHeat(temp, clock, ceiling) {
+// Evidence-based heat bands. The sparks are GB10 boxes: on stock cooling,
+// sustained 78–88 °C ended in thermal shutdowns (a monitored node ran 62 of 73
+// hours at ≥85 °C before dying); the 2200 MHz clock-capped regime runs 65–69 °C.
+// Green below 75 °C keeps a dust-drifting box visible well before shutdown
+// territory; red at 85 °C is the documented danger zone. The Mac does NOT get
+// numeric bands: Apple publishes no throttle temperature, so its colour follows
+// macOS's own thermal verdict (NSProcessInfo.thermalState), and without a
+// verdict the card stays neutral rather than guessing.
+const MACHINE_BANDS = { warn: 75, critical: 85 }, MACHINE_STALE_MS = 120000;
+function machineHeat(temp, clock, ceiling, macVerdict) {
+  if (macVerdict !== undefined) {
+    if (macVerdict === 0) return { key: 'ok', label: 'nominal', reason: 'macOS reports the system thermally nominal.' };
+    if (macVerdict === 1) return { key: 'warn', label: 'thermal pressure: fair', reason: 'macOS reports thermal pressure “fair” — the system is actively managing heat. Normal under sustained inference; sustained readings here merit a look.' };
+    if (macVerdict === 2 || macVerdict === 3) return { key: 'critical', label: `thermal pressure: ${macVerdict === 2 ? 'serious' : 'critical'}`, reason: `macOS reports thermal pressure “${macVerdict === 2 ? 'serious' : 'critical'}” — the system is throttling or near it. Investigate now.` };
+    return { key: 'unknown', label: 'no verdict', reason: 'Apple publishes no throttle temperature and macOS gave no thermal verdict this sample, so the colour stays neutral instead of guessing.' };
+  }
   if (!Number.isFinite(temp)) return { key: 'unknown', label: 'no reading', reason: 'No GPU temperature sample has arrived yet.' };
-  if (temp >= MACHINE_CRITICAL_C) return { key: 'critical', label: 'very hot', reason: `${fmtWhole(temp)} °C is at or above the ${MACHINE_CRITICAL_C} °C advisory threshold. Reason to investigate cooling: airflow, dust, fan floor or room ambient.` };
-  if (temp >= MACHINE_WARN_C) return { key: 'warn', label: 'hot', reason: `${fmtWhole(temp)} °C is above the ${MACHINE_WARN_C} °C advisory threshold. Warm; temperature alone does not establish throttling.` };
+  if (temp >= MACHINE_BANDS.critical) return { key: 'critical', label: 'very hot', reason: `${fmtWhole(temp)} °C is at or above the ${MACHINE_BANDS.critical} °C line — the zone where GB10 boxes have been documented to thermally shut down. Investigate cooling: airflow, dust, fan floor or room ambient.` };
+  if (temp >= MACHINE_BANDS.warn) return { key: 'warn', label: 'hot', reason: `${fmtWhole(temp)} °C is above the ${MACHINE_BANDS.warn} °C advisory line — warmer than the healthy clock-capped regime (65–69 °C). A box drifting up here is the first sign of clogged airflow.` };
   if (Number.isFinite(clock) && Number.isFinite(ceiling) && clock > ceiling) return { key: 'warn', label: 'clock above ceiling', reason: `${fmtWhole(clock)} MHz exceeds the declared ${fmtWhole(ceiling)} MHz ceiling.` };
-  return { key: 'ok', label: 'normal', reason: `Within the advisory thresholds (below ${MACHINE_WARN_C} °C${Number.isFinite(ceiling) ? ` and at or below ${fmtWhole(ceiling)} MHz` : ''}).` };
+  return { key: 'ok', label: 'normal', reason: `Within the documented healthy regime (below ${MACHINE_BANDS.warn} °C; the clock-capped fleet idles 65–69 °C).` };
 }
 function renderHardwareFleet(s, now) {
   const container = $('hardware-fleet'), status = $('hardware-fleet-status');
@@ -146,16 +160,19 @@ function renderHardwareFleet(s, now) {
     const clock = Number.isFinite(cur.clock_mhz) ? cur.clock_mhz : null;
     const at = Math.max(h.temperature_at ?? 0, h.last_sample_at ?? 0) || null;
     const stale = !at || now - at > MACHINE_STALE_MS;
-    const heat = stale ? { key: 'unknown', label: 'stale', reason: `The newest sample is ${age(at, now)}; not used for a heat judgement.` } : machineHeat(temp, clock, ceiling);
+    // Apple machines are judged by macOS's own thermal verdict, not by a
+    // numeric band; the verdict travels with the newest thermal sample.
+    const macVerdict = h.adapter === 'macos-local' ? h.temperature_current?.thermal_state : undefined;
+    const heat = stale ? { key: 'unknown', label: 'stale', reason: `The newest sample is ${age(at, now)}; not used for a heat judgement.` } : machineHeat(temp, clock, ceiling, macVerdict);
     return { id: m.id, label: machineLabel(m.id), temp, clock, heat, throttle: h.temperature_current?.thermal_throttling, at };
   });
   cards.sort((a, b) => (Number.isFinite(b.temp) ? b.temp : -1) - (Number.isFinite(a.temp) ? a.temp : -1));
   // Mini thermometer: tube fill rises from 30 °C to a full column at 85 °C.
-  // Colour is the machine's own temperature band — green below the 78 °C
-  // advisory threshold, amber approaching it, red at the 85 °C worry line —
-  // so the glyph answers 'should I worry?' at a glance.
-  const thermo = celsius => {
-    const band = !Number.isFinite(celsius) ? 'unknown' : celsius >= MACHINE_CRITICAL_C ? 'critical' : celsius >= MACHINE_WARN_C ? 'warn' : 'ok';
+  // Colour comes from the card's heat verdict — for the sparks that is the
+  // documented GB10 band (green <75 °C, amber to the 85 °C shutdown zone, red
+  // at or above it); for the Mac it is macOS's own thermal verdict. When no
+  // verdict exists the glyph stays neutral grey instead of inventing one.
+  const thermo = (celsius, band) => {
     const f = Number.isFinite(celsius) ? Math.min(1, Math.max(.08, (celsius - 30) / 55)) : .08;
     const h = +(32.5 * f).toFixed(1), y = +(35 - h).toFixed(1);
     return { band, glyph: `<rect class="thermo-tube" x="3.5" y="1.5" width="5" height="33.5" rx="2.5"/><rect class="thermo-fill" x="4.75" y="${y}" width="2.5" height="${h}" rx="1.25"/><circle class="thermo-bulb" cx="6" cy="39" r="4"/>` };
@@ -164,7 +181,7 @@ function renderHardwareFleet(s, now) {
   const hottest = cards.find(c => Number.isFinite(c.temp));
   container.dataset.level = cards.some(c => c.heat.key === 'critical') ? 'critical' : attention.length ? 'warn' : 'ok';
   status.textContent = `${cards.length} machine${cards.length === 1 ? '' : 's'} reporting · hottest ${hottest ? `${hottest.label} at ${fmtWhole(hottest.temp)} °C` : 'unknown'}${ceiling ? ` · declared ceiling ${fmtWhole(ceiling)} MHz` : ''} · ${attention.length ? `${attention.length} needing attention` : 'all within advisory limits'}.`;
-  container.innerHTML = cards.map(c => { const t = thermo(c.temp); return `<div class="machine ${esc(c.heat.key)}" role="listitem" title="${esc(`${c.label}: ${c.heat.reason}${c.throttle === true ? ' · thermal throttling flagged' : ''}`)}"><span class="machine-name">${esc(c.label)}</span><div class="machine-values"><svg class="machine-thermo" viewBox="0 0 12 44" data-band="${t.band}" role="img" aria-label="temperature ${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)} degrees, ${t.band}` : 'unknown'}">${t.glyph}</svg><div class="machine-readings"><strong>${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)}<span>°C</span>` : '—'}</strong><span class="machine-clock">${Number.isFinite(c.clock) ? `${fmtWhole(c.clock)}<span>MHz</span>` : '—'}</span></div></div>${c.throttle === true ? '<small class="machine-throttle">throttling flagged</small>' : ''}</div>`; }).join('');
+  container.innerHTML = cards.map(c => { const t = thermo(c.temp, c.heat.key); return `<div class="machine ${esc(c.heat.key)}" role="listitem" title="${esc(`${c.label}: ${c.heat.reason}${c.throttle === true ? ' · thermal throttling flagged' : ''}`)}"><span class="machine-name">${esc(c.label)}</span><div class="machine-values"><svg class="machine-thermo" viewBox="0 0 12 44" data-band="${t.band}" role="img" aria-label="temperature ${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)} degrees, ${t.band}` : 'no verdict'}">${t.glyph}</svg><div class="machine-readings"><strong>${Number.isFinite(c.temp) ? `${fmtWhole(c.temp)}<span>°C</span>` : '—'}</strong><span class="machine-clock">${Number.isFinite(c.clock) ? `${fmtWhole(c.clock)}<span>MHz</span>` : '—'}</span></div></div>${c.throttle === true ? '<small class="machine-throttle">throttling flagged</small>' : ''}</div>`; }).join('');
 }
 function telemetryStatus(d) {
   if (d.telemetry_configured === false) return 'Engine timings not configured';
