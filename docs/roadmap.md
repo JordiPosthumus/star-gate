@@ -34,8 +34,9 @@ does. For what actually ships today, see the [README](../README.md) and the
    unknown without turning the UI into a wall of counters.
 4. **Agent operability.** Keep the scoped drain/resume API and the
    machine-onboarding runbooks accurate enough for another agent to follow.
-5. **Documentation honesty.** Remove retired Genie/Hermes material, keep the
-   caveats current, and mark historical pages as historical.
+5. **Bring Gate Genie home.** Restore the first-party runtime, Genie tab and
+   Hermes Gateway messaging around the identity and brain contract in
+   [Genie](genie.md).
 
 ## Explicitly out of scope
 
@@ -47,8 +48,8 @@ does. For what actually ships today, see the [README](../README.md) and the
 
 ## Retired
 
-These were removed rather than left dormant: the custom Genie agent and Telegram
-bridge, the bundled Hermes runtime, XGBoost/embedding experiments, Priority Lens,
+These were removed rather than left dormant: the bundled Hermes runtime as a
+vendored copy, XGBoost/embedding experiments, Priority Lens,
 Proactive Resume / Session Rescue, and the four-path cache comparator with its
 calibration preflight. Some code names and historical docs remain; they do not
 grant capability.

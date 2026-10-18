@@ -19,8 +19,8 @@ KV caches; clients own their conversations, tools and decisions to start turns.
 | Optional client continuity / Agent Watch | Support certified non-dispatch waiting and advisory client status without submitting a new user turn. |
 
 Normal request dispatch never waits for a model-authored review. The legacy
-Genie assistant and its provider-fallback path were removed; see
-[Direction](roadmap.md) for the current scope.
+Genie assistant is being restored around a first-party Hermes profile and the
+[brain ladder](genie.md); the gateway never depends on him.
 
 ## Current Jobs and queue priority
 

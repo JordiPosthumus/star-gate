@@ -59,10 +59,11 @@ These are the things a reader deserves to know before investing time:
 4. **Hardware-specific features.** Recovery enrollment, hardware telemetry and
    media jobs target macOS LaunchAgents, systemd-user on DGX Spark, and specific
    engine APIs. They are opt-in and fail closed, but they are not universal.
-5. **Removed surfaces still echo.** The legacy Genie agent, Telegram bridge and
-   bundled Hermes runtime were removed in the gateway-only transition. Some
-   modules, routes and docs retain historical names or return `410`; treat them
-   as unsupported rather than as working features.
+5. **Genie is coming back, in stages.** The embedded assistant was removed in the
+   gateway-only transition; his identity and brain contract are restored, but the
+   first-party runtime and conversation tab are not shipped yet. Until they are,
+   `/api/genie*` returns `410` and the Brain/Memory/Soul panels expect a Hermes
+   runtime you install yourself. See [Genie](docs/genie.md) for the plan.
 6. **Configuration is a JSON file, not a stable public API.** Field names have
    changed between revisions. Pin a commit if you need reproducibility.
 7. **Documentation is uneven.** The `docs/` tree grew alongside the code. The
@@ -156,7 +157,7 @@ controls are off unless you set `ui_worker_management: true`.
 | Hardware telemetry (RAM/GPU/power/temp) | Opt-in | DGX Spark SSH/NVIDIA adapter or local JSONL |
 | Media jobs (H3 / ACE-Step) | Experimental | Hardware- and recipe-specific |
 | LAN sharing + Pi client sync | Opt-in | Advertises a fixed home-LAN key `none` |
-| Genie agent, Telegram, bundled Hermes | **Removed** | Historical docs only; no install path |
+| Gate Genie (agent + Hermes runtime) | **Being restored** | Identity and brain contract are back; embedded runtime and Genie tab are the next slice. See [Genie](docs/genie.md) |
 
 ## Configuration and private files
 
@@ -197,6 +198,7 @@ Read [SECURITY.md](SECURITY.md) and [docs/publication-policy.md](docs/publicatio
 Start here:
 
 - [Simplified system overview](docs/simplified-system.md) — what each part does.
+- [Gate Genie](docs/genie.md) — identity, brain ladder, authority, messaging.
 - [Installation and private runtime](docs/installation.md) — config, paths, services.
 - [New backend onboarding](docs/server-setup-guide.md) — add an engine.
 - [OpenAI-compatible workers](docs/openai-endpoints.md) — non-DS4 backends.

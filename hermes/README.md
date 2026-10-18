@@ -1,7 +1,9 @@
 # Gate Genie profile
 
-`SOUL.md` here is the first-run default. The dashboard seeds it only if the
-owner's file does not exist. It never resets an existing file, even an empty one.
+The identity files live in [`genie/`](../genie): `SOUL.md` is the first-run
+default and `AGENTS.md` is the operating instructions. The dashboard seeds SOUL
+only if the owner's file does not exist. It never resets an existing file, even an
+empty one.
 
 The editable copy lives at `<directory of state_file>/hermes-home/SOUL.md`.
 `ds4-gateway/hermes-profile.mjs` exports `hermesHome(config)` as the shared
@@ -32,6 +34,9 @@ The owner explicitly approved native `approvals.mode: off` and
 not settings imposed on other installations. Telegram is restricted to the
 existing paired owner account. Use native Hermes setup for another installation.
 
+See [Gate Genie](../docs/genie.md) for the identity, brain ladder, authority
+model and messaging contract.
+
 ## Memory viewer
 
 SGUI's Memory tab reads this profile's `memories/MEMORY.md`, `memories/USER.md`
@@ -42,12 +47,18 @@ can differ from the frozen memory snapshot in an existing conversation.
 
 ## Gateway inference priority
 
-Star Gate schedules identified Genie requests ahead of other waiting requests,
-including ordinary high-priority work. Existing generations finish normally;
-conversation order, model compatibility, request bodies, limits and capacities
-are preserved. Unaffined Genie calls can use the next compatible free worker.
-Sustained Genie traffic can delay ordinary queued traffic; active work is never
-preempted. This is scheduling, not a fleet-management permission.
+By default Genie's pool turns are ordinary traffic: they queue behind work that is
+already waiting. An installation may instead let Star Gate schedule identified
+Genie requests ahead of other waiting requests, including ordinary high-priority
+work. Existing generations finish normally; conversation order, model
+compatibility, request bodies, limits and capacities are preserved. Unaffined
+Genie calls can use the next compatible free worker. Sustained Genie traffic can
+delay ordinary queued traffic; active work is never preempted. This is scheduling,
+not a fleet-management permission.
+
+The tradeoff is real and worth stating: a faster Genie is a slower queue. Enable
+the key when Genie is actively keeping the fleet alive, and leave it unset when the
+fleet is doing ordinary work.
 
 Set `genie_priority_key` in your private gateway configuration and use the same
 value in the native Hermes profile's route-specific headers:

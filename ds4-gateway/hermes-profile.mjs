@@ -8,7 +8,7 @@ export function hermesHome(config) {
   return path.join(path.dirname(config.state_file), 'hermes-home');
 }
 
-export function createSoulStore(home, seedFile = new URL('../hermes/SOUL.md', import.meta.url)) {
+export function createSoulStore(home, seedFile = new URL('../genie/SOUL.md', import.meta.url)) {
   const file = path.join(home, 'SOUL.md');
   const backups = path.join(home, 'soul-history');
   fs.mkdirSync(home, {recursive:true, mode:0o700});

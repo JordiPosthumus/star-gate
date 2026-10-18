@@ -36,7 +36,7 @@ The demo dashboard uses `30011` (`npm run ui:demo`).
 
 ```sh
 npm run check            # syntax check all .mjs and shell scripts
-npm test                 # main suite (88 files, local fixtures)
+npm test                 # main suite (89 files, local fixtures)
 npm run continuity:test  # client continuity / Door behavior
 npm run data:test        # telemetry and evidence math
 npm run recovery:test    # Node + Python recovery adapters
@@ -68,7 +68,8 @@ ds4-gateway/          gateway, door, dashboard, ~150 modules and their tests
   recovery*.mjs/.py   opt-in service recovery adapters
   media-*.mjs/.py     experimental H3/ACE-Step job support
   spark-*.mjs/.py     DGX Spark enrollment, discovery, services
-  hermes-*.mjs        legacy Genie/Hermes profile helpers (unsupported)
+  hermes-*.mjs        Genie profile, Brain/Memory/Soul stores and runtime bridge
+  genie-brain.mjs     Genie's own model route, fallback ladder and commandeering rule
 scripts/              setup, doctor, check, privacy, hooks, icons, telemetry
 examples/             generic config, demo dashboard, Spark build recipes
 docs/                 user documentation (indexed at the end of README.md)
@@ -96,7 +97,8 @@ docs/                 user documentation (indexed at the end of README.md)
 
 ## Known rough edges
 
-- Some docs still mention removed Genie/Hermes/Telegram features.
+- Gate Genie is being restored in stages: identity and brain contract are in,
+  the embedded runtime and conversation tab are not. `docs/genie.md` is the contract.
 - Routing v2 is experimental and flag-gated.
 - The dashboard is a single-page app assembled from string templates; large UI
   edits need a manual pass in `npm run ui:demo`.
