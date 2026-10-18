@@ -88,6 +88,11 @@ test('the fleet tool is granted only with inspect authority and an absolute sock
   assert.deepEqual(grantedTools(config, ['inspect']), {fleet: {control_socket: '/tmp/dsg-control.sock'}});
   assert.deepEqual(grantedTools(config, []), {});
   assert.deepEqual(grantedTools(config, ['research', 'command']), {});
+  assert.deepEqual(grantedTools(config, ['inspect', 'maintenance']), {
+    fleet: {control_socket: '/tmp/dsg-control.sock'},
+    actions: {control_socket: '/tmp/dsg-control.sock'},
+  });
+  assert.deepEqual(grantedTools(config, ['maintenance']), {actions: {control_socket: '/tmp/dsg-control.sock'}});
   assert.deepEqual(grantedTools({control_socket: 'relative.sock'}, ['inspect']), {});
   assert.deepEqual(grantedTools({}, ['inspect']), {});
 });

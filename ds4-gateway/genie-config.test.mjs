@@ -47,7 +47,7 @@ test('messaging records channels but never stores a credential', () => {
 });
 
 test('every action in the published list is a known action', () => {
-  assert.deepEqual([...GENIE_ACTIONS], ['inspect', 'research', 'rebalance', 'recovery', 'configure', 'command']);
+  assert.deepEqual([...GENIE_ACTIONS], ['inspect', 'research', 'rebalance', 'recovery', 'configure', 'command', 'maintenance']);
 });
 
 test('the diagnostic line stays short and carries no URL', () => {

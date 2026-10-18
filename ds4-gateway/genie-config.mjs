@@ -13,6 +13,7 @@ export const GENIE_ACTIONS = Object.freeze([
   'recovery',     // request an enrolled service recovery
   'configure',    // propose an exact configuration change for approval
   'command',      // run an enrolled operation end to end
+  'maintenance',  // drain or resume an enrolled worker
 ]);
 
 // Standing authority is the set of actions Genie may take without asking. It is

@@ -19,12 +19,12 @@ WORKER_FIELDS = (
 )
 
 
-def _request(socket_path, path='/workers', method='GET', body=None):
+def _request(socket_path, path='/workers', method='GET', body=None, timeout=15):
     """One bounded request over the operator socket. Never a network address."""
     if not isinstance(socket_path, str) or not socket_path.startswith('/'):
         raise ValueError('The fleet tool needs an absolute control socket path')
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(15)
+    client.settimeout(timeout)
     try:
         client.connect(socket_path)
         payload = b'' if body is None else json.dumps(body).encode()

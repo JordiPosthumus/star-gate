@@ -93,16 +93,23 @@ stronger behavior; it is off by default and never inferred.
 
 ## His tools
 
-The first tool is `genie_fleet_status`: a bounded, read-only snapshot of workers,
-health, pause/quarantine reasons, active and queued counts, recovery policy and
-queued offers. It reads the operator socket directly; no shell, no SSH and no
-request contents.
+`genie_fleet_status` is a bounded, read-only snapshot of workers, health,
+pause/quarantine reasons, active and queued counts, recovery policy and queued
+offers. It reads the operator socket directly; no shell, no SSH and no request
+contents.
+
+`drain_worker` and `resume_worker` are the first action tools. Drain stops new
+routing while active work finishes; it refuses to drain the last healthy worker
+unless `allow_last_worker` is explicitly true. Resume asks the gateway for a fresh
+probe and reports what actually happened, including a refused probe. A quarantined
+worker is not resumed — it needs verified readmission. Both return the observed
+state, not an acknowledgement.
 
 The grant is enforced on the Node side (`grantedTools` in
-`ds4-gateway/genie-hermes.mjs`): the runtime receives the tool only when
-`genie.authority` contains `inspect` and an absolute `control_socket` exists.
-A prompt cannot widen that. Every result is compacted to a known field list, and
-a failure returns a failure — never an empty fleet.
+`ds4-gateway/genie-hermes.mjs`): read tools need `inspect`, action tools need
+`maintenance`, and both need an absolute `control_socket`. A prompt cannot widen
+that. Every result is compacted to a known field list, and a failure returns a
+failure — never an empty fleet.
 
 Further tools (drain/resume, recovery, configuration proposals) follow the same
 pattern and are added one at a time, each with its own authority name.
@@ -160,8 +167,10 @@ work is standing; the destructive or capability-reducing work is not.
 ```
 
 `genie.authority` is the standing-authority list: `inspect`, `research`,
-`rebalance`, `recovery`, `configure`, `command`. Unknown names are dropped, and an
-absent list means `inspect` + `research` only — never "everything". Everything not
+`rebalance`, `recovery`, `configure`, `command`, `maintenance`. Unknown names are
+dropped, and an absent list means `inspect` + `research` only — never
+"everything". `npm run genie:setup` grants the first five; `maintenance` and
+`command` stay opt-in because they can interrupt serving work. Everything not
 listed follows the "ask first" rules above.
 
 `genie.messaging.channels` records which channels the owner wants; Hermes owns
