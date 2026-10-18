@@ -36,18 +36,12 @@ Both flags are required:
 --enable-prompt-tokens-details
 ```
 
-This applies to the vLLM 0.29.x/Rust-frontend build used by the DS41F rings and
-to upstream vLLM releases that carry `FrontendArgs`.
+This applies to the vLLM 0.29.x/Rust-frontend build used in a DS41F ring setup
+and to upstream vLLM releases that carry `FrontendArgs`.
 
-## Where the DS41F rings keep it
+## Where a ring keeps it
 
-The serve arguments live in host-local (git-ignored) site configs:
-
-- `ds41f-ring` (Spark4/5/6, head Spark6):
-  `~/inference-fleet/config/site-ring1.local.json`
-- `ds41f-ring2` (Spark1/2/3, head Spark):
-  `~/inference-fleet/config/site-ring2.local.json`
-
+The serve arguments live in host-local (git-ignored) site configs, one per ring.
 Add `"--enable-prompt-tokens-details"` to `serve_args`, next to
 `"--enable-prefix-caching"`.
 
