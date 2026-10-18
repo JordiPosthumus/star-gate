@@ -139,7 +139,10 @@ with separately opt-in [bounded DS4 service recovery](docs/worker-recovery.md). 
 and [experimental collector/Genie setup](docs/observer.md). A read-only
 [cache-continuity audit](docs/cache-continuity-audit.md) now measures same-session
 reuse and keeps weak low-reuse evidence unconfirmed; cache migration remains a
-roadmap item. DSG performs a
+roadmap item. An engine that caches but omits `prompt_tokens_details` is read as
+cold by DSG and every client, so the
+[engine cache telemetry contract](docs/cache-telemetry.md) documents the required
+flag, the verification steps and the one-ring-at-a-time restart procedure. DSG performs a
 [safe queued handover](docs/queued-handover.md) when a first/unaffined request is
 still undispatched and another server becomes free. An established session gets
 a five-minute warm-home first-refusal window by default; after that, the gateway

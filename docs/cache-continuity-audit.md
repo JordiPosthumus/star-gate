@@ -1,5 +1,12 @@
 # Cache-continuity audit
 
+Before treating a worker's zero-cache evidence as low reuse, rule out a missing
+telemetry field: an engine can cache every prefix and still report no cached
+tokens if it was started without the usage flag. See
+[engine cache telemetry](cache-telemetry.md) and run
+`node scripts/cache-telemetry.mjs` to compare reported reads with the engine's
+own prefix-cache counters.
+
 **Implemented as a read-only, aggregate audit over DSG's private numerical
 dataset. It has no routing or cache authority.** The audit asks a narrow question:
 when two consecutive requests identify the same DSG session and stay on the same

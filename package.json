@@ -14,6 +14,7 @@
     "data:test": "node --test ds4-gateway/json-usage.test.mjs ds4-gateway/throughput.test.mjs ds4-gateway/fleet-speed.test.mjs ds4-gateway/performance-lights.test.mjs ds4-gateway/hardware-telemetry.test.mjs ds4-gateway/request-history.test.mjs",
     "attribution:audit": "node ds4-gateway/attribution-audit.mjs --directory runtime/dashboard",
     "cache-continuity:audit": "node ds4-gateway/cache-continuity-audit.mjs --data runtime/requests",
+    "cache-telemetry:check": "node scripts/cache-telemetry.mjs",
     "attribution:reconcile-audit": "node ds4-gateway/attribution-audit.mjs --directory runtime/dashboard --gateway-log runtime/gateway.log",
     "recovery:test": "python3 -m unittest discover -s ds4-gateway -p 'recovery_*_test.py' -v && node --test ds4-gateway/recovery-omlx-controller.test.mjs ds4-gateway/recovery-omlx-enrollment.test.mjs ds4-gateway/recovery-pair-enrollment.test.mjs ds4-gateway/recovery-pair-preparation.test.mjs ds4-gateway/recovery-pair-controller.test.mjs ds4-gateway/recovery.test.mjs ds4-gateway/recovery-qwen.test.mjs ds4-gateway/launchd-removal-audit.test.mjs ds4-gateway/recovery-bootstrap.test.mjs",
     "check": "node scripts/check.mjs",

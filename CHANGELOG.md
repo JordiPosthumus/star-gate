@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-18 — Ring cache hits were unreported, not absent
+
+The DS41F rings were launched without `--enable-prompt-tokens-details`, so every
+response carried `"prompt_tokens_details": null`. DSG and the client read that as
+zero cache reads: fleet cache hits fell from 90% to 0% while the engines reported
+96.8% and 92.2%, and routing's compute-token estimate counted cached prefixes as
+prefill, inflating ring lane speeds to 6,875 and 3,233 tokens/sec. Both rings now
+carry the flag; the first warm record after the fix read 150,528 cached of 159,903
+prompt tokens (94.1%). The flag lives in the host-local site configs, so a config
+rebuild must re-check it. `scripts/cache-telemetry.mjs` compares reported reads
+with each engine's prefix-cache counters and exits non-zero when a node caches
+without reporting; `docs/cache-telemetry.md` records the contract, the sentinel
+`created_cache_tokens` field and the one-ring-at-a-time restart procedure.
+
 ## 2026-10-05 — Rewritten uploads stop leaking a phantom second request
 
 The exact-length rewrite work left an orphaned upstream request in the
