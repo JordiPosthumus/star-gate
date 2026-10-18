@@ -59,3 +59,8 @@ test('the diagnostic line stays short and carries no URL', () => {
   assert.doesNotMatch(line, /http/);
   assert.equal(describeGenie({}), 'Genie: disabled');
 });
+
+test('an absent genie block still reports a complete messaging default', () => {
+  assert.deepEqual(genieConfig({}).messaging, {channels: [], owner_only: true});
+  assert.deepEqual(genieConfig({genie: {}}).messaging, {channels: [], owner_only: true});
+});

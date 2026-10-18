@@ -19,10 +19,11 @@ export const GENIE_ACTIONS = Object.freeze([
 // Standing authority is the set of actions Genie may take without asking. It is
 // explicit: an absent list means "inspect and research only", never "everything".
 const DEFAULT_AUTHORITY = Object.freeze(['inspect', 'research']);
+const DEFAULT_MESSAGING = Object.freeze({channels: [], owner_only: true});
 
 export function genieConfig(config) {
   const raw = config?.genie;
-  if (!object(raw)) return {enabled: false, authority: [...DEFAULT_AUTHORITY], brain: brainPolicy(config), messaging: {}};
+  if (!object(raw)) return {enabled: false, authority: [...DEFAULT_AUTHORITY], brain: brainPolicy(config), messaging: {...DEFAULT_MESSAGING, channels: []}};
   const authority = Array.isArray(raw.authority)
     ? raw.authority.filter(action => GENIE_ACTIONS.includes(action))
     : [...DEFAULT_AUTHORITY];

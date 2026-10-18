@@ -91,6 +91,33 @@ stronger behavior; it is off by default and never inferred.
 
 ## His authority
 
+## Messaging
+
+Hermes Gateway is how you talk to him when you are not at the dashboard. Star
+Gate launches the pinned gateway against the same private profile; Hermes owns
+channel authorization, delivery and the bot tokens.
+
+```json
+"messaging": {"channels": ["telegram"], "owner_only": true}
+```
+
+```sh
+npm run genie:gateway -- --check   # readiness only; starts nothing
+npm run genie:gateway              # run in the foreground
+```
+
+`--check` reports the token-free facts: whether Genie is enabled, which channels
+were asked for, whether the pinned source, interpreter, `config.yaml` and `.env`
+exist, and whether the launcher would run. It exits non-zero when it would not.
+
+The launcher refuses a non-owner audience (`owner_only` false), a missing source,
+interpreter or profile, and a disabled Genie. It passes `HERMES_HOME`, runs
+`gateway.run` from the pinned checkout, and forwards SIGINT/SIGTERM. It does not
+read, print or copy a token; those live in the Hermes profile and stay there.
+
+Starting the gateway is an owner action. Star Gate will not enable a channel or
+start messaging on its own.
+
 ## His tools
 
 `genie_fleet_status` is a bounded, read-only snapshot of workers, health,

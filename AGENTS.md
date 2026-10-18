@@ -36,7 +36,7 @@ The demo dashboard uses `30011` (`npm run ui:demo`).
 
 ```sh
 npm run check            # syntax check all .mjs and shell scripts
-npm test                 # main suite (97 files, local fixtures)
+npm test                 # main suite (98 files, local fixtures)
 npm run continuity:test  # client continuity / Door behavior
 npm run data:test        # telemetry and evidence math
 npm run recovery:test    # Node + Python recovery adapters
@@ -47,6 +47,7 @@ npm run doctor           # read-only config/port/path checks
 npm run setup -- --controls
 npm run genie:setup      # Genie runtime + identity + brain config (no service started)
 npm run genie -- "hi"    # talk to Genie through the pinned runtime
+npm run genie:gateway -- --check  # messaging readiness; starts nothing
 npm start | npm run door | npm run ui
 npm run ui:demo          # synthetic dashboard, no fleet needed
 ```
@@ -103,9 +104,9 @@ docs/                 user documentation (indexed at the end of README.md)
 
 ## Known rough edges
 
-- Gate Genie is restored through the conversation tab and a read-only fleet tool;
-  action tools (drain, recovery) and Hermes Gateway messaging are still missing.
-  `docs/genie.md` is the contract.
+- Gate Genie is restored through the conversation tab, fleet and drain/resume
+  tools, and a messaging launcher; the recovery tool and a live channel test are
+  still missing. `docs/genie.md` is the contract.
 - Routing v2 is experimental and flag-gated.
 - The dashboard is a single-page app assembled from string templates; large UI
   edits need a manual pass in `npm run ui:demo`.
