@@ -125,6 +125,8 @@ pause/quarantine reasons, active and queued counts, recovery policy and queued
 offers. It reads the operator socket directly; no shell, no SSH and no request
 contents.
 
+`recovery_status`, `inspect_worker` and `recover_worker` cover the guarded restart path. The gateway's own adapter produces the evidence: Genie asks for an inspection, reads the new `evidence_id`, then requests recovery with exactly that evidence. He cannot enroll a service, change recovery policy, run a canary or cancel active work. An accepted request returns an operation receipt, not proof that the worker is serving.
+
 `drain_worker` and `resume_worker` are the first action tools. Drain stops new
 routing while active work finishes; it refuses to drain the last healthy worker
 unless `allow_last_worker` is explicitly true. Resume asks the gateway for a fresh
@@ -134,7 +136,8 @@ state, not an acknowledgement.
 
 The grant is enforced on the Node side (`grantedTools` in
 `ds4-gateway/genie-hermes.mjs`): read tools need `inspect`, action tools need
-`maintenance`, and both need an absolute `control_socket`. A prompt cannot widen
+`maintenance`, recovery tools need `recovery`, and all need an absolute
+`control_socket`. A prompt cannot widen
 that. Every result is compacted to a known field list, and a failure returns a
 failure — never an empty fleet.
 

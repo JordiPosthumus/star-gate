@@ -104,9 +104,9 @@ docs/                 user documentation (indexed at the end of README.md)
 
 ## Known rough edges
 
-- Gate Genie is restored through the conversation tab, fleet and drain/resume
-  tools, and a messaging launcher; the recovery tool and a live channel test are
-  still missing. `docs/genie.md` is the contract.
+- Gate Genie is restored through the conversation tab, fleet, drain/resume and
+  recovery tools, and a messaging launcher; a live channel test and commandeering
+  execution are still missing. `docs/genie.md` is the contract.
 - Routing v2 is experimental and flag-gated.
 - The dashboard is a single-page app assembled from string templates; large UI
   edits need a manual pass in `npm run ui:demo`.

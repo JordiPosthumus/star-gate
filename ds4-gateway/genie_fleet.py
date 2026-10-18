@@ -50,11 +50,18 @@ def _request(socket_path, path='/workers', method='GET', body=None, timeout=15):
     raw = b''.join(chunks)
     header, _, body_bytes = raw.partition(b'\r\n\r\n')
     status = int(header.split(b' ')[1]) if header else 0
-    if status != 200:
-        raise ValueError(f'The gateway refused the fleet request ({status})')
     if b'transfer-encoding: chunked' in header.lower():
         body_bytes = _dechunk(body_bytes)
-    return json.loads(body_bytes)
+    try:
+        parsed = json.loads(body_bytes)
+    except ValueError:
+        if status >= 400:
+            raise ValueError(f'The gateway refused the request ({status})') from None
+        raise
+    if status >= 400:
+        detail = parsed.get('error') if isinstance(parsed, dict) else None
+        raise ValueError(detail or f'The gateway refused the request ({status})')
+    return parsed
 
 
 def _dechunk(body):

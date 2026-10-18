@@ -67,6 +67,7 @@ export function grantedTools(config, authority) {
   if (typeof config?.control_socket !== 'string' || !path.isAbsolute(config.control_socket)) return tools;
   if (authority.includes('inspect')) tools.fleet = {control_socket: config.control_socket};
   if (authority.includes('maintenance')) tools.actions = {control_socket: config.control_socket};
+  if (authority.includes('recovery')) tools.recovery = {control_socket: config.control_socket};
   return tools;
 }
 

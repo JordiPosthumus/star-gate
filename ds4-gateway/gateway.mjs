@@ -2178,7 +2178,7 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       let body='';req.on('data',chunk=>{body+=chunk;if(Buffer.byteLength(body)>2048)req.destroy();});req.on('error',()=>{});
       req.on('end',()=>{void serialize(async()=>{try{const input=JSON.parse(body);return json(res,202,await (req.url==='/genie-media-start'?mediaExecution.start(input):req.url==='/genie-media-setup'?mediaSetup.start(input):req.url==='/genie-media-repair'?mediaSetup.repair(input):req.url==='/genie-media-audit'?mediaSetup.audit(input):mediaSetup.finish(input)));}catch(e){return error(res,409,'media_start_failed',e.message);}});});return;
     }
-    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/archive-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-execution-capacity','/set-routing-margin','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
+    if (req.method !== 'POST' || !['/set-genie-thinking','/media-host-eligibility','/drain-workers', '/resume-workers', '/maintenance-lock','/release-maintenance-lock','/maintenance-receipt','/add-worker', '/edit-endpoint', '/check-endpoint', '/remove-worker', '/archive-worker', '/set-ssh-fallbacks','/set-context-limit','/set-conversation-turns','/set-queue-timeout','/set-protection','/set-job-priority','/set-worker-concurrency','/set-execution-capacity','/set-routing-margin','/set-direct-reserve','/relocate-queued','/genie-relocate-queued','/genie-capability','/recovery-policy','/recovery-handback-policy','/recover-worker','/genie-recover-worker','/recovery-canary','/recovery-recheck','/recovery-inspect','/recovery-pair-permit','/enroll-pair-recovery','/enroll-omlx-recovery','/qualify-omlx-recovery','/recovery-omlx-permit','/qualify-pair-recovery','/grant-agent','/revoke-agent','/release-agent-hold','/agent/v1/drain','/agent/v1/resume','/agent/v1/receipt'].includes(req.url)) return error(res, 404, 'not_found', 'Unknown control action');
     let body = '';
     req.on('data', chunk => { body += chunk; if (Buffer.byteLength(body) > 4096) req.destroy(); });
     req.on('error', () => {});
@@ -2204,6 +2204,15 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
           if(req.url==='/enroll-omlx-recovery')return json(res,202,omlxEnrollment.request(input));
           if(req.url==='/recovery-pair-permit')return json(res,200,recovery.pairPermit(input));
           if(req.url==='/recovery-recheck')return json(res,202,recovery.reconcile(input));
+          if(req.url==='/recovery-inspect'){
+            // Refresh one worker's service evidence off the mutation queue: the
+            // adapter may take seconds, and an inspection must never delay a
+            // drain, resume or another operator decision. The request reports
+            // that it started; recovery_status carries the observation.
+            if(!input||Object.keys(input).join(',')!=='worker_id'||typeof input.worker_id!=='string'||!nodes.some(n=>n.id===input.worker_id))throw new Error('Specify one known worker');
+            void recovery.inspect(input.worker_id);
+            return json(res,202,{worker_id:input.worker_id,state:'inspecting'});
+          }
           if(req.url==='/genie-capability') {
             if(Object.keys(input).sort().join(',')!=='enabled,key'||![...genieCapabilityKeys,'recovery'].includes(input.key)||typeof input.enabled!=='boolean')throw new Error('Specify a known capability and boolean enabled');
             if(input.key==='recovery')recovery.setAutomatic(input.enabled);
