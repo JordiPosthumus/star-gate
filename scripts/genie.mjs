@@ -6,6 +6,7 @@ import {createInterface} from 'node:readline/promises';
 import {loadConfig} from '../ds4-gateway/config.mjs';
 import {hermesHome} from '../ds4-gateway/hermes-profile.mjs';
 import {createHermesProvider} from '../ds4-gateway/genie-hermes.mjs';
+import {genieConfig} from '../ds4-gateway/genie-config.mjs';
 
 const MAX_HISTORY = 40;
 
@@ -36,6 +37,13 @@ async function ask(provider, history, message, onDelta) {
   return result.text;
 }
 
+// The profile decides whether Genie may look at the fleet; the prompt never does.
+function authorityFor(config) {
+  const genie = genieConfig(config);
+  if (!genie.enabled) throw new Error('Genie is disabled in this configuration (genie.enabled is not true).');
+  return genie.authority;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--help')) {
@@ -50,8 +58,8 @@ async function main() {
     else words.push(args[i]);
   }
   const {config} = loadConfig();
-  if (config.genie === false) throw new Error('Genie is disabled in this configuration (genie: false).');
-  const provider = createHermesProvider(config, {home: hermesHome(config)});
+  const authority = authorityFor(config);
+  const provider = createHermesProvider(config, {home: hermesHome(config), authority});
   const file = historyFile(config, session);
   const history = readHistory(file);
   const onDelta = text => process.stdout.write(text);

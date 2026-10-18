@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createHermesProvider, parseBridgeLine, providerConfig} from './genie-hermes.mjs';
+import {createHermesProvider, grantedTools, parseBridgeLine, providerConfig} from './genie-hermes.mjs';
 
 function fixture(t, chat = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsg-hermes-'));
@@ -81,4 +81,20 @@ test('status reports the pinned model and home without leaking a key', t => {
   assert.equal(status.model, 'PoolModel');
   assert.equal(status.engine, 'Hermes');
   assert.doesNotMatch(JSON.stringify(status), /secret-value/);
+});
+
+test('the fleet tool is granted only with inspect authority and an absolute socket', () => {
+  const config = {control_socket: '/tmp/dsg-control.sock'};
+  assert.deepEqual(grantedTools(config, ['inspect']), {fleet: {control_socket: '/tmp/dsg-control.sock'}});
+  assert.deepEqual(grantedTools(config, []), {});
+  assert.deepEqual(grantedTools(config, ['research', 'command']), {});
+  assert.deepEqual(grantedTools({control_socket: 'relative.sock'}, ['inspect']), {});
+  assert.deepEqual(grantedTools({}, ['inspect']), {});
+});
+
+test('a provider without inspect authority exposes no tools to the runtime', t => {
+  const {config, home} = fixture(t);
+  assert.deepEqual(createHermesProvider(config, {home}).tools, {});
+  const withSocket = {...config, control_socket: '/tmp/dsg-control.sock'};
+  assert.deepEqual(createHermesProvider(withSocket, {home, authority: ['inspect']}).tools, {fleet: {control_socket: '/tmp/dsg-control.sock'}});
 });

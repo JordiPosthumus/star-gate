@@ -91,6 +91,22 @@ stronger behavior; it is off by default and never inferred.
 
 ## His authority
 
+## His tools
+
+The first tool is `genie_fleet_status`: a bounded, read-only snapshot of workers,
+health, pause/quarantine reasons, active and queued counts, recovery policy and
+queued offers. It reads the operator socket directly; no shell, no SSH and no
+request contents.
+
+The grant is enforced on the Node side (`grantedTools` in
+`ds4-gateway/genie-hermes.mjs`): the runtime receives the tool only when
+`genie.authority` contains `inspect` and an absolute `control_socket` exists.
+A prompt cannot widen that. Every result is compacted to a known field list, and
+a failure returns a failure — never an empty fleet.
+
+Further tools (drain/resume, recovery, configuration proposals) follow the same
+pattern and are added one at a time, each with its own authority name.
+
 Standing authority (do it, then report):
 
 - read gateway state, logs, runtime files and documentation;

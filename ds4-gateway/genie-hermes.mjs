@@ -60,11 +60,23 @@ export function parseBridgeLine(line) {
   return {type: 'ignore'};
 }
 
-export function createHermesProvider(config, {home, spawnImpl = spawn, now = Date.now, bridgePath = bridge} = {}) {
+// Only the tools an installation has actually granted are handed to the runtime.
+// The check is here, on the Node side, so a prompt cannot widen it.
+export function grantedTools(config, authority) {
+  const tools = {};
+  if (authority.includes('inspect') && typeof config?.control_socket === 'string' && path.isAbsolute(config.control_socket))
+    tools.fleet = {control_socket: config.control_socket};
+  return tools;
+}
+
+export function createHermesProvider(config, {home, spawnImpl = spawn, now = Date.now, bridgePath = bridge, authority = []} = {}) {
   const provider = providerConfig(config);
   if (!home || !fs.existsSync(path.join(home, 'SOUL.md'))) throw new Error('Genie has no private profile yet. Run npm run genie:setup.');
 
+  const tools = grantedTools(config, authority);
+
   return {
+    tools,
     status() {
       return {configured: true, engine: 'Hermes', model: provider.model, source: provider.source, home};
     },
@@ -120,7 +132,7 @@ export function createHermesProvider(config, {home, spawnImpl = spawn, now = Dat
         });
         child.stderr.resume();
         child.stdin.on('error', () => {});
-        child.stdin.end(JSON.stringify({message, history, session_id: sessionId ?? null, context, provider: {
+        child.stdin.end(JSON.stringify({message, history, session_id: sessionId ?? null, context, tools, provider: {
           url: provider.url, model: provider.model, max_tokens: provider.max_tokens,
           reasoning_effort: provider.reasoning_effort, api_key: config?.genie_chat?.api_key ?? null,
         }}));
