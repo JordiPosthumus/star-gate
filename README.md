@@ -108,6 +108,20 @@ npm run ui:demo                 # synthetic fleet on http://127.0.0.1:30011
 
 All screenshots below come from that demo, not from a real deployment.
 
+## Gate Genie (optional)
+
+Genie is Star Gate's resident agent. Install his private runtime and enable him
+after the gateway works:
+
+```sh
+npm run genie:setup        # pinned Hermes, identity, brain config; starts nothing
+```
+
+He can use the gateway's own pool as his brain, or a dedicated endpoint, and can
+commandeer an enrolled machine only when the fleet has no healthy worker and
+nothing in flight. The gateway works exactly the same when he is absent. See
+[Genie](docs/genie.md) for the authority model and the full brain ladder.
+
 ![Star Gate dashboard with synthetic telemetry](docs/images/dashboard-overview.png)
 
 <details>
@@ -157,7 +171,7 @@ controls are off unless you set `ui_worker_management: true`.
 | Hardware telemetry (RAM/GPU/power/temp) | Opt-in | DGX Spark SSH/NVIDIA adapter or local JSONL |
 | Media jobs (H3 / ACE-Step) | Experimental | Hardware- and recipe-specific |
 | LAN sharing + Pi client sync | Opt-in | Advertises a fixed home-LAN key `none` |
-| Gate Genie (agent + Hermes runtime) | **Being restored** | Identity and brain contract are back; embedded runtime and Genie tab are the next slice. See [Genie](docs/genie.md) |
+| Gate Genie (agent + Hermes runtime) | **Restoring** | Runtime installer, identity and brain ladder are in; Genie tab and messaging next. See [Genie](docs/genie.md) |
 
 ## Configuration and private files
 

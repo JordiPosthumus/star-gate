@@ -28,11 +28,28 @@ suggestions.
 ## Where he lives
 
 ```text
-genie/SOUL.md          identity and voice (versioned, seeded once, owner-editable)
-genie/AGENTS.md        operating instructions and standing authority
-runtime/…/hermes-home  private profile: SOUL, history, memory, skills, config
-ds4-gateway/hermes-*   Node glue: Brain, Memory, Soul panels and the runtime bridge
+genie/SOUL.md           identity and voice (versioned, seeded once, owner-editable)
+genie/AGENTS.md         operating instructions and standing authority
+runtime/genie-runtime/  private pinned Hermes checkout and its own Python
+runtime/…/hermes-home   private profile: SOUL, AGENTS, history, memory, skills
+ds4-gateway/genie-*     brain ladder, config surface, identity seeding
+ds4-gateway/hermes-*    Node glue: Brain, Memory, Soul panels and the runtime bridge
 ```
+
+## Installing him
+
+```sh
+npm run setup -- --controls        # gateway configuration first
+npm run genie:setup                # runtime, identity and brain config
+npm run genie:setup -- --model-url http://127.0.0.1:8000/v1 --model genie-local
+npm run genie:setup -- --commandeer spark-a
+```
+
+Setup pins one upstream Hermes revision, installs a private Python 3.12 inside
+`runtime/genie-runtime/`, seeds the identity files, and writes `genie.brain`. It
+never modifies a global Python, a personal Hermes, or a shell profile, and it
+starts no service. Re-running it verifies the recorded revision and worktree; a
+modified or mismatched runtime is refused rather than repaired or replaced.
 
 The runtime is a Hermes installation pinned by this repository and installed
 inside `runtime/`, not a vendored copy and not a global Python environment. Star
