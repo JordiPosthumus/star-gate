@@ -48,3 +48,10 @@ Gate-Genie-Embedded-Hermes-Fork-Plan-*.md
 # Local scratch and vendored clone never belong in Git.
 tmp/
 vendor/hermes/
+
+# Operator-local one-off scripts, handovers and unrelated scratch work.
+ring*-*.mjs
+re-enroll-*.mjs
+unenroll-*.mjs
+pick_up_here*.md
+3d-prints/

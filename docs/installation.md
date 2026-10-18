@@ -26,16 +26,13 @@ preparation from DSG registration and gives acceptance and rollback steps.
 Follow the [README quick start](../README.md). Node 22.22.2+ is required; the core
 has no package dependencies. `npm run setup -- --controls` creates an empty fleet
 with local UI management enabled. Without that explicit flag the UI is read-only.
-Normal setup installs a dedicated pinned Hermes runtime and its own Python,
-guides the model connection and checks a real Genie reply. It requires Git, tar,
-internet access and a reachable OpenAI-compatible model API. No prior Hermes or
-Python installation is needed. Personal Hermes and existing services are untouched.
-See [Genie setup and SOUL.md](genie-conversation.md).
+Normal setup writes the gateway configuration only. The legacy Genie agent and
+bundled Hermes runtime were removed; `--gateway-only` is accepted for
+compatibility and has no additional effect. Setup needs no network access and
+does not install Python.
 
 Setup uses a random inference key and mode-0600 configuration. Existing settings
-are never regenerated. Adding Genie to an existing gateway creates a timestamped
-private backup and adds only its chat configuration after the connection check.
-`--gateway-only` explicitly skips Genie. No servers start.
+are never regenerated. No servers start.
 
 `npm run doctor` checks local config, ports, paths, worker/recovery definitions,
 existing durable registry and optional encoder files. If a durable worker endpoint
@@ -136,13 +133,9 @@ stop DS4 or alter worker policy,
 context, sampling, cache or concurrency settings. Durable affinity and worker
 pause/quarantine state survive. In-flight requests do not survive a forced stop.
 
-Dashboard stop/restart saves a private Genie report snapshot under
-`runtime/dashboard/backups/`. A single `restart` restores enabled/source settings;
-old in-memory reports remain in the archive, not re-imported into the live panel.
-A separate stop/start uses the configured default: on unless
-`genie.enabled` is explicitly `false`. An interrupted health review is not
-resumed. Optional automatic recovery policy is separate and remains in durable
-gateway state.
+Dashboard stop/restart preserves enabled/source settings. A separate stop/start
+uses the configured default. Optional automatic recovery policy is separate and
+remains in durable gateway state.
 
 Service commands refuse a registration pointing to another checkout/config/port.
 Restart keeps the registered Node interpreter even if your shell uses a newer
@@ -215,10 +208,7 @@ PID. Repeating stop on an already-stopped installation is safe. Stop does **not*
 run syntax checks, so those failures do
 not prevent an otherwise valid managed shutdown.
 
-The existing dashboard controller separately archives Genie reports before
-stopping. After a separate stop/start, a configured Genie starts **on** unless
-private config explicitly sets `genie.enabled` to `false`. Turning him off in the
-UI pauses observation until the next dashboard start. Durable recovery
+Durable recovery
 authorization remains a separate switch; worker pause/hold/quarantine state is retained.
 Services stay installed for the next login; stopping does not uninstall them.
 
@@ -237,7 +227,7 @@ Useful options:
 Without both interruption flags, busy work is not cancelled. With both flags,
 clients may fail and need a retry; queued HTTP connections and partial streams
 are not persisted. DS4 processes stay running and may still be handling other
-direct clients. A dashboard-only stop interrupts Genie reviews, not model requests.
+direct clients. A dashboard-only stop does not interrupt model requests.
 
 `--config` takes precedence over `DWARF_GATE_CONFIG`; relative filenames belong to
 the caller's directory. Otherwise the default is this checkout's

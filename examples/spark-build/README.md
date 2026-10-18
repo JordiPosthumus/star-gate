@@ -11,9 +11,10 @@ original LLM after media work.
 | MiniMax H3 | [H3 recipe](h3/README.md) | Standalone build, real video/audio generation and original-LLM restoration passed |
 | ACE-Step XL SFT / 4B | [Music recipe](ace-step/README.md) | Standalone build, real music generation and original-LLM restoration passed |
 
-Genie can now connect these recipes to preparation, media samples, LLM and
-recovery qualification, and gateway registration. See [Genie setup for new
-Sparks](../../docs/genie-spark-setup.md) for enrollment and the chat instruction.
+The recipes are standalone build inputs. Connecting them to gateway registration
+and recovery qualification is a separate operator step; see the
+[server setup guide](../../docs/server-setup-guide.md) and
+[media jobs](../../docs/media-jobs.md).
 The complete bundle has built and passed native checks in empty installation
 and model directories on an existing Spark. A newly registered worker has also
 completed a music-to-LLM return cycle. Installation on a pristine physical Spark
@@ -41,15 +42,14 @@ preparations remain available for inspection. A changed recipe needs review
 before resuming an existing setup; it is not silently applied over it.
 
 The command alone produces three **stopped** containers with recorded image IDs.
-When requested through Genie's full setup workflow, he continues with native
-media samples, LLM/recovery qualification and registration. Preparation alone
-does not start serving. A full run on pristine hardware remains unverified.
+Native media samples, LLM/recovery qualification and gateway registration are
+separate operator steps. Preparation alone does not start serving. A full run on
+pristine hardware remains unverified.
 
 If preparation fails, inspect `setup.json` and `setup.log` in the same directory.
-The CLI can resume unchanged recipes as described above. Genie can also resume
-a confirmed failed preparation using its exact completion receipt, after
-inspecting the cause. Remote resume uses the same directory and verified bundled
-sources; it does not restart uncertain work or failed native qualification.
+The CLI can resume unchanged recipes as described above; resuming a confirmed
+failed preparation uses the same directory and verified bundled sources and does
+not restart uncertain work or failed native qualification.
 Older preparations without the source receipt still require inspection. An
 uncertain SSH response is not proof of failure: read the same setup status before
 considering a retry.

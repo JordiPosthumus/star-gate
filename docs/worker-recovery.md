@@ -136,9 +136,9 @@ executable, declared profile files and listener port that remains verifiable wit
 live PID. DSG must observe the same stopped epoch for at least 15 seconds, the gateway
 worker must be failed, idle and unpaused, and normal one-operation/30-minute guards still
 apply. A missing unit, changed file, open listener, active process or unknown install is
-never started. Endpoint registration alone grants no such authority. The 2026-09-03
-[reachability incident](incidents/2026-09-03-worker-reachability.md) is the acceptance-test
-basis; it does not authorize a reboot or turn a network outage into service evidence.
+never started. Endpoint registration alone grants no such authority. The network
+reachability incident that shaped these checks is not service evidence and does
+not authorize a reboot.
 
 Both helpers check port availability even when the enrolled service has no PID.
 They briefly bind, without reuse, connecting or listening, to IPv4 and supported

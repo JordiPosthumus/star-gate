@@ -12,9 +12,9 @@ project and should follow that project's contribution guide.
    `npm test`, `npm run privacy-check`, and `npm run privacy:test`.
 4. Add a regression test for changed behavior; use fixture workers, not live GPUs.
 5. Update the README when commands, guarantees or limitations change.
-6. For a meaningful user-facing capability or reliability milestone, add one
-   plain-language bullet to [WORKLOG.md](WORKLOG.md). Keep detailed technical
-   history in [CHANGELOG.md](CHANGELOG.md); do not turn the work log into a commit dump.
+6. For a meaningful user-facing change, add one short entry to
+   [CHANGELOG.md](CHANGELOG.md). Do not add dated work logs, deployment diaries
+   or internal study reports to this repository.
 
 The privacy check examines tracked/staged files and working copies. Stage newly
 added files before running it so they are included. Review the complete staged

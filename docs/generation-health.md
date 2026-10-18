@@ -104,8 +104,7 @@ UI controls, tests and canary procedure. GG and the deterministic fatal-fault
 watcher share that runner. Failure to verify leaves the worker isolated; a slow
 healthy response is never sufficient evidence. Stream replay, kernel repair and
 container recovery are not implemented. Launchd requires a real per-Mac canary
-before activation. The [broader powers plan](genie-powers-plan.md)
-remains a roadmap for additional capabilities.
+before activation. [Direction](roadmap.md) records what remains out of scope.
 
 ## Failure patterns to diagnose
 

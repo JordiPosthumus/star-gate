@@ -15,13 +15,12 @@ KV caches; clients own their conversations, tools and decisions to start turns.
 | Current Jobs | Shows observed request previews, state, worker placement and waiting/running times; allows explicit priority edits for waiting requests. |
 | Operational evidence | Records request outcomes, reported cache reuse, observed cache misses/restores, measured prefill/decode rates and attribution uncertainty. |
 | Hardware telemetry | Shows available memory, activity, measured power, accumulated energy and temperature, with freshness and measurement-scope labels. |
-| Gate Genie | Explains fleet evidence, maintains its existing private notebook/action history, and requests only independently validated, already-enrolled actions. |
 | Scoped controls and recovery | Preserve operator pauses, agent ownership, named maintenance locks and separately enrolled recovery policies. |
 | Optional client continuity / Agent Watch | Support certified non-dispatch waiting and advisory client status without submitting a new user turn. |
 
-Genie can select compatible free pool capacity for a new review. Provider
-fallback requires proven non-dispatch; an ambiguous dispatched failure is not
-permission to replay it. Normal request dispatch never waits for Genie advice.
+Normal request dispatch never waits for a model-authored review. The legacy
+Genie assistant and its provider-fallback path were removed; see
+[Direction](roadmap.md) for the current scope.
 
 ## Current Jobs and queue priority
 
@@ -30,8 +29,7 @@ control-socket `GET /current-jobs`. With controls enabled, the separate
 `POST /api/current-jobs/priority` action changes one waiting request’s explicit
 priority through the local control socket. See [queue priority](queue-priority.md).
 General
-inference status, diagnostics, request journals and Genie prompts exclude these
-previews.
+inference status, diagnostics and request journals exclude these previews.
 
 The gateway extracts a supported user-text excerpt from the original request and
 keeps a whitespace-normalized preview of at most 160 Unicode characters, plus an
@@ -75,23 +73,24 @@ The core can move a safe undispatched queue head from a busy worker to a
 completely idle eligible worker. New or unaffined work can move immediately;
 established conversations have a five-minute affinity window by default
 (`automatic_affinity_rebalance_min_wait_ms`, or `false` for strict affinity).
-Genie may request an independently validated offer after its separate wait
-threshold, one minute by default (`genie_rebalance_min_wait_ms`). Operator
-controls use the same exact-offer checks. Active or competing same-conversation
-work prevents a move. Handover retains the original client stream and deadline;
-it does not move running inference or copy KV files. Destination cache reuse
-is unknown and a cold prefill may be needed.
+Operator controls use the same exact-offer checks. Active or competing
+same-conversation work prevents a move. Handover retains the original client
+stream and deadline; it does not move running inference or copy KV files.
+Destination cache reuse is unknown and a cold prefill may be needed.
 
-Genie's own new reviews can use compatible free capacity under the existing
-provider-assignment policy. None of these routing rules depends on the retired
-XGB models, priority classifier, four-path comparator or calibration preflight.
+An optional routing-v2 lane estimator can replace the request-count planner when
+`routing_v2_enabled` is set. It measures observed lane speed, rejects implausible
+samples, and falls back to the legacy planner when evidence is insufficient. It
+is experimental; see [routing estimator](routing-estimator.md). None of these
+routing rules depends on the retired XGB models, priority classifier, four-path
+comparator or calibration preflight.
 
 ## Cache comparison and calibration — retired
 
 The experimental comparison of waiting hot, restoring locally, acquiring a
 remote cache or rebuilding cold has been removed, together with its calibration
-preflight and dashboard/Genie status. No calibration job or cache-transfer
-protocol was active; this retirement does not change the routing rules above.
+preflight and dashboard status. No calibration job or cache-transfer protocol
+was active; this retirement does not change the routing rules above.
 
 Passive measurements from ordinary requests remain: reported cache reuse,
 observed misses, disk-load spans and prefill/decode speed. Unknown cause or
@@ -104,8 +103,7 @@ never submits synthetic work. See the [cache audit](cache-continuity-audit.md).
 Changing dashboard or gateway source does not authorize a DS4 restart, cache
 clear or model-setting change. Preserve a timestamped source/configuration
 backup, drain admitted gateway work through the Door, update only affected
-services, and verify effective settings and worker identity afterward. Wait for
-Genie work to finish before replacing its dashboard process.
+services, and verify effective settings and worker identity afterward.
 
 The retirement release passes the gateway/dashboard, continuity, syntax,
 publication-privacy and synthetic browser checks. Gateway fixtures verify FIFO
@@ -114,5 +112,5 @@ checks cover the read-only Jobs table, retained fleet controls and narrow
 layouts. Private live activation receipts remain outside Git.
 
 See [setup](../README.md), [service commands](../README.md#quick-start),
-[worker recovery](worker-recovery.md), [Agent Watch](agent-watch.md) and the
-[closed simplification checklist](current-work-plan.md).
+[worker recovery](worker-recovery.md), [Agent Watch](agent-watch.md) and
+[Direction](roadmap.md).

@@ -12,8 +12,8 @@ been observed with this baseline; their precise causes remain unresolved. Passin
 boundary checks is **not evidence that the profile is OOM-proof or long-context
 stable**. No configuration reductions are implied by this documentation. Diagnose
 faults and validate representative sustained work before relying on stronger
-guarantees; see the
-[maintenance review](maintenance-review-2026-09-02.md).
+guarantees; see the [worker recovery](worker-recovery.md) and
+[generation health](generation-health.md) pages for the evidence model.
 
 The engine and model artifacts are the work of
 [Salvatore “antirez” Sanfilippo and DS4 contributors](https://github.com/antirez/ds4).
