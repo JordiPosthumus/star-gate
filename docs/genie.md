@@ -53,13 +53,14 @@ Genie's own inference is a fleet resource with a configured ladder
 | `pool` | Default. His turns go through the Continuity Door to the ordinary pool. | Ordinary traffic. With `genie_priority_key` configured, scheduled ahead of waiting work. |
 | `dedicated` | A configured endpoint that is not part of the serving fleet. | Normal request. |
 | `fallback` | Ordered extra endpoints, tried after the above fail. | Normal request. |
-| `commandeer` | Last resort, only when the fleet serves nobody. | Exclusive, time-boxed, announced. |
+| `commandeer` | Last resort, only when no worker is healthy and nothing is in flight. | Exclusive, time-boxed, announced. |
 
 **The commandeering rule.** Taking a machine for his own brain is legitimate
-exactly when the fleet is not serving anyone: no healthy worker, no active request,
-no queued request. At that moment there is no user work to protect, so "at all
-costs" and "never starve the fleet" stop being in conflict. If anyone is being
-served or is waiting, waiting is correct and Genie waits.
+exactly when the fleet has no healthy worker and no request in flight. At that
+moment nobody is being served, so "at all costs" and "never starve the fleet"
+stop being in conflict. A queue does not veto it: queued work cannot progress
+until capacity returns, and getting the brain and the fleet back is the job. If a
+worker is healthy, or a request is still in flight, Genie waits.
 
 The one deliberate exception to "Genie waits" is the owner's `genie_priority_key`:
 when configured, identified Genie requests are scheduled ahead of waiting work.

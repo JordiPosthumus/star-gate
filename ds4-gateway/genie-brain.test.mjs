@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {brainPolicy, fleetIsIdle, fleetSnapshot, resolveBrainRoute, DEFAULT_MAX_COMMANDEER_SECONDS} from './genie-brain.mjs';
+import {brainPolicy, fleetIsStranded, fleetSnapshot, resolveBrainRoute, DEFAULT_MAX_COMMANDEER_SECONDS} from './genie-brain.mjs';
 
 const pool = {url: 'http://127.0.0.1:30000/v1', model: 'PoolModel'};
 const dedicated = {url: 'http://127.0.0.1:8000/v1', model: 'genie-local'};
@@ -44,13 +44,20 @@ test('commandeering is refused while anyone is served or waiting', () => {
   assert.match(route.reason, /user work outranks the brain/);
 });
 
-test('commandeering a machine is allowed when the fleet serves nobody', () => {
+test('commandeering a machine is allowed when no worker is healthy and nothing is in flight', () => {
   const config = {genie: {brain: {pool, commandeer: {enabled: true, worker: 'spark-a'}}}};
   const route = resolveBrainRoute(config, down, {attempts: [pool.url], now: 1000});
   assert.equal(route.route, 'commandeer');
   assert.equal(route.worker, 'spark-a');
   assert.equal(route.commandeering, true);
   assert.equal(route.release_at, 1000 + DEFAULT_MAX_COMMANDEER_SECONDS * 1000);
+});
+
+test('a stranded fleet with a queue may still be commandeered', () => {
+  const config = {genie: {brain: {pool, commandeer: {enabled: true, worker: 'spark-a'}}}};
+  const route = resolveBrainRoute(config, {workers: 3, healthy: 0, active: 0, queued: 7}, {attempts: [pool.url]});
+  assert.equal(route.route, 'commandeer');
+  assert.match(route.reason, /No worker is healthy and nothing is in flight/);
 });
 
 test('a draining request still counts as someone being served', () => {
@@ -93,6 +100,6 @@ test('fleet snapshots count only undrained healthy workers and ignore unknown nu
     {is_healthy: false, active: 'x'},
   ]});
   assert.deepEqual(snapshot, {workers: 3, healthy: 1, active: 7, queued: 1});
-  assert.equal(fleetIsIdle(snapshot), false);
-  assert.equal(fleetIsIdle({workers: 0, healthy: 0, active: 0, queued: 0}), true);
+  assert.equal(fleetIsStranded(snapshot), false);
+  assert.equal(fleetIsStranded({workers: 0, healthy: 0, active: 0, queued: 0}), true);
 });

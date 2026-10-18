@@ -32,10 +32,12 @@ export function fleetSnapshot(gateway) {
   };
 }
 
-// True only when nobody is being served and nobody is waiting. A draining
-// request still counts as someone being served.
-export function fleetIsIdle(snapshot) {
-  return snapshot.healthy === 0 && snapshot.active === 0 && snapshot.queued === 0;
+// True when the fleet cannot serve anyone: no healthy worker and no request in
+// flight. Queued work does not veto commandeering -- it cannot progress until
+// capacity returns, and restoring capacity is exactly what Genie is for. A
+// draining request still counts as someone being served.
+export function fleetIsStranded(snapshot) {
+  return snapshot.healthy === 0 && snapshot.active === 0;
 }
 
 export function brainPolicy(config) {
@@ -84,9 +86,9 @@ export function resolveBrainRoute(config, fleet, {attempts = [], now = Date.now(
     };
   }
 
-  const idle = fleetIsIdle(fleet);
+  const stranded = fleetIsStranded(fleet);
   const commandeer = policy.commandeer;
-  if (commandeer.enabled && (idle || commandeer.allow_while_serving)) {
+  if (commandeer.enabled && (stranded || commandeer.allow_while_serving)) {
     return {
       route: 'commandeer',
       worker: commandeer.worker,
@@ -98,7 +100,7 @@ export function resolveBrainRoute(config, fleet, {attempts = [], now = Date.now(
       release_at: now + commandeer.max_seconds * 1000,
       reason: commandeer.allow_while_serving
         ? `Commandeering ${commandeer.worker} under the owner's standing authorization.`
-        : `The fleet is not serving anyone; commandeering ${commandeer.worker} for the brain.`,
+        : `No worker is healthy and nothing is in flight; commandeering ${commandeer.worker} to get the brain and the fleet back.`,
     };
   }
 
