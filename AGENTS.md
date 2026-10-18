@@ -36,7 +36,7 @@ The demo dashboard uses `30011` (`npm run ui:demo`).
 
 ```sh
 npm run check            # syntax check all .mjs and shell scripts
-npm test                 # main suite (93 files, local fixtures)
+npm test                 # main suite (94 files, local fixtures)
 npm run continuity:test  # client continuity / Door behavior
 npm run data:test        # telemetry and evidence math
 npm run recovery:test    # Node + Python recovery adapters
@@ -69,7 +69,8 @@ ds4-gateway/          gateway, door, dashboard, ~150 modules and their tests
   recovery*.mjs/.py   opt-in service recovery adapters
   media-*.mjs/.py     experimental H3/ACE-Step job support
   spark-*.mjs/.py     DGX Spark enrollment, discovery, services
-  hermes-*.mjs        Genie profile, Brain/Memory/Soul stores and runtime bridge
+  hermes-*.mjs        Genie profile, Brain/Memory/Soul stores
+  genie-hermes.mjs    one conversational turn through the pinned Hermes runtime
   genie-brain.mjs     Genie's own model route, fallback ladder and commandeering rule
   genie-config.mjs    whether Genie exists, what he may do unasked, which channels run
   genie-identity.mjs  seeds genie/SOUL.md and genie/AGENTS.md into the private profile
