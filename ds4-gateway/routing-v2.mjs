@@ -57,7 +57,11 @@ export const DEFAULT_SLOWDOWN_PER_LEVEL = 0.9;
 // carried 25-73 tok/s poison (49% weight on ring2) and two-phase placement
 // activated on it. On mismatch, phase classes are dropped and re-measured;
 // solo/slowdown/output history survives (their semantics did not change).
-const MEASUREMENT_VERSION = 2;
+// Bumped whenever a stored number stops meaning what it used to. A mismatch
+// voids the traffic-derived history instead of re-ranking on it: the pre-guard
+// file held 46 453 t/s for a machine whose engine reports 31.7.
+const MEASUREMENT_VERSION = 3;
+export {MEASUREMENT_VERSION};
 
 const slowdownDefault = c => Math.pow(DEFAULT_SLOWDOWN_PER_LEVEL, c - 1);
 const positive = x => Number.isFinite(x) && x > 0;
@@ -80,6 +84,39 @@ export const DEFAULT_HYSTERESIS_SECONDS = 10;
 export const DEFAULT_PROBE_AFTER_SECONDS = 20;
 export const DEFAULT_SAMPLE_ALPHA = 0.3;
 export const DEFAULT_SAMPLE_TTL_SECONDS = 7 * 24 * 3600;
+// Measurement plausibility guards. A lane is a machine, not a traffic diary:
+// a reading outside physical bounds, or a brand-new lane reading far above its
+// peers, is evidence about the SAMPLE, not about the machine. Such samples are
+// rejected (counted, never averaged in) and a lane left with no honest number is
+// priced at its peers' median — "assume average speed" — instead of winning or
+// losing every comparison on a corrupt value. Thresholds are configurable
+// because the right ceiling is a property of the fleet's hardware.
+export const MIN_PLAUSIBLE_TPS = 1;
+export const DEFAULT_MIN_PROMPT_TOKENS = 200;
+export const DEFAULT_MIN_SAMPLE_SECONDS = 0.25;
+// Gross-sanity ceiling for the BLENDED rate. Deliberately loose: with prefix
+// caching a prompt can be "read" at tens of thousands of tokens/second, and
+// that is real work, not a lie. This bound exists to reject the physically
+// absurd (the 31k-44k readings this fleet produced while cached_tokens was
+// unreported), not to judge which machine is faster. The tight bound is the
+// decode ceiling below, where the physics is unambiguous.
+export const DEFAULT_MAX_PLAUSIBLE_TPS = 20000;
+// Autoregressive decode is a serial token loop. These rings measure ~32
+// tokens/second per sequence from the engine's own decode_time counters
+// (2026-10-17: 549,839 generation tokens / 16,864 s = 32.6 on :18091,
+// 1,349,910 / 42,019 s = 32.1 on :18092). A decode-dominated sample an order
+// of magnitude above that is a prompt-side artifact, not a fast machine.
+export const DEFAULT_MAX_PLAUSIBLE_DECODE_TPS = 200;
+// How far above the same-model peer median a lane may read before its number
+// is treated as traffic mix rather than machine speed. Loose enough for real
+// heterogeneous hardware; tight enough that the 3.9x and 5.2x divergences seen
+// on 2026-10-17 are caught.
+export const DEFAULT_PEER_RATIO = 3;
+export const DEFAULT_NEW_LANE_SAMPLES = 5;
+export const DEFAULT_SUSPECT_AFTER = 3;
+// Engine counters are scraped every ~2 s; five minutes of silence means the
+// reading is history, not a measurement of the machine as it stands now.
+export const DEFAULT_ENGINE_TTL_SECONDS = 300;
 const MAX_CONCURRENCY_LEVEL = 16;
 const OUTPUT_SAMPLE_WINDOW = 32;
 
@@ -118,6 +155,17 @@ function remainingSecondsOf(entry, rate, medianOutputTokens, at) {
   return rate > 0 ? Math.max(0, total - rate * elapsed) : null;
 }
 
+// A lane's measurement state is per-incarnation: identity, model, samples and
+// suspicion reset together. Keeping the shape in one place means restore(),
+// record() and checkIdentity() cannot drift apart.
+const emptyLane = (id, identity = null, model = null) => ({
+  id, identity, model,
+  solo: null, slowdown: new Map(), levels: new Set(), outputs: [],
+  prefill: null, decode: null, samples: 0, lastAt: null, lastProbeAt: null,
+  rejected: {}, suspect: false, suspectReason: null, suspectAt: null, recoveryStreak: 0,
+  lastAccepted: null, engine: null,
+});
+
 export class LaneSpeeds {
   // filename may be null for a purely in-memory instance (tests, previews).
   constructor(filename, {
@@ -126,6 +174,15 @@ export class LaneSpeeds {
     probeAfterSeconds = DEFAULT_PROBE_AFTER_SECONDS,
     sampleAlpha = DEFAULT_SAMPLE_ALPHA,
     sampleTtlSeconds = DEFAULT_SAMPLE_TTL_SECONDS,
+    minPromptTokens = DEFAULT_MIN_PROMPT_TOKENS,
+    minSampleSeconds = DEFAULT_MIN_SAMPLE_SECONDS,
+    maxPlausibleTps = DEFAULT_MAX_PLAUSIBLE_TPS,
+    maxPlausibleDecodeTps = DEFAULT_MAX_PLAUSIBLE_DECODE_TPS,
+    peerRatio = DEFAULT_PEER_RATIO,
+    newLaneSamples = DEFAULT_NEW_LANE_SAMPLES,
+    suspectAfter = DEFAULT_SUSPECT_AFTER,
+    engineTtlSeconds = DEFAULT_ENGINE_TTL_SECONDS,
+    onSuspect = null,
     now = () => performance.now() / 1000,
     wallNow = () => Date.now() / 1000,
   } = {}) {
@@ -135,12 +192,31 @@ export class LaneSpeeds {
     if (!positive(sampleAlpha) && sampleAlpha !== 0) throw new Error('sampleAlpha must be a number in (0,1]');
     if (sampleAlpha > 1) throw new Error('sampleAlpha must be a number in (0,1]');
     if (!nonnegative(sampleTtlSeconds)) throw new Error('sampleTtlSeconds must be a non-negative number of seconds');
+    if (!Number.isSafeInteger(minPromptTokens) || minPromptTokens < 0) throw new Error('minPromptTokens must be a non-negative whole number of tokens');
+    if (!nonnegative(minSampleSeconds)) throw new Error('minSampleSeconds must be a non-negative number of seconds');
+    if (!positive(maxPlausibleTps)) throw new Error('maxPlausibleTps must be a positive number of tokens per second');
+    if (!positive(maxPlausibleDecodeTps)) throw new Error('maxPlausibleDecodeTps must be a positive number of tokens per second');
+    if (maxPlausibleDecodeTps > maxPlausibleTps) throw new Error('maxPlausibleDecodeTps must not exceed maxPlausibleTps');
+    if (!positive(peerRatio) || peerRatio < 1) throw new Error('peerRatio must be a number >= 1');
+    if (!Number.isSafeInteger(newLaneSamples) || newLaneSamples < 1) throw new Error('newLaneSamples must be a positive whole number');
+    if (!Number.isSafeInteger(suspectAfter) || suspectAfter < 1) throw new Error('suspectAfter must be a positive whole number');
+    if (!nonnegative(engineTtlSeconds)) throw new Error('engineTtlSeconds must be a non-negative number of seconds');
+    if (onSuspect !== null && typeof onSuspect !== 'function') throw new Error('onSuspect must be a function or null');
     this.filename = filename;
     this.medianOutputTokens = medianOutputTokens;
     this.hysteresisSeconds = hysteresisSeconds;
     this.probeAfterSeconds = probeAfterSeconds;
     this.sampleAlpha = sampleAlpha;
     this.sampleTtlSeconds = sampleTtlSeconds;
+    this.minPromptTokens = minPromptTokens;
+    this.minSampleSeconds = minSampleSeconds;
+    this.maxPlausibleTps = maxPlausibleTps;
+    this.maxPlausibleDecodeTps = maxPlausibleDecodeTps;
+    this.peerRatio = peerRatio;
+    this.newLaneSamples = newLaneSamples;
+    this.suspectAfter = suspectAfter;
+    this.engineTtlSeconds = engineTtlSeconds;
+    this.onSuspect = onSuspect;
     // Two clocks, deliberately: `now` is the gateway's monotonic performance
     // epoch in SECONDS (matches elapsedSeconds; dispatchedMono is the same
     // epoch in MILLISECONDS), `wallNow` is wall time for anything persisted —
@@ -149,8 +225,13 @@ export class LaneSpeeds {
     this.now = now;
     this.wallNow = wallNow;
     this.lanes = new Map();
+    // The peer group for one decision: the workers actually offered to
+    // evaluate(). Without it, a lane retired from config but still inside the
+    // 7-day sample TTL would keep voting in every median — exactly the
+    // "switched a server out" case this guard has to survive.
+    this.peerPool = null;
     this.fleetOutputs = [];
-    this.state = {records: 0, storageError: null, notice: null};
+    this.state = {records: 0, rejected: 0, storageError: null, notice: null};
     this.dirty = false;
     this.writing = false;
     this.closed = false;
@@ -175,12 +256,21 @@ export class LaneSpeeds {
     const lanes = data?.version === 1 && data.lanes && typeof data.lanes === 'object' ? data.lanes : null;
     if (!lanes) {this.state.notice = 'Previous lane-speed history had an unknown format and was ignored.';return;}
     this.fleetOutputs = Array.isArray(data.fleetOutputs) ? data.fleetOutputs.filter(count).slice(-OUTPUT_SAMPLE_WINDOW * 2) : [];
-    // Phase semantics changed with MEASUREMENT_VERSION; older phase EWMAs are
-    // poison (different token accounting / different sampling rule), not data.
-    const phasesValid = data.measurementVersion === MEASUREMENT_VERSION;
+    // Sample semantics changed with MEASUREMENT_VERSION; older EWMAs are poison
+    // (different token accounting, no plausibility fence, probe-sized samples),
+    // not data. This is what makes a restart self-cleaning: the poisoned numbers
+    // cannot survive it, and engine rates refill the lanes within a poll.
+    const historyValid = data.measurementVersion === MEASUREMENT_VERSION;
+    const phasesValid = historyValid;
+    if (!historyValid && data.lanes && Object.keys(data.lanes).length)
+      this.state.notice = 'Measurement semantics changed; previous speed history was discarded and lanes will re-measure.';
     for (const [id, lane] of Object.entries(lanes)) {
       if (!lane || typeof lane !== 'object' || typeof id !== 'string' || !id) continue;
-      const solo = this.restoreSample(lane.solo);
+      const stored = historyValid ? this.restoreSample(lane.solo) : null;
+      // A subnormal persisted value is corruption, not a slow machine: it would
+      // otherwise divide the finish estimate into a null and drag the peer
+      // median down with it (round-2 hostile-trace case).
+      const solo = stored && stored.value >= MIN_PLAUSIBLE_TPS ? stored : null;
       const lastProbeAt = nonnegative(lane.lastProbeAt) ? lane.lastProbeAt : null;
       // A solo-less entry is still worth restoring when it carries a probe
       // latch: the latch spaces out probe attempts across restarts. With
@@ -192,15 +282,39 @@ export class LaneSpeeds {
         if (restored && Number.isSafeInteger(+level) && +level >= 1 && +level <= MAX_CONCURRENCY_LEVEL) slowdown.set(+level, restored);
       }
       const levels = solo && Array.isArray(lane.levels) ? lane.levels.filter(value => Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY_LEVEL) : [];
-      this.lanes.set(id, {id, identity: typeof lane.identity === 'string' ? lane.identity : null,
-        solo, slowdown, levels: solo ? new Set(levels.length ? levels : [1]) : new Set(),
-        outputs: solo && Array.isArray(lane.outputs) ? lane.outputs.filter(count).slice(-OUTPUT_SAMPLE_WINDOW) : [],
-        prefill: solo && phasesValid ? this.restoreSample(lane.prefill) : null,
-        decode: solo && phasesValid ? this.restoreSample(lane.decode) : null,
-        samples: solo ? (count(lane.samples) ? lane.samples : 1) : 0,
-        lastAt: solo && nonnegative(lane.lastAt) ? lane.lastAt : null,
-        lastProbeAt});
+      const restored = emptyLane(id, typeof lane.identity === 'string' ? lane.identity : null,
+        typeof lane.model === 'string' ? lane.model : null);
+      restored.solo = solo;
+      restored.slowdown = slowdown;
+      restored.levels = solo ? new Set(levels.length ? levels : [1]) : new Set();
+      restored.outputs = solo && Array.isArray(lane.outputs) ? lane.outputs.filter(count).slice(-OUTPUT_SAMPLE_WINDOW) : [];
+      restored.prefill = solo && phasesValid ? this.restoreSample(lane.prefill) : null;
+      restored.decode = solo && phasesValid ? this.restoreSample(lane.decode) : null;
+      restored.samples = solo ? (count(lane.samples) ? lane.samples : 1) : 0;
+      restored.lastAt = solo && nonnegative(lane.lastAt) ? lane.lastAt : null;
+      restored.lastProbeAt = lastProbeAt;
+      restored.lastAccepted = historyValid && solo && positive(lane.lastAccepted) && lane.lastAccepted <= this.maxPlausibleTps
+        ? lane.lastAccepted : (solo && solo.value <= this.maxPlausibleTps ? solo.value : null);
+      // A persisted number above the physical ceiling was already wrong when it
+      // was written. Do not re-rank on it: start suspect and let the peer
+      // fallback price the lane until three clean samples arrive.
+      if (solo && solo.value > this.maxPlausibleTps) {
+        restored.suspect = true;
+        restored.suspectReason = 'implausible_history';
+        restored.solo = null; // the number is not evidence; re-earn it from traffic
+        restored.prefill = null;
+        restored.decode = null;
+      }
+      restored.suspect = lane.suspect === true;
+      restored.suspectReason = typeof lane.suspectReason === 'string' ? lane.suspectReason : null;
+      restored.suspectAt = nonnegative(lane.suspectAt) ? lane.suspectAt : null;
+      this.lanes.set(id, restored);
     }
+    // Re-judge every restored lane now that the whole peer set exists. A
+    // persisted value that no longer looks like its peers must not be adopted
+    // just because it survived a restart; a persisted conviction is not
+    // trusted blindly either — it has to survive this same test.
+    for (const lane of this.lanes.values()) if (lane.solo) this.assessLane(lane, false);
   }
 
   restoreSample(sample) {
@@ -211,22 +325,25 @@ export class LaneSpeeds {
   // the same endpoint) — every number it earned is invalid. Called from both
   // record() and the evaluate() candidate pass, so a swap demotes a lane to
   // cold before it is next scored, not only after its first new completion.
-  checkIdentity(id, identity) {
+  checkIdentity(id, identity, model = null) {
     const lane = this.lanes.get(id);
     if (!lane) return null;
+    if (model) lane.model = model;
     if (identity && lane.identity && lane.identity !== identity) {
       lane.identity = identity;lane.solo = null;lane.slowdown = new Map();lane.levels = new Set();
       lane.outputs = [];lane.prefill = null;lane.decode = null;lane.samples = 0;lane.lastAt = null;lane.lastProbeAt = null;
+      lane.rejected = {};lane.suspect = false;lane.suspectReason = null;lane.suspectAt = null;lane.recoveryStreak = 0;
     }
     return lane;
   }
 
-  lane(id, identity = null) {
+  lane(id, identity = null, model = null) {
     let lane = this.lanes.get(id);
     if (!lane) {
-      lane = {id, identity, solo: null, slowdown: new Map(), levels: new Set(), outputs: [], prefill: null, decode: null, samples: 0, lastAt: null, lastProbeAt: null};
+      lane = emptyLane(id, identity, model);
       this.lanes.set(id, lane);
-    } else if (identity) this.checkIdentity(id, identity);
+    } else if (identity) this.checkIdentity(id, identity, model);
+    else if (model && !lane.model) lane.model = model;
     if (identity && !lane.identity) lane.identity = identity;
     return lane;
   }
@@ -235,17 +352,61 @@ export class LaneSpeeds {
   // the gateway subtracts the cached prefix), outputTokens = completion tokens
   // (drives the per-lane output-size estimate), seconds = gateway-measured
   // service seconds, concurrency = the lane's executing count while it ran.
-  record({worker, tokens, outputTokens, seconds, concurrency, at = this.wallNow()}) {
+  record({worker, tokens, promptTokens, outputTokens, seconds, concurrency, at = this.wallNow()}) {
     if (this.closed) return;
     const id = worker?.id;
     if (typeof id !== 'string' || !id || !positive(tokens) || !positive(seconds) || !count(concurrency) || concurrency < 1) return;
     const level = Math.min(concurrency, MAX_CONCURRENCY_LEVEL);
-    const lane = this.lane(id, typeof worker.identity === 'string' ? worker.identity : null);
+    const lane = this.lane(id, typeof worker.identity === 'string' ? worker.identity : null,
+      typeof worker.model === 'string' ? worker.model : null);
     const rate = tokens / seconds;
+    // Plausibility fence. These bounds are about physics and the fleet's own
+    // hardware class, not about "slow" or "fast": a reading above the ceiling
+    // cannot be a throughput measurement on this fleet, and a sub-1 t/s reading
+    // cannot be a working lane. Decode-dominated samples get the tighter
+    // decode ceiling: a blended 5,000 t/s with 1,250 output tokens in 0.25 s is
+    // physically impossible for autoregressive decode, and only a prompt-side
+    // artifact can produce it. Rejecting the sample is deliberately different
+    // from clamping it — a silent clamp turns nonsense into a plausible-looking
+    // number that still steers placement. Rejections are counted and visible.
+    //
+    // The size floor is on the PROMPT, not on compute tokens (2026-10-17). A
+    // 31-prompt/1-completion health probe takes ~0.2-2.5 s to stream, so it
+    // measures 12-124 t/s — a 100x-low sample at full EWMA weight. One probe
+    // moves a lane 30% toward "broken" (alpha 0.3), and the 19:20Z collapse
+    // coincides exactly with probe-sized requests landing on ring2. A compute
+    // floor cannot express this: once cached tokens are reported correctly a
+    // genuinely large cached request also has few compute tokens, and rejecting
+    // it would throw away the best samples. Prompt size is the honest proxy for
+    // "this request was big enough for seconds to mean throughput".
+    const outputPart = count(outputTokens) && outputTokens > 0 ? outputTokens : 0;
+    const inputPart = Math.max(0, tokens - outputPart);
+    const decodeDominant = outputPart > 0 && inputPart * 4 <= outputPart;
+    const ceiling = decodeDominant ? Math.min(this.maxPlausibleTps, this.maxPlausibleDecodeTps) : this.maxPlausibleTps;
+    const prompt = count(promptTokens) && promptTokens > 0 ? promptTokens : null;
+    const rejection = prompt !== null && prompt < this.minPromptTokens ? 'prompt_below_floor'
+      : seconds < this.minSampleSeconds ? 'seconds_below_floor'
+      : rate < 1 ? 'implausible_rate'
+      : rate > ceiling ? 'implausible_rate' : null;
+    if (rejection) {
+      lane.rejected[rejection] = (lane.rejected[rejection] ?? 0) + 1;
+      this.state.rejected++;
+      // A lane that has produced nothing but impossible readings must not stay
+      // "cold and harmless" while it waits: if it has no honest number at all,
+      // price it at the fleet average so it neither dominates nor starves.
+      const rejected = Object.values(lane.rejected).reduce((sum, value) => sum + value, 0);
+      if (!lane.solo && rejected >= this.suspectAfter) this.markSuspect(lane, 'implausible_samples');
+      return;
+    }
     // Normalize every sample to solo-equivalent with the default curve, then
     // refine the curve itself from measured ratios. A lane measured only at
     // concurrency 3 still yields a usable solo estimate on day one.
-    const previousSolo = lane.solo?.value ?? null;
+    // A persisted number above the ceiling is not evidence the machine is
+    // fast, it is evidence the old measurement was broken. Do not carry it
+    // forward through the EWMA (that would need ~10 honest samples to dilute);
+    // restart the estimate from this first in-band sample instead.
+    const poisoned = !!lane.solo && lane.solo.value > this.maxPlausibleTps;
+    const previousSolo = poisoned ? null : (lane.solo?.value ?? null);
     const soloEquivalent = rate / slowdownDefault(level);
     lane.solo = {value: ewma(previousSolo, soloEquivalent, this.sampleAlpha), samples: (lane.solo?.samples ?? 0) + 1, updatedAt: at};
     lane.levels.add(level);
@@ -280,8 +441,6 @@ export class LaneSpeeds {
     // blended/phase = (k+1)/(k + r) for hardware ratio r); both twins share
     // the bias, so placement comparisons survive it.
     if (level === 1) {
-      const outputPart = count(outputTokens) && outputTokens > 0 ? outputTokens : 0;
-      const inputPart = Math.max(0, tokens - outputPart);
       if (outputPart === 0 || inputPart >= 4 * outputPart) {
         lane.prefill = {value: ewma(lane.prefill?.value ?? null, rate, this.sampleAlpha), samples: (lane.prefill?.samples ?? 0) + 1, updatedAt: at};
       } else if (inputPart * 4 <= outputPart) {
@@ -291,14 +450,144 @@ export class LaneSpeeds {
     lane.samples++;
     lane.lastAt = at;
     this.state.records++;
+    this.assessLane(lane);
     this.save();
+  }
+
+  // The engine's own numbers, when it publishes them. These are the only
+  // cache-INVARIANT machine measurements available: decode_tps is
+  // generation_tokens summed over decode_time summed, and prefill_tps is
+  // kv-computed tokens over prefill seconds. Both are properties of the
+  // hardware, not of which conversations happened to arrive that hour, so they
+  // outrank anything derived from gateway stopwatches. A nonsense engine report
+  // is ignored (bounded like any other sample) rather than trusted because it
+  // came from the engine.
+  observeEngine(workerId, {decodeTps, prefillTps, at = this.wallNow()} = {}) {
+    if (this.closed || typeof workerId !== 'string' || !workerId) return;
+    const decode = positive(decodeTps) && decodeTps <= this.maxPlausibleDecodeTps ? decodeTps : null;
+    const prefill = positive(prefillTps) && prefillTps <= this.maxPlausibleTps && prefillTps >= MIN_PLAUSIBLE_TPS ? prefillTps : null;
+    if (decode === null && prefill === null) return;
+    const lane = this.lane(workerId);
+    lane.engine = {decode: decode ?? lane.engine?.decode ?? null,
+      prefill: prefill ?? lane.engine?.prefill ?? null, at};
+    // Engine evidence supersedes a stopwatch conviction: the lane's traffic
+    // sample may have been probe-sized, but the engine is reporting the whole
+    // session. Clear the flag so the lane is ranked on the honest number.
+    if (lane.suspect) this.clearSuspect(lane);
+  }
+
+  engineFresh(lane) {
+    return !!lane?.engine && lane.engine.at !== null && (this.wallNow() - lane.engine.at) <= this.engineTtlSeconds
+      && positive(lane.engine.decode);
+  }
+
+  // Cross-check one lane against its peers (same served model). The test is
+  // deliberately ONE-SIDED and HIGH-ONLY: cache inflation can only make a lane
+  // look faster than the machine is, and a two-sided test would let a liar that
+  // happens to report first convict the honest lane for being "too slow". A
+  // reading more than peerRatio above the peer median is not trustworthy as a
+  // MACHINE property, so the lane is priced at the peer median until it has
+  // produced suspectAfter consecutive in-band samples. A lane with no trusted
+  // peer (single-lane fleet, one lane per model) is never convicted by this
+  // test — only by the absolute ceiling — so the guard cannot deadlock.
+  assessLane(lane, persist = true) {
+    const value = lane.solo?.value;
+    if (!positive(value)) return;
+    const peer = this.peerMedian(lane);
+    const implausible = value > this.maxPlausibleTps;
+    const outlier = positive(peer) && value > peer * this.peerRatio;
+    if (implausible || outlier) {
+      lane.recoveryStreak = 0;
+      this.markSuspect(lane, implausible ? 'implausible_rate' : 'peer_outlier', persist);
+    } else if (lane.suspect) {
+      lane.recoveryStreak = (lane.recoveryStreak ?? 0) + 1;
+      if (lane.recoveryStreak >= this.suspectAfter) this.clearSuspect(lane, persist);
+    }
+    // The last value this lane earned while nothing objected. It is the
+    // fallback of last resort when a lane turns suspect with no trusted peer
+    // (a single-lane fleet, one lane per model): better a stale-but-honest
+    // number from this very machine than a fleet-wide cold switch.
+    if (!lane.suspect && positive(value)) lane.lastAccepted = value;
+  }
+
+  markSuspect(lane, reason, persist = true) {
+    const changed = !lane.suspect || lane.suspectReason !== reason;
+    lane.suspect = true;
+    lane.suspectReason = reason;
+    lane.suspectAt = lane.suspectAt ?? this.wallNow();
+    lane.recoveryStreak = 0;
+    if (!changed) return;
+    const state = this.measurementState(lane);
+    try {this.onSuspect?.(lane, state);} catch {}
+    if (persist) this.save();
+  }
+
+  clearSuspect(lane, persist = true) {
+    if (!lane.suspect) return;
+    lane.suspect = false;
+    lane.suspectReason = null;
+    lane.suspectAt = null;
+    lane.recoveryStreak = 0;
+    const state = this.measurementState(lane);
+    try {this.onSuspect?.(lane, state);} catch {}
+    if (persist) this.save();
+  }
+
+  // Median solo speed of the OTHER trusted lanes serving the same model. A
+  // suspect lane is never its own reference, and a bad peer never becomes the
+  // fleet average (suspect peers are excluded). The pool is the set of workers
+  // actually offered to this decision: a lane retired from config but still
+  // inside the sample TTL must not keep voting in every median. Returns null
+  // when there is no honest peer — the caller then falls back to cold rather
+  // than inventing a number.
+  peerMedian(lane, pool = this.peerPool) {
+    const values = [];
+    for (const other of this.lanes.values()) {
+      if (other.id === lane.id || other.suspect) continue;
+      if (pool && !pool.has(other.id)) continue;
+      if (!other.solo || !positive(other.solo.value)) continue;
+      if (other.solo.value < MIN_PLAUSIBLE_TPS || other.solo.value > this.maxPlausibleTps) continue;
+      // Require a positive match. A legacy lane whose model is unknown must not
+      // vote on a lane that serves something else: with the pre-guard state file
+      // this pooled Apple-silicon GLM lanes with the rings and priced a broken
+      // ring at 305 t/s.
+      if (!lane.model || !other.model || lane.model !== other.model) continue;
+      if (other.lastAt === null || (this.wallNow() - other.lastAt) > this.sampleTtlSeconds) continue;
+      values.push(other.solo.value);
+    }
+    return median(values);
+  }
+
+  measurementState(lane) {
+    if (!lane) return {suspect: false, reason: null, observed: null, fallback: null};
+    const peer = lane.suspect ? this.peerMedian(lane) : null;
+    return {suspect: lane.suspect === true, reason: lane.suspectReason ?? null,
+      observed: lane.solo?.value ?? null, fallback: peer};
   }
 
   // The lane's expected blended tokens/second at a concurrency level, with an
   // honest evidence label. Cold (null) is a state, never a fabricated number:
   // no measurement, or a measurement older than the staleness horizon.
+  // A lane under measurement suspicion is priced at its peers' median instead
+  // of its own reading (evidence 'fleet_average') — the owner's rule for a
+  // server that reports nonsense: assume it runs at the fleet's average speed.
   speedAt(workerId, concurrency) {
     const lane = this.lanes.get(workerId);
+    if (this.engineFresh(lane)) return {tokensPerSecond: lane.engine.decode, evidence: 'engine_measured',
+      soloTokensPerSecond: lane.engine.decode, soloSamples: lane.solo?.samples ?? 0, engine: true};
+    // Suspicion is checked BEFORE the cold test: a lane condemned by its own
+    // rejected samples never earned a solo value, and it must still be priced
+    // at its peers rather than silently treated as unmeasured.
+    const suspect = !!lane && (lane.suspect === true || (!!lane.solo && lane.solo.value > this.maxPlausibleTps));
+    if (suspect) {
+      const peer = this.peerMedian(lane);
+      const fallback = positive(peer) ? peer : (positive(lane.lastAccepted) ? lane.lastAccepted : null);
+      const base = {suspect: true, suspectReason: lane.suspectReason ?? 'implausible_rate',
+        soloSamples: lane.solo?.samples ?? 0, observedTokensPerSecond: lane.solo?.value ?? null};
+      return positive(fallback)
+        ? {...base, tokensPerSecond: fallback, evidence: 'fleet_average', soloTokensPerSecond: fallback}
+        : {...base, tokensPerSecond: null, evidence: 'suspect_unmeasured', soloTokensPerSecond: null};
+    }
     if (!lane?.solo || !positive(lane.solo.value)) return {tokensPerSecond: null, evidence: 'cold'};
     if (lane.lastAt === null || (this.wallNow() - lane.lastAt) > this.sampleTtlSeconds) return {tokensPerSecond: null, evidence: 'stale'};
     const level = Math.max(1, Math.min(concurrency, MAX_CONCURRENCY_LEVEL));
@@ -344,9 +633,22 @@ export class LaneSpeeds {
   // as the solo EWMA), so finishEstimate scales them with the same factor.
   phaseRates(workerId) {
     const lane = this.lanes.get(workerId);
+    // Engine counters first: decode from the engine is cache-invariant, and
+    // pairing it with the lane's traffic-measured prefill is strictly better
+    // than either alone. Fall back to two classified traffic classes.
+    if (this.engineFresh(lane)) {
+      const prefill = positive(lane.engine.prefill) ? lane.engine.prefill : (lane.prefill?.samples >= 3 ? lane.prefill.value : null);
+      if (positive(prefill)) return {prefill, decode: lane.engine.decode, source: 'engine'};
+    }
     const prefill = lane?.prefill, decode = lane?.decode;
     if (!prefill || !decode || prefill.samples < 3 || decode.samples < 3) return null;
     if (!positive(prefill.value) || !positive(decode.value)) return null;
+    // The same plausibility ceiling applies to phase rates: a prefill reading
+    // above the fleet's physical ceiling is a cache artifact, and mixing it
+    // into a finish estimate reintroduces exactly the corruption the blended
+    // fence rejects. A suspect lane's phase history is not used at all.
+    if (lane.suspect) return null;
+    if (prefill.value > this.maxPlausibleTps || decode.value > this.maxPlausibleTps) return null;
     return {prefill: prefill.value, decode: decode.value};
   }
 
@@ -370,8 +672,13 @@ export class LaneSpeeds {
     const phases = this.phaseRates(worker.id);
     // Phase split when the lane's sample ring supports it (solo-equivalent
     // times, scaled back up to the join concurrency); blended otherwise.
-    const factor = positive(speed.soloTokensPerSecond) && speed.tokensPerSecond > 0
-      ? speed.tokensPerSecond / speed.soloTokensPerSecond : 1;
+    // The factor is a concurrency correction ONLY. When speedAt substituted a
+    // fleet average the ratio is 1 by construction, and a nonsense ratio
+    // (0, Infinity, NaN) must degrade to 1 rather than price a job at 0 s or
+    // 665 s — the round-2 "wins by finishing instantly" bug in a new disguise.
+    const solo = speed.soloTokensPerSecond;
+    const rawFactor = positive(solo) && positive(speed.tokensPerSecond) ? speed.tokensPerSecond / solo : 1;
+    const factor = Number.isFinite(rawFactor) && rawFactor > 0 ? rawFactor : 1;
     const serviceSeconds = phases
       ? (parts.input / phases.prefill + parts.output / phases.decode) / factor
       : (parts.input + parts.output) / speed.tokensPerSecond;
@@ -384,6 +691,20 @@ export class LaneSpeeds {
   // SIDE-EFFECT-FREE: probe choices are reported, not latched — the committing
   // caller latches them via markProbed() only when a request will really go.
   evaluate({job, workers, currentWorkerId = null, eligibility, homeIsWarmCache = false, at = this.now()}) {
+    // The peer group for THIS decision is the fleet actually offered to it.
+    // Reading this.lanes directly would let a worker the owner switched out —
+    // still inside the 7-day sample TTL — vote in every median, which both
+    // hides a liar and convicts an honest lane.
+    const previousPool = this.peerPool;
+    this.peerPool = new Set((workers ?? []).map(worker => worker?.id).filter(id => typeof id === 'string' && id));
+    try {
+      return this.decide({job, workers, currentWorkerId, eligibility, homeIsWarmCache, at});
+    } finally {
+      this.peerPool = previousPool;
+    }
+  }
+
+  decide({job, workers, currentWorkerId = null, eligibility, homeIsWarmCache = false, at = this.now()}) {
     const candidate = worker => {
       if (typeof worker?.identity === 'string') this.checkIdentity(worker.id, worker.identity);
       const allowed = eligibility ? eligibility(job, worker) : {eligible: true, reason: null};
@@ -509,17 +830,35 @@ export class LaneSpeeds {
   }
 
   // Report which registered lanes have never produced a measurement, so the
-  // fleet's blindness is visible instead of silent.
+  // fleet's blindness is visible instead of silent. A suspect lane reports the
+  // value it was priced at (effective) next to the reading it was caught with
+  // (solo) and the peer median that replaced it, so an operator can see the
+  // guard working rather than infer it from placement.
   status(registeredIds = []) {
     const wall = this.wallNow();
     const lanes = registeredIds.map(id => {
       const lane = this.lanes.get(id);
       const solo = lane?.solo ?? null;
       const fresh = !!solo && lane.lastAt !== null && (wall - lane.lastAt) <= this.sampleTtlSeconds;
-      return {workerId: id, measured: fresh, samples: lane?.samples ?? 0,
+      const suspect = !!lane && (lane.suspect === true || (solo && solo.value > this.maxPlausibleTps));
+      const peer = suspect && lane ? this.peerMedian(lane) : null;
+      const effective = suspect ? (positive(peer) ? peer : null) : (fresh ? solo.value : null);
+      const rejectedByReason = lane ? {...lane.rejected} : {};
+      const engine = this.engineFresh(lane) ? lane.engine : null;
+      return {workerId: id, measured: fresh && !suspect, samples: lane?.samples ?? 0,
+        measurement: suspect && !engine ? 'suspect' : engine ? 'engine' : !solo ? 'cold' : !fresh ? 'stale' : 'measured',
+        suspectReason: suspect ? (lane.suspectReason ?? 'implausible_rate') : null,
+        suspectSince: suspect ? (lane.suspectAt ?? null) : null,
+        effectiveTokensPerSecond: engine ? engine.decode : effective,
+        engineDecodeTokensPerSecond: engine ? engine.decode : null,
+        enginePrefillTokensPerSecond: engine ? engine.prefill : null,
+        engineSampleAgeSeconds: engine ? Math.max(0, wall - engine.at) : null,
+        peerMedianTokensPerSecond: peer,
+        rejectedSamples: Object.values(rejectedByReason).reduce((sum, value) => sum + value, 0),
+        rejectedByReason,
         soloTokensPerSecond: fresh ? solo.value : null, soloSamples: solo?.samples ?? 0,
-        prefillTokensPerSecond: fresh && lane.prefill && lane.prefill.samples >= 3 && positive(lane.prefill.value) ? lane.prefill.value : null,
-        decodeTokensPerSecond: fresh && lane.decode && lane.decode.samples >= 3 && positive(lane.decode.value) ? lane.decode.value : null,
+        prefillTokensPerSecond: fresh && !suspect && lane.prefill && lane.prefill.samples >= 3 && positive(lane.prefill.value) && lane.prefill.value <= this.maxPlausibleTps ? lane.prefill.value : null,
+        decodeTokensPerSecond: fresh && !suspect && lane.decode && lane.decode.samples >= 3 && positive(lane.decode.value) && lane.decode.value <= this.maxPlausibleTps ? lane.decode.value : null,
         outputMedianTokens: this.medianOutput(id),
         measuredConcurrency: lane ? [...lane.slowdown.keys()].sort((a, b) => a - b) : [],
         soloLevels: lane ? [...lane.levels].sort((a, b) => a - b) : [],
@@ -529,7 +868,11 @@ export class LaneSpeeds {
     return {planner: 'v2', median_output_tokens: this.medianOutputTokens,
       hysteresis_seconds: this.hysteresisSeconds, probe_after_seconds: this.probeAfterSeconds,
       sample_ttl_seconds: this.sampleTtlSeconds, fleet_output_median_tokens: median(this.fleetOutputs),
-      records: this.state.records, storage_error: this.state.storageError, notice: this.state.notice,
+      min_prompt_tokens: this.minPromptTokens, min_sample_seconds: this.minSampleSeconds,
+      max_plausible_tps: this.maxPlausibleTps, peer_ratio: this.peerRatio,
+      records: this.state.records, rejected_samples: this.state.rejected,
+      storage_error: this.state.storageError, notice: this.state.notice,
+      suspect_lanes: lanes.filter(lane => lane.measurement === 'suspect').map(lane => lane.workerId),
       unmeasured_lanes: lanes.filter(lane => !lane.measured).map(lane => lane.workerId), lanes};
   }
 
@@ -541,7 +884,9 @@ export class LaneSpeeds {
       while (this.dirty) {
         this.dirty = false;
         const lanes = Object.fromEntries([...this.lanes.values()].map(lane => [lane.id, {
-          identity: lane.identity, samples: lane.samples, lastAt: lane.lastAt, lastProbeAt: lane.lastProbeAt,
+          identity: lane.identity, model: lane.model, samples: lane.samples, lastAt: lane.lastAt, lastProbeAt: lane.lastProbeAt,
+          lastAccepted: lane.lastAccepted,
+          suspect: lane.suspect, suspectReason: lane.suspectReason, suspectAt: lane.suspectAt,
           solo: lane.solo, levels: [...lane.levels], outputs: [...lane.outputs], prefill: lane.prefill, decode: lane.decode,
           slowdown: Object.fromEntries([...lane.slowdown.entries()])}]));
         const data = JSON.stringify({version: 1, measurementVersion: MEASUREMENT_VERSION, fleetOutputs: [...this.fleetOutputs], lanes});

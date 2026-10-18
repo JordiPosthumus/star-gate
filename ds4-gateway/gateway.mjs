@@ -33,7 +33,7 @@ import { Dataset } from './dataset.mjs';
 import { clientMetadata, CLIENT_METADATA_HEADER } from './client-metadata.mjs';
 import { RoutingShadow } from './routing-shadow.mjs';
 import {RoutingObservations,routingRequestMetadata,routingIdentity} from './routing-observations.mjs';
-import {LaneSpeeds,DEFAULT_SAMPLE_TTL_SECONDS} from './routing-v2.mjs';
+import {LaneSpeeds,DEFAULT_SAMPLE_TTL_SECONDS,DEFAULT_MIN_PROMPT_TOKENS,DEFAULT_MIN_SAMPLE_SECONDS,DEFAULT_MAX_PLAUSIBLE_TPS,DEFAULT_MAX_PLAUSIBLE_DECODE_TPS,DEFAULT_PEER_RATIO,DEFAULT_SUSPECT_AFTER} from './routing-v2.mjs';
 import {EndpointTelemetry} from './endpoint-telemetry.mjs';
 import { GenerationFaultObserver, verifyGeneration } from './generation-health.mjs';
 import { workerConfig, workerConfigs, workerFields, assertUniqueWorker, sshTargets, replaceSshFallbacks } from './worker-config.mjs';
@@ -408,20 +408,52 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
   if(config.routing_v2_probe_after_seconds!==undefined&&(!Number.isFinite(config.routing_v2_probe_after_seconds)||config.routing_v2_probe_after_seconds<0))throw new Error('routing_v2_probe_after_seconds must be a non-negative number');
   if(config.routing_v2_median_output_tokens!==undefined&&(!Number.isSafeInteger(config.routing_v2_median_output_tokens)||config.routing_v2_median_output_tokens<1))throw new Error('routing_v2_median_output_tokens must be a positive whole number');
   if(config.routing_v2_sample_ttl_seconds!==undefined&&(!Number.isFinite(config.routing_v2_sample_ttl_seconds)||config.routing_v2_sample_ttl_seconds<0))throw new Error('routing_v2_sample_ttl_seconds must be a non-negative number');
+  // Measurement guards. These exist so one server returning unreasonable values
+  // cannot steer placement: out-of-physics samples are rejected (counted, never
+  // averaged), and a lane reading far above its same-model peers is priced at
+  // their median until it re-earns its own number.
+  if(config.routing_v2_min_prompt_tokens!==undefined&&(!Number.isSafeInteger(config.routing_v2_min_prompt_tokens)||config.routing_v2_min_prompt_tokens<0))throw new Error('routing_v2_min_prompt_tokens must be a non-negative whole number');
+  if(config.routing_v2_min_sample_seconds!==undefined&&(!Number.isFinite(config.routing_v2_min_sample_seconds)||config.routing_v2_min_sample_seconds<0))throw new Error('routing_v2_min_sample_seconds must be a non-negative number');
+  if(config.routing_v2_max_plausible_tps!==undefined&&(!Number.isFinite(config.routing_v2_max_plausible_tps)||config.routing_v2_max_plausible_tps<=0))throw new Error('routing_v2_max_plausible_tps must be a positive number');
+  if(config.routing_v2_max_plausible_decode_tps!==undefined&&(!Number.isFinite(config.routing_v2_max_plausible_decode_tps)||config.routing_v2_max_plausible_decode_tps<=0))throw new Error('routing_v2_max_plausible_decode_tps must be a positive number');
+  if(config.routing_v2_peer_ratio!==undefined&&(!Number.isFinite(config.routing_v2_peer_ratio)||config.routing_v2_peer_ratio<1))throw new Error('routing_v2_peer_ratio must be a number >= 1');
+  if(config.routing_v2_suspect_after!==undefined&&(!Number.isSafeInteger(config.routing_v2_suspect_after)||config.routing_v2_suspect_after<1))throw new Error('routing_v2_suspect_after must be a positive whole number');
   const routingV2Enabled=timeRouting&&config.routing_v2_enabled===true;
   const laneSpeeds=new LaneSpeeds(path.join(path.dirname(config.state_file),'lane-speeds.json'),{
     medianOutputTokens:config.routing_v2_median_output_tokens??800,
     hysteresisSeconds:config.routing_v2_hysteresis_seconds??10,
     probeAfterSeconds:config.routing_v2_probe_after_seconds??20,
-    sampleTtlSeconds:config.routing_v2_sample_ttl_seconds??DEFAULT_SAMPLE_TTL_SECONDS});
+    sampleTtlSeconds:config.routing_v2_sample_ttl_seconds??DEFAULT_SAMPLE_TTL_SECONDS,
+    minPromptTokens:config.routing_v2_min_prompt_tokens??DEFAULT_MIN_PROMPT_TOKENS,
+    minSampleSeconds:config.routing_v2_min_sample_seconds??DEFAULT_MIN_SAMPLE_SECONDS,
+    maxPlausibleTps:config.routing_v2_max_plausible_tps??DEFAULT_MAX_PLAUSIBLE_TPS,
+    maxPlausibleDecodeTps:config.routing_v2_max_plausible_decode_tps??DEFAULT_MAX_PLAUSIBLE_DECODE_TPS,
+    peerRatio:config.routing_v2_peer_ratio??DEFAULT_PEER_RATIO,
+    suspectAfter:config.routing_v2_suspect_after??DEFAULT_SUSPECT_AFTER,
+    // A lane crossing the fence is an operational event, not a silent one:
+    // one log line when it is condemned and one when it recovers.
+    onSuspect:(lane,state)=>log(state.suspect?'lane_measurement_suspect':'lane_measurement_trusted',{
+      worker:lane.id,reason:state.reason??null,
+      observed_tps:state.observed==null?null:Math.round(state.observed),
+      fallback_tps:state.fallback==null?null:Math.round(state.fallback)})});
   const routingV2Shadow={evaluations:0,errors:0,v2_moves:0,legacy_moves:0,legacy_abstentions:0,destination_disagreements:0,agree:0,disagree:0,last:null};
   // Compact receipt of the most recent real v2 placement decision, for the
   // dashboard's 'last placement' panel. Offers and diagnostics are excluded:
   // they fire per-admission and would turn 'last' into a mirror of request
   // volume instead of a record of actual placements. No job or session ids.
   let routingV2Last=null;
-  const routingTelemetry=routingObservations.enabled?new EndpointTelemetry({includeLegacy:true,fetcher:routingFetcher,onSample:(id,value)=>{
-    const node=nodes.find(node=>node.id===id);if(node)routingObservations.observeNative(routingWorker(node),value,activeJobs(node));
+  // v2 needs the engine's own rates, so it starts the poller even when
+  // observation-only routing is off (the live config runs v1 with v2 measured).
+  const routingTelemetry=(routingObservations.enabled||config.routing_v2_enabled===true)?new EndpointTelemetry({includeLegacy:true,fetcher:routingFetcher,onSample:(id,value)=>{
+    const node=nodes.find(node=>node.id===id);
+    if(node&&routingObservations.enabled)routingObservations.observeNative(routingWorker(node),value,activeJobs(node));
+    // Feed the engine's own decode/prefill rates into placement measurement.
+    // These are cache-invariant (decode tokens over decode seconds, kv-computed
+    // prompt tokens over prefill seconds), so they describe the machine rather
+    // than the hour's cache-hit mix — the exact defect the stopwatch metric has.
+    // Validated inside LaneSpeeds; a nonsense engine report is ignored.
+    if(value?.connected!==false)
+      laneSpeeds.observeEngine(id,{decodeTps:value?.decode_tps,prefillTps:value?.prefill_tps,at:value?.at});
   }}):null;
   const observe = fn => {if(shadow.enabled)try{return fn();}catch{shadow.state.errors++;}};
   let draining = false, shuttingDown = false, healthTimer, recoveryTimer, waitingTimer, routingTimer;
@@ -1256,17 +1288,18 @@ export function createGateway(config,{visionTranscode,tunnelFactory=superviseTun
       // per completed request — no probes, no synthetic load, no engine help.
       // Tokens are COMPUTE tokens per the reviewed design: the cached prefix is
       // subtracted so the rate is a machine property, not a cache-mix property.
-      // The engines do NOT count reasoning in completion_tokens (fleet data
-      // 2026-10-16: thinking-mode samples implied ~25 tok/s decodes; adding
-      // thinkingCharacters/4 converges them to the twins' honest ~165), so the
-      // observer's thinking characters are converted at ~4 chars/token and added.
+      // Reasoning is NOT added on top: the engine already counts it in
+      // completion_tokens (verified 2026-10-17 — engine generation_tokens_total
+      // tracks the reported sum within 5%), so the old thinkingCharacters/4
+      // correction was double-counting. prompt_tokens is passed through so the
+      // sampler can reject probe-sized requests, which measure 12-124 t/s and
+      // were dragging lanes toward "broken" at full EWMA weight.
       if(outcome==='complete'&&Number.isSafeInteger(observer.usage?.prompt_tokens)&&Number.isSafeInteger(observer.usage?.completion_tokens)
         &&observer.usage.prompt_tokens+observer.usage.completion_tokens>0){
         const cached=Math.min(Number.isSafeInteger(observer.usage.cached_tokens)?observer.usage.cached_tokens:0,observer.usage.prompt_tokens);
-        const thinkingTokens=Number.isFinite(observer.thinkingCharacters)&&observer.thinkingCharacters>0?Math.round(observer.thinkingCharacters/4):0;
-        const completionTokens=observer.usage.completion_tokens+thinkingTokens;
+        const completionTokens=observer.usage.completion_tokens;
         laneSpeeds.record({worker:routingWorker(node),tokens:Math.max(0,observer.usage.prompt_tokens-cached)+completionTokens,
-          outputTokens:completionTokens,seconds:(performance.now()-job.dispatchedMono)/1000,
+          promptTokens:observer.usage.prompt_tokens,outputTokens:completionTokens,seconds:(performance.now()-job.dispatchedMono)/1000,
           concurrency:Math.max(job.startConcurrency??1,activeCount(node))});
       }
       job.cleanup();

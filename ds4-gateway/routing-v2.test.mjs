@@ -306,7 +306,7 @@ test('a measured-but-unestimable lane is excluded, never ranked as instantly don
   // the lane reads "measured", but workOf/rate overflows to a null estimate.
   // Null would coerce to 0 in the peers sort and win placement — forbidden.
   const file = tempFile();
-  fs.writeFileSync(file, JSON.stringify({version: 1, fleetOutputs: [], lanes: {
+  fs.writeFileSync(file, JSON.stringify({version: 1, measurementVersion: 3, fleetOutputs: [], lanes: {
     good: {solo: {value: 100, samples: 3}, samples: 3, lastAt: 0},
     bad: {solo: {value: 5e-324, samples: 3}, samples: 3, lastAt: 0}}}));
   const lb = new LaneSpeeds(file, {now: () => 0, wallNow: () => 0});
@@ -339,7 +339,7 @@ test('the fleet output window survives a restart at its full 64 depth (round-2 P
 
 test('a solo-less probe latch survives a restart and keeps spacing probes (round-2)', () => {
   const file = tempFile();
-  fs.writeFileSync(file, JSON.stringify({version: 1, fleetOutputs: [], lanes: {
+  fs.writeFileSync(file, JSON.stringify({version: 1, measurementVersion: 3, fleetOutputs: [], lanes: {
     a: {lastProbeAt: 123}, z: {}}}));
   // Huge probe window: a lane latched at wall 123 must NOT be probe-eligible
   // at wall 1000; the fresh lane 'z' wins instead. Losing the latch would
@@ -466,22 +466,243 @@ test('phase classes ignore concurrent samples; the same samples at level 1 count
   assert.ok(Math.abs(lane.decodeTokensPerSecond - 102.5) < 3, `decode ${lane.decodeTokensPerSecond}`);
 });
 
-test('stale measurement version drops poisoned phase state but keeps solo history', async () => {
+test('a stale measurement version voids the whole traffic history, not just phases', async () => {
   const file = path.join(os.tmpdir(), `routing-v2-phasever-${randomUUID()}.json`);
   try {
     const lb = new LaneSpeeds(file, {now: () => 0, wallNow: () => 1000});
-    const rec = (id, I, O, s) => lb.record({worker: {id, identity: 'i'}, tokens: I + O, outputTokens: O, seconds: s, concurrency: 1});
+    const rec = (id, I, O, s) => lb.record({worker: {id, identity: 'i'}, tokens: I + O, promptTokens: I, outputTokens: O, seconds: s, concurrency: 1});
     rec('r', 1000, 40000, 400); rec('r', 2000, 80000, 800); rec('r', 1500, 60000, 600);
     await lb.close();
     const onDisk = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    assert.equal(onDisk.measurementVersion, 2, 'save stamps the measurement version');
-    // Simulate state saved under an older measurement semantics.
-    onDisk.measurementVersion = 1;
+    assert.equal(onDisk.measurementVersion, 3, 'save stamps the measurement version');
+    // Same file read back under the current semantics keeps what it earned.
+    const same = new LaneSpeeds(file, {now: () => 0, wallNow: () => 2000});
+    assert.ok(same.status(['r']).lanes[0].soloTokensPerSecond > 0, 'current semantics keep history');
+    await same.close();
+    // An older semantics measured something else entirely: a number that meant
+    // "cache-hit mix" must not be re-ranked as "tokens per second".
+    onDisk.measurementVersion = 2;
     fs.writeFileSync(file, JSON.stringify(onDisk));
-    const revived = new LaneSpeeds(file, {now: () => 0, wallNow: () => 2000});
+    const revived = new LaneSpeeds(file, {now: () => 0, wallNow: () => 3000});
     const lane = revived.status(['r']).lanes[0];
+    assert.equal(lane.soloTokensPerSecond, null, 'pre-guard numbers are not evidence');
     assert.equal(lane.decodeTokensPerSecond, null, 'poisoned phase class is dropped');
-    assert.ok(lane.soloTokensPerSecond > 0, 'solo history survives');
+    assert.equal(lane.measurement, 'cold');
+    assert.match(revived.status(['r']).notice, /discarded/i, 'the discard is announced, not silent');
     await revived.close();
   } finally { fs.rmSync(file, {force: true}); }
+});
+
+// ---------------------------------------------------------------------------
+// Measurement guards (2026-10-17). The fleet's v2 rates were a cache-mix meter,
+// not a throughput measurement: `cached_tokens` is always null on these engines,
+// so a lane that answered from prefix cache reported thousands of tokens/second
+// and won every comparison. These tests pin the fence that keeps one nonsense
+// reading from becoming placement policy.
+// ---------------------------------------------------------------------------
+
+const guard = (over = {}) => new LaneSpeeds(null, {now: () => 0, wallNow: () => 1000, ...over});
+// The exact shape that started this: a cached prompt counted as compute.
+const liar = (lb, id, over = {}) => lb.record({worker: {id, identity: 'i', model: 'm'}, tokens: 19909, promptTokens: 19909, seconds: 1, concurrency: 1, ...over});
+const honest = (lb, id, rate = 165) => lb.record({worker: {id, identity: 'i', model: 'm'}, tokens: rate * 10, promptTokens: rate * 10, seconds: 10, concurrency: 1});
+
+test('G1 — one liar cannot convict the honest lane, and both stay rankable (review P0-1)', () => {
+  const lb = guard();
+  honest(lb, 'good');
+  liar(lb, 'bad');
+  assert.equal(lb.speedAt('bad', 1).suspect, true, 'the liar is caught');
+  assert.equal(lb.speedAt('good', 1).suspect, undefined, 'the honest lane is not convicted for being slower');
+  assert.equal(lb.speedAt('good', 1).evidence, 'measured');
+  // The liar is priced at its peer, not at its own reading, and never at null:
+  // "assume average speeds from other machines".
+  const priced = lb.speedAt('bad', 1);
+  assert.equal(priced.evidence, 'fleet_average');
+  assert.equal(priced.tokensPerSecond, 165);
+  assert.equal(priced.observedTokensPerSecond, 19909, 'the rejected reading stays visible in the receipt');
+  // Repeated decisions must not accumulate suspicion anywhere.
+  for (let i = 0; i < 10; i++) lb.evaluate({job: job(), workers: [worker('good'), worker('bad')], eligibility: always});
+  const status = lb.status(['good', 'bad']);
+  assert.deepEqual(status.suspect_lanes, ['bad']);
+});
+
+test('G2 — a single lane whose readings are impossible still places work and recovers (review P1-6)', () => {
+  const lb = guard();
+  // 50,000 t/s is beyond anything these engines can do, cache or not.
+  for (let i = 0; i < 4; i++) lb.record({worker: {id: 'only', identity: 'i', model: 'm'}, tokens: 50000, promptTokens: 50000, seconds: 1, concurrency: 1});
+  assert.equal(lb.speedAt('only', 1).suspect, true);
+  const pick = lb.evaluate({job: job(), workers: [worker('only')], eligibility: always});
+  assert.equal(pick.workerId, 'only', 'the fleet never dead-ends on a suspect lane');
+  assert.notEqual(pick.action, 'unavailable');
+  // Honest samples re-earn the lane without needing a peer.
+  honest(lb, 'only');
+  honest(lb, 'only');
+  honest(lb, 'only');
+  const recovered = lb.speedAt('only', 1);
+  assert.notEqual(recovered.suspect, true, 'no peer is required to recover');
+  assert.equal(recovered.evidence, 'measured');
+  assert.ok(Number.isFinite(lb.evaluate({job: job(), workers: [worker('only')], eligibility: always}).candidates[0].completionSeconds));
+});
+
+test('G3 — the substituted rate reaches the estimate, not just the ranking (review P0-3)', () => {
+  const lb = guard();
+  honest(lb, 'good');
+  liar(lb, 'bad');
+  const at = 1000;
+  const onBad = lb.finishEstimate(worker('bad'), job({inputTokens: 2000, expectedOutputTokens: 800}), at);
+  const onGood = lb.finishEstimate(worker('good'), job({inputTokens: 2000, expectedOutputTokens: 800}), at);
+  assert.ok(Number.isFinite(onBad));
+  assert.ok(Math.abs(onBad - onGood) / onGood < 0.05, `suspect lane must price like its peer (${onBad} vs ${onGood})`);
+  assert.ok(onBad < 100, 'and never at a factor-inverted 665 s');
+});
+
+test('G4 — per-phase bounds reject a physically impossible decode sample', () => {
+  const lb = guard();
+  // 1250 output tokens in 0.25 s = 5000 tok/s. These engines decode at ~32 t/s.
+  lb.record({worker: {id: 'x', identity: 'i'}, tokens: 1250, promptTokens: 1250, outputTokens: 1250, seconds: 0.25, concurrency: 1});
+  assert.equal(lb.lanes.get('x').solo, null, 'a rejected sample never becomes a speed');
+  assert.equal(lb.status(['x']).lanes[0].measurement, 'cold');
+  assert.equal(lb.state.rejected, 1);
+  // The same request at an honest decode rate is kept.
+  lb.record({worker: {id: 'y', identity: 'i'}, tokens: 1000, promptTokens: 1000, outputTokens: 1000, seconds: 30, concurrency: 1});
+  assert.ok(lb.lanes.get('y').solo.value > 0);
+  assert.equal(lb.state.rejected, 1);
+});
+
+test('G5 — the fence kills probe-sized requests but keeps real ones', () => {
+  const lb = guard();
+  const rec = (id, prompt, seconds, over = {}) => lb.record({worker: {id, identity: 'i'}, tokens: prompt, promptTokens: prompt, seconds, concurrency: 1, ...over});
+  // The 31-prompt/1-completion health probe: 32 tokens in 0.2-2.5 s.
+  rec('probe-a', 31, 0.2, {outputTokens: 1});
+  rec('probe-b', 31, 2.5, {outputTokens: 1});
+  assert.equal(lb.state.rejected, 2, 'a probe is not a throughput measurement');
+  // Real requests in the same traffic: 20k-150k prompts at 2.5k-16k t/s.
+  rec('real-small', 20000, 8);
+  rec('real-big', 150000, 9.1);
+  assert.equal(lb.state.rejected, 2, 'honest large prompts are not rejected');
+  assert.equal(lb.lanes.get('real-big').solo.value, 150000 / 9.1);
+  // Floors and ceilings are inclusive on the honest side.
+  rec('edge-prompt', 200, 10);
+  rec('edge-time', 5000, 0.25);
+  assert.equal(lb.state.rejected, 2);
+  rec('edge-ceiling', 20000, 1);
+  assert.equal(lb.state.rejected, 2);
+  rec('over-ceiling', 20001, 1);
+  assert.equal(lb.state.rejected, 3);
+});
+
+test('G6 — a lane whose every sample is rejected is priced at the fleet average, never left cold', () => {
+  const lb = guard();
+  honest(lb, 'good');
+  for (let i = 0; i < 5; i++) lb.record({worker: {id: 'bad', identity: 'i', model: 'm'}, tokens: 50000, promptTokens: 50000, seconds: 0.5, concurrency: 1});
+  const lane = lb.status(['good', 'bad']).lanes.find(row => row.workerId === 'bad');
+  assert.equal(lane.rejectedSamples, 5);
+  assert.equal(lane.measurement, 'suspect');
+  assert.equal(lane.effectiveTokensPerSecond, 165, 'average speed stands in for the broken lane');
+  assert.equal(lb.speedAt('bad', 1).evidence, 'fleet_average');
+});
+
+test('G7 — a retired lane still inside the TTL does not vote in the peer median (review P0-2)', () => {
+  const lb = guard();
+  honest(lb, 'good');
+  honest(lb, 'retired', 19909);
+  liar(lb, 'bad');
+  // 'retired' is not offered to the decision: it must not lift the median
+  // above the liar's ratio and thereby convict the honest lane.
+  const pick = lb.evaluate({job: job(), workers: [worker('good'), worker('bad')], eligibility: always});
+  assert.ok(pick);
+  assert.equal(lb.speedAt('good', 1).suspect, undefined);
+  assert.equal(lb.speedAt('bad', 1).suspect, true);
+});
+
+test('G8 — recovery needs sustained honest samples, and a condemned EWMA is not evidence', () => {
+  const lb = guard({suspectAfter: 3});
+  honest(lb, 'good');
+  liar(lb, 'bad');
+  assert.equal(lb.speedAt('bad', 1).suspect, true);
+  honest(lb, 'bad');
+  assert.equal(lb.speedAt('bad', 1).suspect, true, 'a single in-band sample is not recovery');
+  // The condemned EWMA is diluted, not erased: at alpha 0.3 a 120x outlier needs
+  // a run of honest samples before it is back inside the peer band. The lane is
+  // priced at its peer median the whole time, so the delay costs nothing.
+  for (let i = 0; i < 20; i++) honest(lb, 'bad');
+  assert.notEqual(lb.speedAt('bad', 1).suspect, true, 'sustained honest samples restore trust');
+});
+
+test('G9 — persisted nonsense is not re-adopted across a restart (review P2)', async () => {
+  const file = path.join(os.tmpdir(), `routing-v2-guard-${randomUUID()}.json`);
+  try {
+    const first = new LaneSpeeds(file, {now: () => 0, wallNow: () => 1000});
+    honest(first, 'good');
+    liar(first, 'bad');
+    await first.close();
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    assert.equal(onDisk.lanes.bad.model, 'm', 'the served model survives so peer grouping works after restart');
+    const revived = new LaneSpeeds(file, {now: () => 0, wallNow: () => 2000});
+    const lane = revived.status(['good', 'bad']).lanes.find(row => row.workerId === 'bad');
+    assert.equal(lane.measurement, 'suspect');
+    assert.equal(lane.effectiveTokensPerSecond, 165, 'the corrupt number is not resurrected as a ranking');
+    await revived.close();
+  } finally { fs.rmSync(file, {force: true}); }
+});
+
+test('G10 — evaluate stays side-effect-free while a lane is suspect', () => {
+  const lb = guard();
+  honest(lb, 'good');
+  liar(lb, 'bad');
+  const before = lb.status(['good', 'bad']);
+  for (let i = 0; i < 100; i++) lb.evaluate({job: job(), workers: [worker('good'), worker('bad')], eligibility: always});
+  const after = lb.status(['good', 'bad']);
+  assert.equal(after.records, before.records);
+  assert.equal(after.rejected_samples, before.rejected_samples);
+  assert.deepEqual(after.suspect_lanes, before.suspect_lanes);
+});
+
+test('G11 — the ratio guard does not flap as a lane drifts', () => {
+  const lb = guard({peerRatio: 3});
+  honest(lb, 'peer', 200);
+  const seen = [];
+  let transitions = 0;
+  let previous = false;
+  for (const rate of [40, 80, 160, 320, 640, 1280, 2560, 5120, 2560, 1280, 640, 320, 160, 80, 40]) {
+    for (let i = 0; i < 3; i++) lb.record({worker: {id: 'drift', identity: 'i', model: 'm'}, tokens: rate * 10, promptTokens: rate * 10, seconds: 10, concurrency: 1});
+    const suspect = lb.speedAt('drift', 1).suspect === true;
+    if (suspect !== previous) { transitions++; previous = suspect; }
+    seen.push(suspect);
+  }
+  assert.ok(transitions <= 4, `expected a stable verdict, saw ${transitions} transitions: ${seen.join(',')}`);
+});
+
+test('G12 — engine-measured decode outranks the stopwatch and is cache-invariant', () => {
+  const lb = guard();
+  // The stopwatch says 20,000 t/s because the prompt was served from cache.
+  liar(lb, 'cached');
+  // The engine says 32 t/s decode for that same lane, all session.
+  lb.observeEngine('cached', {decodeTps: 32.5, prefillTps: 2500, at: 1000});
+  const speed = lb.speedAt('cached', 1);
+  assert.equal(speed.evidence, 'engine_measured');
+  assert.equal(speed.tokensPerSecond, 32.5, 'the machine number wins over the traffic-derived one');
+  assert.equal(lb.status(['cached']).lanes[0].measurement, 'engine');
+  // Two identical machines, measured by their engines, price identically even
+  // when their traffic mixes differ wildly.
+  const twin = guard();
+  twin.observeEngine('a', {decodeTps: 32.6, prefillTps: 2400, at: 1000});
+  twin.observeEngine('b', {decodeTps: 32.1, prefillTps: 2600, at: 1000});
+  liar(twin, 'a');
+  const ja = twin.finishEstimate(worker('a'), job({inputTokens: 40000, expectedOutputTokens: 900}), 1000);
+  const jb = twin.finishEstimate(worker('b'), job({inputTokens: 40000, expectedOutputTokens: 900}), 1000);
+  assert.ok(Math.abs(ja - jb) / jb < 0.1, `twins must price within 10% (${ja} vs ${jb})`);
+});
+
+test('G13 — an implausible engine report is ignored, not trusted for being the engine', () => {
+  const lb = guard();
+  honest(lb, 'x', 200);
+  lb.observeEngine('x', {decodeTps: 9000, prefillTps: 5e9, at: 1000});
+  assert.equal(lb.speedAt('x', 1).evidence, 'measured', 'out-of-range engine numbers are dropped');
+  // A stalled engine reading ages out instead of being used forever.
+  const l2 = guard({engineTtlSeconds: 60});
+  l2.observeEngine('y', {decodeTps: 32, prefillTps: 2500, at: 1000});
+  assert.equal(l2.speedAt('y', 1).evidence, 'engine_measured');
+  const l3 = new LaneSpeeds(null, {now: () => 0, wallNow: () => 2000, engineTtlSeconds: 60});
+  l3.observeEngine('y', {decodeTps: 32, prefillTps: 2500, at: 1000});
+  assert.notEqual(l3.speedAt('y', 1).evidence, 'engine_measured');
 });
