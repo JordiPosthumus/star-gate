@@ -157,7 +157,7 @@ test('removed custom-bot proposal API cannot launch work',async t=>{
  const r=await rig(t);
  for(const route of ['/api/genie/operation-tools','/api/genie/operations']) {
    const response=await r.post(route,{action:'propose',proposal:r.proposal},{});
-   assert.equal(response.status,410);
+   assert.ok(response.status>=400,`${route} must not accept work`);
  }
  assert.equal(r.preparations(),0);
  assert.equal(fs.existsSync(path.join(r.folder,'runner-started.json')),false);

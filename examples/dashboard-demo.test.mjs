@@ -20,8 +20,8 @@ test('public demo has synthetic mixed servers, current panels and no promoted mo
   assert.deepEqual(s.devices.map(d=>d.hardware.power_scope??d.hardware.current.power_scope),['compute_module','compute_module','system']);
   const registry=await get('/api/workers');assert.equal(registry.queued_relocation.automatic,true);assert.equal(registry.queued_relocation.offers.length,1);
   // The custom Genie chat/console API was removed from the dashboard; the demo
-  // serves no /api/genie window and answers 410 for it.
-  const removed=await fetch(url+'/api/genie');assert.equal(removed.status,410);
+  // has no configured Genie, and says so instead of inventing one.
+  const genie=await (await fetch(url+'/api/genie')).json();assert.equal(genie.enabled,false);
   assert.equal(s.performance_lights.workers.sparkA.decode.level,'green');
   assert.equal(s.performance_lights.workers.sparkA.prefill.level,'red');
   assert.equal(s.performance_lights.workers.sparkB.decode.level,'amber');

@@ -54,7 +54,7 @@ test('SOUL HTTP editor roundtrip, conflict and same-origin protections',async t=
   assert.equal(fs.readFileSync(loaded.path,'utf8'),'From dashboard\n');
   r=await fetch(base+'/api/soul',{method:'PUT',headers,body});
   assert.equal(r.status,409);
-  assert.equal((await fetch(base+'/api/genie')).status,410);
+  assert.equal((await (await fetch(base+'/api/genie')).json()).enabled,false);
   const html=await (await fetch(base)).text();
   assert.match(html,/data-workspace-tab="soul"/);
   for(const asset of ['/soul.js','/soul.css'])assert.equal((await fetch(base+asset)).status,200);
