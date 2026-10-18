@@ -36,7 +36,7 @@ The demo dashboard uses `30011` (`npm run ui:demo`).
 
 ```sh
 npm run check            # syntax check all .mjs and shell scripts
-npm test                 # main suite (89 files, local fixtures)
+npm test                 # main suite (90 files, local fixtures)
 npm run continuity:test  # client continuity / Door behavior
 npm run data:test        # telemetry and evidence math
 npm run recovery:test    # Node + Python recovery adapters
@@ -70,6 +70,7 @@ ds4-gateway/          gateway, door, dashboard, ~150 modules and their tests
   spark-*.mjs/.py     DGX Spark enrollment, discovery, services
   hermes-*.mjs        Genie profile, Brain/Memory/Soul stores and runtime bridge
   genie-brain.mjs     Genie's own model route, fallback ladder and commandeering rule
+  genie-config.mjs    whether Genie exists, what he may do unasked, which channels run
 scripts/              setup, doctor, check, privacy, hooks, icons, telemetry
 examples/             generic config, demo dashboard, Spark build recipes
 docs/                 user documentation (indexed at the end of README.md)

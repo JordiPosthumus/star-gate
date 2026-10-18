@@ -124,7 +124,13 @@ work is standing; the destructive or capability-reducing work is not.
 }
 ```
 
-`genie.enabled: false` disables him completely. The gateway never depends on him:
+`genie.authority` is the standing-authority list: `inspect`, `research`,
+`rebalance`, `recovery`, `configure`, `command`. Unknown names are dropped, and an
+absent list means `inspect` + `research` only — never "everything". Everything not
+listed follows the "ask first" rules above.
+
+`genie.messaging.channels` records which channels the owner wants; Hermes owns
+authorization and credentials. `genie.enabled: false` disables him completely. The gateway never depends on him:
 ordinary dispatch, admission, affinity and the Door work exactly the same whether
 he is configured, running, or absent.
 
