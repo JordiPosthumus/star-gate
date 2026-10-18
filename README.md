@@ -116,6 +116,7 @@ after the gateway works:
 ```sh
 npm run genie:setup        # pinned Hermes, identity, brain config; starts nothing
 npm run genie -- "how is the fleet?"   # one turn, from a terminal
+# or open the dashboard and use the Genie tab
 ```
 
 He can use the gateway's own pool as his brain, or a dedicated endpoint, and can
@@ -172,7 +173,7 @@ controls are off unless you set `ui_worker_management: true`.
 | Hardware telemetry (RAM/GPU/power/temp) | Opt-in | DGX Spark SSH/NVIDIA adapter or local JSONL |
 | Media jobs (H3 / ACE-Step) | Experimental | Hardware- and recipe-specific |
 | LAN sharing + Pi client sync | Opt-in | Advertises a fixed home-LAN key `none` |
-| Gate Genie (agent + Hermes runtime) | **Restoring** | Runtime, identity, conversation and a read-only fleet tool are in; Genie tab, action tools and messaging next. See [Genie](docs/genie.md) |
+| Gate Genie (agent + Hermes runtime) | **Restoring** | Runtime, identity, Genie tab, conversation and a read-only fleet tool are in; action tools and messaging next. See [Genie](docs/genie.md) |
 
 ## Configuration and private files
 

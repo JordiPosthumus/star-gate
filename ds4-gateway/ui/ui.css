@@ -242,3 +242,28 @@ dialog#help-dialog::backdrop{background:rgba(0,0,0,.6)}
 dialog#help-dialog .help-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
 dialog#help-dialog h2{margin:0;font-size:15px}
 dialog#help-dialog p{font-size:12px;line-height:1.55;color:var(--muted,#9a9a9a);margin:8px 0}
+
+/* Gate Genie conversation */
+.genie-view .genie-panel{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:22px 24px;max-width:980px}
+.genie-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:16px}
+.genie-heading h2{font-size:20px;font-weight:500;letter-spacing:-.4px;margin:4px 0 6px}
+.genie-status{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:6px 10px;white-space:nowrap}
+.genie-log{min-height:180px;max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--bg);padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.genie-message{max-width:88%}
+.genie-message .genie-who{display:block;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.genie-message p{margin:0;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
+.genie-message.user{align-self:flex-end;text-align:right}
+.genie-message.user p{background:#263026;border:1px solid #3c4a3b;border-radius:12px 12px 3px 12px;padding:9px 12px;display:inline-block;text-align:left}
+.genie-message.assistant p{padding:2px 0}
+.genie-message.error p{color:var(--error)}
+.genie-empty{margin:auto;text-align:center;max-width:420px}
+.genie-form{margin-top:14px}
+.genie-form textarea{width:100%;resize:vertical;min-height:64px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);padding:10px 12px;font:inherit;line-height:1.5}
+.genie-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.genie-actions{display:flex;align-items:center;gap:10px;margin-top:10px}
+.genie-actions .button{min-width:74px}
+.genie-actions .button:disabled{opacity:.45;cursor:not-allowed}
+.genie-foot{font-size:11px;color:var(--muted);margin:14px 0 0}
+.genie-foot a{color:var(--accent)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:750px){.genie-view .genie-panel{padding:18px}.genie-message{max-width:100%}.genie-heading{flex-direction:column;gap:8px}}

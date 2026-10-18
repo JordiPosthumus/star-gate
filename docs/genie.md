@@ -128,7 +128,9 @@ work is standing; the destructive or capability-reducing work is not.
 
 ## Talking to him
 
-- **Dashboard** — the Genie tab: conversation, Soul, Brain, Memory, activity.
+- **Dashboard** — the Genie tab: a live conversation with his model and tools,
+  his current model and granted tool count, and one in-flight turn at a time.
+  History is private runtime state (`runtime/genie-chat/dashboard.json`).
 - **Hermes Gateway** — the same agent over a messaging channel, with the same
   profile, memory and tools. Channel authorization belongs to Hermes; Star Gate
   never invents a second identity.

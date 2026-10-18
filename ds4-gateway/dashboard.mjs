@@ -2,6 +2,7 @@ import {gzip} from 'node:zlib';
 import {createMemoryView} from './hermes-memory.mjs';
 import {createBrainStore} from './hermes-brain.mjs';
 import {createSoulStore,hermesHome} from './hermes-profile.mjs';
+import {createGenieChat} from './genie-chat.mjs';
 import {createNativeMediaStatus} from './native-media-status.mjs';
 import {fleetMediaWorkloads} from './media-workloads.mjs';
 import {machinesFor} from './fleet-machines.mjs';
@@ -66,6 +67,7 @@ assets.set('/brain.css',['brain.css','text/css']);
 assets.set('/soul.js',['soul.js','text/javascript']);
 assets.set('/soul.css',['soul.css','text/css']);
 assets.set('/activity.js',['activity.js','text/javascript']);
+assets.set('/genie.js',['genie.js','text/javascript']);
 assets.set('/fleet-catalogue.js',['fleet-catalogue.js','text/javascript']);
 assets.set('/logo.svg',['logo.svg','image/svg+xml']);
 assets.set('/media.js',['media.js','text/javascript']);
@@ -97,7 +99,7 @@ export function proxyMediaFile(config,req,res,route){
       res.on('close',()=>upstream.destroy());upstream.end();
     }
 
-export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 'ui'), management = null, requestHistory = null, currentJobs = null, testing = null, lanSharing = null, mediaTools = null, powerTools = null, soul = null, brain = null, memory = null} = {}) {
+export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 'ui'), management = null, requestHistory = null, currentJobs = null, testing = null, lanSharing = null, mediaTools = null, powerTools = null, soul = null, brain = null, memory = null, genie = null} = {}) {
   const csrf = randomBytes(32).toString('base64url');
   // Freeze one complete release in memory: edits on disk cannot expose half an
   // update to a live browser. Only the dashboard needs a reload to promote it.
@@ -169,7 +171,36 @@ export function createDashboard(getSnapshot, {assetsDirectory = path.join(here, 
       });
       return;
     }
-    if(req.url==='/api/genie'||req.url?.startsWith('/api/genie/'))return reply(410,{available:false,error:'The custom Genie API was removed. Gate Genie runs in native Hermes.'});
+    if(req.url==='/api/genie'&&req.method==='GET')
+      return reply(200,{...(genie?.status()??{enabled:false,ready:false,messages:[],tools:[]}),csrf_token:csrf});
+    if(req.url==='/api/genie/chat'||req.url==='/api/genie/chat/stop'){
+      if(!genie)return reply(503,{error:'Genie is not configured on this installation.'});
+      if(req.method!=='POST')return reply(405,{error:'Use POST.'});
+      const token=Buffer.from(req.headers['x-dsg-csrf']??''),expected=Buffer.from(csrf);
+      if(req.headers.origin!==`http://${req.headers.host}`||token.length!==expected.length||!timingSafeEqual(token,expected))
+        return reply(403,{error:'Reload this local dashboard before talking to Genie.'});
+      if(req.url==='/api/genie/chat/stop')return reply(200,{stopped:genie.stop()});
+      if(req.headers['content-type']!=='application/json')return reply(415,{error:'JSON required.'});
+      let body='',ended=false;req.setEncoding('utf8');
+      const timer=setTimeout(()=>{ended=true;reply(408,{error:'Genie request was incomplete.'});},15000);
+      req.on('aborted',()=>{ended=true;clearTimeout(timer);});
+      req.on('error',()=>{ended=true;clearTimeout(timer);});
+      req.on('data',chunk=>{if(ended)return;body+=chunk;if(Buffer.byteLength(body)>16384){ended=true;clearTimeout(timer);reply(413,{error:'That question is too long.'});}});
+      req.on('end',()=>{
+        clearTimeout(timer);if(ended)return;ended=true;
+        let input;try{input=JSON.parse(body);}catch{return reply(400,{error:'Invalid JSON.'});}
+        if(typeof input?.message!=='string'||!input.message.trim())return reply(400,{error:'A question is required.'});
+        if(!genie.enabled)return reply(409,{error:'Genie is disabled in this configuration.'});
+        res.writeHead(200,{...headers,'content-type':'text/event-stream','cache-control':'no-store','x-accel-buffering':'no'});
+        res.write(': genie\n\n');
+        const send=text=>{if(!res.writableEnded)res.write(`data: ${JSON.stringify({delta:text})}\n\n`);};
+        res.on('close',()=>{if(!res.writableEnded)genie.stop();});
+        void genie.send({message:input.message,onDelta:send})
+          .then(text=>{res.write(`data: ${JSON.stringify({done:true,text})}\n\n`);res.end();})
+          .catch(error=>{res.write(`data: ${JSON.stringify({error:error.message,code:error.code??null})}\n\n`);res.end();});
+      });
+      return;
+    }
 
     if(req.method==='GET'&&/^\/api\/media\/(music|video)\/jobs\/[a-f0-9-]{36}\/files\/[a-f0-9-]{36}$/.test(req.url??'')){
       if(!management?.mediaFile)return reply(409,{error:'Media downloads are not connected.'});
@@ -546,7 +577,7 @@ export async function runDashboard(configPath, port) {
   }:null, lanSharing:managementEnabled&&continuityEnabled(config)?{
     read:async()=>lanSharingDetails(await doorControl(doorSocket(config),'/lan-sharing'),config.port),
     set:async enabled=>lanSharingDetails(await doorControl(doorSocket(config),'/set-lan-sharing',{enabled}),config.port),
-  }:null, powerTools, soul:createSoulStore(hermesHome(config)), brain:createBrainStore(hermesHome(config)), memory:createMemoryView(hermesHome(config))});
+  }:null, powerTools, soul:createSoulStore(hermesHome(config)), brain:createBrainStore(hermesHome(config)), memory:createMemoryView(hermesHome(config)), genie:createGenieChat(config)});
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   operations?.bind(server.address().port);
   await poll(); endpointTelemetry.poll(); const interval = setInterval(poll, 2000), endpointTimer=setInterval(()=>endpointTelemetry.poll(),2000), historyTimer=setInterval(()=>monitoringHistory.save(activity,endpointTelemetry),10000);

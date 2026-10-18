@@ -979,7 +979,7 @@ test('six-worker monitoring only reads gateway status; credentials and addresses
   const app = await runDashboard(config, 0); t.after(app.close);
   const s = app.snapshot(); assert.equal(s.devices.length, 6); assert.equal(s.events.length, 1);
   assert.deepEqual(s.gateway.genie_thinking,{chat:'max',reviewer:'high',saved:{chat:'max'},levels:['none','minimal','low','medium','high','xhigh','max']});
-  const caps=await fetch('http://127.0.0.1:'+app.server.address().port+'/api/genie/capabilities');assert.equal(caps.status,410);
+  const caps=await fetch('http://127.0.0.1:'+app.server.address().port+'/api/genie/capabilities');assert.equal(caps.status,404);
   assert.deepEqual(s.gateway.workers[0].requested_thinking,{status:'specified',fields:{reasoning_effort:'xhigh'}});
   assert.equal(s.gateway.workers[1].requested_thinking.fields.reasoning_effort,'none');
   assert.equal(s.gateway.workers[0].last_request_finished_at,null);
@@ -1208,13 +1208,13 @@ test('Fleet presentation groups only mapped paused alternatives and preserves fa
 });
 
 
-test('gateway-only dashboard rejects legacy bot routes and serves no bot entry point',async t=>{
+test('the dashboard serves a Genie entry point and no legacy bot routes',async t=>{
  const {url}=await fixture(t);
  const html=await(await fetch(url)).text();
- assert.doesNotMatch(html,/id="tab-genie"|src="\/genie-|id="conversation-form"/);
- for(const route of ['/api/genie','/api/genie/chat','/api/genie/telegram','/api/genie/power-tools']){
-  for(const method of ['GET','POST'])assert.equal((await fetch(url+route,{method})).status,410);
- }
+ assert.match(html,/id="tab-genie"/);assert.match(html,/src="\/genie\.js"/);
+ const status=await(await fetch(url+'/api/genie')).json();
+ assert.equal(status.enabled,false);assert.deepEqual(status.messages,[]);
+ for(const route of ['/api/genie/telegram','/api/genie/power-tools'])assert.equal((await fetch(url+route)).status,404);
  assert.equal((await fetch(url+'/api/status')).status,200);
 });
 
