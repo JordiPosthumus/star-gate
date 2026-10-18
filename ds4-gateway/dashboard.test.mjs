@@ -339,7 +339,7 @@ test('verified profile hand-back is a visible independent default-on recovery po
 test('recovery enrollment links to an agent guide without granting control authority',()=>{
   const html=fs.readFileSync(new URL('./ui/index.html',import.meta.url),'utf8');
   const guide=fs.readFileSync(new URL('../docs/agent-recovery-enrollment.md',import.meta.url),'utf8');
-  assert.match(html,/<a id="recovery-enrollment-guide" href="https:\/\/github\.com\/JordiPosthumus\/dwarf-star-gate\/blob\/main\/docs\/agent-recovery-enrollment\.md" target="_blank" rel="noopener noreferrer">Setup guide for your agent/);
+  assert.match(html,/<a id="recovery-enrollment-guide" href="https:\/\/github\.com\/JordiPosthumus\/star-gate\/blob\/main\/docs\/agent-recovery-enrollment\.md" target="_blank" rel="noopener noreferrer">Setup guide for your agent/);
   assert.match(html,/Connecting an endpoint does not grant restart permission/);
   assert.match(guide,/inspection and a proposed plan only/);
   assert.match(guide,/Automatic recovery is a fleet-wide policy/);
