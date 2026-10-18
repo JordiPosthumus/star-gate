@@ -115,6 +115,7 @@ after the gateway works:
 
 ```sh
 npm run genie:setup        # pinned Hermes, identity, brain config; starts nothing
+npm run genie -- "how is the fleet?"   # one turn, from a terminal
 ```
 
 He can use the gateway's own pool as his brain, or a dedicated endpoint, and can

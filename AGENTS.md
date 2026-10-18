@@ -36,7 +36,7 @@ The demo dashboard uses `30011` (`npm run ui:demo`).
 
 ```sh
 npm run check            # syntax check all .mjs and shell scripts
-npm test                 # main suite (94 files, local fixtures)
+npm test                 # main suite (95 files, local fixtures)
 npm run continuity:test  # client continuity / Door behavior
 npm run data:test        # telemetry and evidence math
 npm run recovery:test    # Node + Python recovery adapters
@@ -46,6 +46,7 @@ npm run hooks:install    # opt in to the staged-file pre-commit hook
 npm run doctor           # read-only config/port/path checks
 npm run setup -- --controls
 npm run genie:setup      # Genie runtime + identity + brain config (no service started)
+npm run genie -- "hi"    # talk to Genie through the pinned runtime
 npm start | npm run door | npm run ui
 npm run ui:demo          # synthetic dashboard, no fleet needed
 ```
