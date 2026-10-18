@@ -24,7 +24,9 @@ m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class NativeOmlxTransactionTests(unittest.TestCase):
     def setUp(self):
         # Short socket path also works under macOS's 104-byte sun_path limit.
-        tmp=tempfile.TemporaryDirectory(prefix='omlx-tx-',dir='/tmp');self.addCleanup(tmp.cleanup)
+        # The fixture process can still be releasing a file when cleanup starts on a
+        # loaded runner; a leftover /tmp directory is preferable to a false failure.
+        tmp=tempfile.TemporaryDirectory(prefix='omlx-tx-',dir='/tmp',ignore_cleanup_errors=True);self.addCleanup(tmp.cleanup)
         self.root=Path(tmp.name);(self.root/'state').mkdir()
         with socket.socket() as reserve:
             reserve.bind(('127.0.0.1',0));self.port=reserve.getsockname()[1]
