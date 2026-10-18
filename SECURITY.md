@@ -4,7 +4,7 @@
 
 **Do not post exploitable details or secrets in a public issue.** Use GitHub's
 private vulnerability reporting for this repository:
-[report a vulnerability privately](https://github.com/JordiPosthumus/dwarf-star-gate/security/advisories/new).
+[report a vulnerability privately](https://github.com/JordiPosthumus/star-gate/security/advisories/new).
 Include a minimal reproduction, affected commit, impact and proposed mitigation.
 Do not include live credentials or private conversation content.
 

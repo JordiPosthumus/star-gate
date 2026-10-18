@@ -83,7 +83,7 @@ These are the things a reader deserves to know before investing time:
 ## Quick start
 
 ```sh
-git clone https://github.com/JordiPosthumus/dwarf-star-gate.git ~/DSG
+git clone https://github.com/JordiPosthumus/star-gate.git ~/DSG
 cd ~/DSG
 npm run setup -- --controls     # writes an ignored, mode-0600 config.local.json
 npm run hooks:install           # optional: staged-file privacy + identity hook
